@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: oxidedb
+Version: 0.1.0
+Requires-Dist: grpcio>=1.50.0
+Requires-Dist: grpcio-tools>=1.50.0
+Requires-Dist: protobuf>=4.21.0
+Requires-Dist: msgpack>=1.0.0
+Provides-Extra: test
+Requires-Dist: pytest>=7.0.0; extra == "test"
+Requires-Dist: pytest-asyncio>=0.20.0; extra == "test"
+Dynamic: provides-extra
+Dynamic: requires-dist

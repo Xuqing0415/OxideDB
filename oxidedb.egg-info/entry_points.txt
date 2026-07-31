@@ -1,0 +1,2 @@
+[console_scripts]
+oxidedb = oxidedb.cli:main
