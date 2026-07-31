@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package oxidedb.client;
+
+message GetRequest {
+    bytes key = 1;
+}
+
+message GetResponse {
+    bytes value = 1;
+    bool found = 2;
+}
+
+message SetRequest {
+    bytes key = 1;
+    bytes value = 2;
+}
+
+message SetResponse {
+    bool success = 1;
+}
+
+message DeleteRequest {
+    bytes key = 1;
+}
+
+message DeleteResponse {
+    bool success = 1;
+}
+
+message ScanRequest {
+    bytes start_key = 1;
+    bytes end_key = 2;
+}
+
+message ScanResponse {
+    repeated KeyValuePair entries = 1;
+}
+
+message KeyValuePair {
+    bytes key = 1;
+    bytes value = 2;
+}
+
+message ErrorResponse {
+    enum ErrorCode {
+        OK = 0;
+        NOT_LEADER = 1;
+        KEY_NOT_FOUND = 2;
+        INTERNAL_ERROR = 3;
+    }
+    ErrorCode code = 1;
+    string message = 2;
+    string leader_address = 3;
+}
+
+service ClientService {
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc Set(SetRequest) returns (SetResponse);
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+    rpc Scan(ScanRequest) returns (ScanResponse);
+}
