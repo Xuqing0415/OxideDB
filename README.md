@@ -282,6 +282,8 @@ oxidedb/
   client/        gRPC client SDK (server side not implemented)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
-docs/            design notes (the why, where the README has the what)
+docs/            design notes and posts
+  design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
+  blog/          the ReadIndex story: a read path that passed every test while wrong
 proto/           gRPC service definitions
 tests/           pytest suite
