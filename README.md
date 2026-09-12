@@ -29,9 +29,11 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
 ```
 
 * **Raft** — leader election, log replication, commit index, durable term/vote,
-  a no-op entry per election (so a new leader can commit what it inherited), and
-  a ReadIndex read path.  Runs either fully in-process (embedded, used by most
-  tests) or over gRPC (`RaftCluster.start` vs `RaftCluster.start_network`).
+  a no-op entry per election (so a new leader can commit what it inherited),
+  log compaction behind a state-machine snapshot, `InstallSnapshot` for a
+  replica that fell behind that snapshot, and a ReadIndex read path.  Runs either
+  fully in-process (embedded, used by most tests) or over gRPC
+  (`RaftCluster.start` vs `RaftCluster.start_network`).
 * **MVCC** — every write becomes a version keyed by timestamp, so a read at
   timestamp `t` sees a consistent snapshot and an old transaction keeps seeing
   the data it started with.  Deletes are tombstones, not erasures.
@@ -80,7 +82,13 @@ lock record      \x04 || key || \x00 || start_ts(8B BE)    -> msgpack{status,
 Raft log entry   \x01 || index(8B BE)                      -> msgpack{term, command}
 Raft meta        \x02                                      -> msgpack{current_term, voted_for}
 Raft commit      \x03                                      -> commit_index(8B BE)
+Raft snapshot    \x04                                      -> msgpack{index, term, data}
 ```
+
+The snapshot record carries its own `index`/`term`, so it is written before the
+log prefix it covers is dropped: a crash in between leaves entries that replay
+skips (they are at or below the snapshot index) rather than state with no entry
+to rebuild it from.
 
 `\x02` in the MVCC keyspace used to hold a bare write intent.  A lock record
 carries the same value plus the primary key, the status and the TTL, so the
@@ -131,11 +139,15 @@ embedded tests rely on.
 python -m pytest tests -q
 ```
 
-77 tests.  `tests/test_durability.py` covers the correctness properties that
+88 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
-ReadIndex quorum.
+ReadIndex quorum.  `tests/test_snapshot.py` covers snapshots and log compaction:
+the storage round trip behind them, what a snapshot has to contain (MVCC history
+and unresolved locks included), a restart that rebuilds from the snapshot because
+the entries are gone, and a replica catching up through `InstallSnapshot` after
+the leader compacted past what it was missing.
 
 Three environment notes:
 
@@ -160,9 +172,18 @@ Honest list of what is *not* done, roughly in priority order.
   replicas hold TTLs that differ by a few milliseconds and the value is not
   covered by Raft.  Deriving it from the entry itself would make the state
   machine deterministic.
-* **No snapshot or log compaction.**  The Raft log grows without bound - a
-  no-op per election plus every write - and `InstallSnapshot` does not exist in
-  `proto/raft.proto`.
+* **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
+  every row in a single msgpack payload, so the cost of a snapshot grows with the
+  data set, and it is taken and restored while holding the node lock - the node
+  serves no RPCs for the duration.  Chunked, incremental snapshots are the next
+  step; the interface (`snapshot()`/`restore(data)`) does not have to change.
+  Over gRPC the payload also has to fit in one message: the 4 MiB default limit
+  means a snapshot past that size is dropped by the peer until the channel is
+  configured for more.
+* **`_apply_results` grows with the applied log.**  Results are kept per index so
+  a waiting `propose` can read the one it is waiting for; nothing prunes them
+  yet, so a long-lived cluster leaks a small object per applied command even
+  though its log is now compacted.
 * **No membership change.**  Cluster size is fixed at construction; there is no
   joint-consensus configuration change.
 * **Timing is a thread per node, not an event loop.**  Elections and heartbeats
