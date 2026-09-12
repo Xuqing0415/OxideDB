@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nraft.proto\x12\x0coxidedb.raft\"g\n\x12RequestVoteRequest\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x14\n\x0c\x63\x61ndidate_id\x18\x02 \x01(\x04\x12\x16\n\x0elast_log_index\x18\x03 \x01(\x04\x12\x15\n\rlast_log_term\x18\x04 \x01(\x04\"9\n\x13RequestVoteResponse\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x14\n\x0cvote_granted\x18\x02 \x01(\x08\"5\n\x05\x45ntry\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\r\n\x05index\x18\x02 \x01(\x04\x12\x0f\n\x07\x63ommand\x18\x03 \x01(\x0c\"\xa3\x01\n\x14\x41ppendEntriesRequest\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x11\n\tleader_id\x18\x02 \x01(\x04\x12\x16\n\x0eprev_log_index\x18\x03 \x01(\x04\x12\x15\n\rprev_log_term\x18\x04 \x01(\x04\x12$\n\x07\x65ntries\x18\x05 \x03(\x0b\x32\x13.oxidedb.raft.Entry\x12\x15\n\rleader_commit\x18\x06 \x01(\x04\"K\n\x15\x41ppendEntriesResponse\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x13\n\x0bmatch_index\x18\x03 \x01(\x04\x32\xbb\x01\n\x0bRaftService\x12R\n\x0bRequestVote\x12 .oxidedb.raft.RequestVoteRequest\x1a!.oxidedb.raft.RequestVoteResponse\x12X\n\rAppendEntries\x12\".oxidedb.raft.AppendEntriesRequest\x1a#.oxidedb.raft.AppendEntriesResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nraft.proto\x12\x0coxidedb.raft\"g\n\x12RequestVoteRequest\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x14\n\x0c\x63\x61ndidate_id\x18\x02 \x01(\x04\x12\x16\n\x0elast_log_index\x18\x03 \x01(\x04\x12\x15\n\rlast_log_term\x18\x04 \x01(\x04\"9\n\x13RequestVoteResponse\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x14\n\x0cvote_granted\x18\x02 \x01(\x08\"5\n\x05\x45ntry\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\r\n\x05index\x18\x02 \x01(\x04\x12\x0f\n\x07\x63ommand\x18\x03 \x01(\x0c\"\xa3\x01\n\x14\x41ppendEntriesRequest\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x11\n\tleader_id\x18\x02 \x01(\x04\x12\x16\n\x0eprev_log_index\x18\x03 \x01(\x04\x12\x15\n\rprev_log_term\x18\x04 \x01(\x04\x12$\n\x07\x65ntries\x18\x05 \x03(\x0b\x32\x13.oxidedb.raft.Entry\x12\x15\n\rleader_commit\x18\x06 \x01(\x04\"K\n\x15\x41ppendEntriesResponse\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x13\n\x0bmatch_index\x18\x03 \x01(\x04\"\x80\x01\n\x16InstallSnapshotRequest\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x11\n\tleader_id\x18\x02 \x01(\x04\x12\x1b\n\x13last_included_index\x18\x03 \x01(\x04\x12\x1a\n\x12last_included_term\x18\x04 \x01(\x04\x12\x0c\n\x04\x64\x61ta\x18\x05 \x01(\x0c\"8\n\x17InstallSnapshotResponse\x12\x0c\n\x04term\x18\x01 \x01(\x04\x12\x0f\n\x07success\x18\x02 \x01(\x08\x32\x9b\x02\n\x0bRaftService\x12R\n\x0bRequestVote\x12 .oxidedb.raft.RequestVoteRequest\x1a!.oxidedb.raft.RequestVoteResponse\x12X\n\rAppendEntries\x12\".oxidedb.raft.AppendEntriesRequest\x1a#.oxidedb.raft.AppendEntriesResponse\x12^\n\x0fInstallSnapshot\x12$.oxidedb.raft.InstallSnapshotRequest\x1a%.oxidedb.raft.InstallSnapshotResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -41,6 +41,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_APPENDENTRIESREQUEST']._serialized_end=411
   _globals['_APPENDENTRIESRESPONSE']._serialized_start=413
   _globals['_APPENDENTRIESRESPONSE']._serialized_end=488
-  _globals['_RAFTSERVICE']._serialized_start=491
-  _globals['_RAFTSERVICE']._serialized_end=678
+  _globals['_INSTALLSNAPSHOTREQUEST']._serialized_start=491
+  _globals['_INSTALLSNAPSHOTREQUEST']._serialized_end=619
+  _globals['_INSTALLSNAPSHOTRESPONSE']._serialized_start=621
+  _globals['_INSTALLSNAPSHOTRESPONSE']._serialized_end=677
+  _globals['_RAFTSERVICE']._serialized_start=680
+  _globals['_RAFTSERVICE']._serialized_end=963
 # @@protoc_insertion_point(module_scope)
