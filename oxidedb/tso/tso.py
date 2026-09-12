@@ -85,8 +85,11 @@ class TSOClient:
         
         try:
             result_data = msgpack.unpackb(result.data) if result.data else {}
+            # 服务端返回的 start_ts/end_ts 均为 inclusive（[start_ts, end_ts] 共 batch_size 个号），
+            # 客户端按半开区间 [start_ts, end_ts) 消费，因此 end 需 +1 转成 exclusive 上界，
+            # 否则当 _local_start 增长到 end_ts 时会提前触发新批次，跳过最后一个号。
             self._local_start = result_data.get("start_ts", 0)
-            self._local_end = result_data.get("end_ts", 0)
+            self._local_end = result_data.get("end_ts", 0) + 1
         except Exception:
             self._local_start = 0
             self._local_end = 0

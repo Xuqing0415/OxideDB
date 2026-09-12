@@ -1,8 +1,31 @@
+"""Durable state for a Raft node: ``currentTerm``/``votedFor``, the log and
+``commitIndex``.
+
+Two things matter for correctness here, and both were missing before:
+
+1. ``commitIndex`` must be persisted, otherwise a restarted node cannot tell
+   committed entries from merely replicated ones and would hand uncommitted
+   entries to the state machine (violating the Raft state-machine safety rule).
+2. The log must support *truncation*.  When a follower discovers a conflicting
+   suffix it deletes those entries; if that deletion is not written through,
+   the entries reappear on the next restart and the node silently diverges.
+
+:class:`EngineRaftStorage` is the engine-backed implementation (see plan E) and
+the one to use for new code.  :class:`JSONFileStorage` is kept because existing
+tests and tools construct it, and it now honours the same contract; it rewrites
+the whole file per append, so treat it as a development aid rather than a
+durable store.
+"""
+
 import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+import msgpack
+
+from oxidedb.storage.engine import Engine, create_engine
 from .node import LogEntry
 
 
@@ -20,7 +43,20 @@ class RaftStorage(ABC):
         pass
 
     @abstractmethod
+    def truncate_log(self, from_index: int) -> None:
+        """Drop every entry with ``index >= from_index``."""
+        pass
+
+    @abstractmethod
     def load_log(self) -> List[LogEntry]:
+        pass
+
+    @abstractmethod
+    def save_commit_index(self, commit_index: int) -> None:
+        pass
+
+    @abstractmethod
+    def load_commit_index(self) -> int:
         pass
 
     @abstractmethod
@@ -29,6 +65,8 @@ class RaftStorage(ABC):
 
 
 class JSONFileStorage(RaftStorage):
+    """Legacy JSON-file storage, kept for backwards compatibility."""
+
     def __init__(self, data_dir: str):
         self._data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
@@ -46,11 +84,23 @@ class JSONFileStorage(RaftStorage):
                 os.unlink(temp_path)
             raise
 
+    def _read_log(self) -> list:
+        if not os.path.exists(self._log_path):
+            return []
+        with open(self._log_path, 'r') as f:
+            return json.load(f).get("entries", [])
+
+    def _write_log(self, entries: list) -> None:
+        self._atomic_write(self._log_path, {"entries": entries})
+
     def save_meta(self, current_term: int, voted_for: Optional[int]) -> None:
         data = {
             "current_term": current_term,
-            "voted_for": voted_for
+            "voted_for": voted_for,
         }
+        if os.path.exists(self._meta_path):
+            with open(self._meta_path, 'r') as f:
+                data["commit_index"] = json.load(f).get("commit_index", 0)
         self._atomic_write(self._meta_path, data)
 
     def load_meta(self) -> tuple:
@@ -61,37 +111,120 @@ class JSONFileStorage(RaftStorage):
         return data.get("current_term", 0), data.get("voted_for", None)
 
     def append_log_entry(self, entry: LogEntry) -> None:
-        if not os.path.exists(self._log_path):
-            log_data = {"entries": []}
-        else:
-            with open(self._log_path, 'r') as f:
-                log_data = json.load(f)
-        
-        log_data["entries"].append({
+        entries = [e for e in self._read_log() if e["index"] < entry.index]
+        entries.append({
             "term": entry.term,
             "index": entry.index,
-            "command": entry.command.decode('latin-1')
+            "command": entry.command.decode('latin-1'),
         })
-        
-        self._atomic_write(self._log_path, log_data)
+        self._write_log(entries)
+
+    def truncate_log(self, from_index: int) -> None:
+        self._write_log([e for e in self._read_log() if e["index"] < from_index])
 
     def load_log(self) -> List[LogEntry]:
-        if not os.path.exists(self._log_path):
-            return []
-        with open(self._log_path, 'r') as f:
-            log_data = json.load(f)
-        
         entries = []
-        for item in log_data.get("entries", []):
+        for item in self._read_log():
             entries.append(LogEntry(
                 term=item["term"],
                 index=item["index"],
-                command=item["command"].encode('latin-1')
+                command=item["command"].encode('latin-1'),
             ))
+        entries.sort(key=lambda e: e.index)
         return entries
+
+    def save_commit_index(self, commit_index: int) -> None:
+        data = {"current_term": 0, "voted_for": None, "commit_index": commit_index}
+        if os.path.exists(self._meta_path):
+            with open(self._meta_path, 'r') as f:
+                data.update(json.load(f))
+            data["commit_index"] = commit_index
+        self._atomic_write(self._meta_path, data)
+
+    def load_commit_index(self) -> int:
+        if not os.path.exists(self._meta_path):
+            return 0
+        with open(self._meta_path, 'r') as f:
+            return json.load(f).get("commit_index", 0)
 
     def clear(self) -> None:
         if os.path.exists(self._meta_path):
             os.remove(self._meta_path)
         if os.path.exists(self._log_path):
             os.remove(self._log_path)
+
+
+class EngineRaftStorage(RaftStorage):
+    """Raft state on top of a byte-ordered :class:`~oxidedb.storage.engine.Engine`.
+
+    Keyspace (single-byte namespaces so that range scans stay cheap):
+
+    * ``\\x01 || index(8B big-endian)`` -> msgpack ``{term, command}``
+    * ``\\x02``                         -> msgpack ``{current_term, voted_for}``
+    * ``\\x03``                         -> ``commit_index`` as 8 bytes big-endian
+    """
+
+    _LOG = b"\x01"
+    _META = b"\x02"
+    _COMMIT = b"\x03"
+
+    def __init__(self, engine: Optional[Engine] = None, data_dir: Optional[str] = None):
+        if engine is None:
+            engine = create_engine(data_dir, name="raft")
+        self._engine = engine
+
+    @staticmethod
+    def _log_key(index: int) -> bytes:
+        return EngineRaftStorage._LOG + index.to_bytes(8, 'big')
+
+    def save_meta(self, current_term: int, voted_for: Optional[int]) -> None:
+        self._engine.put(self._META, msgpack.packb(
+            {"current_term": current_term, "voted_for": voted_for}, use_bin_type=True
+        ))
+
+    def load_meta(self) -> tuple:
+        raw = self._engine.get(self._META)
+        if raw is None:
+            return 0, None
+        data = msgpack.unpackb(raw, raw=False)
+        return data.get("current_term", 0), data.get("voted_for", None)
+
+    def append_log_entry(self, entry: LogEntry) -> None:
+        self._engine.put(self._log_key(entry.index), msgpack.packb(
+            {"term": entry.term, "command": entry.command}, use_bin_type=True
+        ))
+
+    def truncate_log(self, from_index: int) -> None:
+        # delete_range is what makes truncation durable in one shot: with the old
+        # append-only file the deleted suffix came back after a restart.
+        self._engine.delete_range(self._log_key(from_index), b"\x02")
+
+    def load_log(self) -> List[LogEntry]:
+        entries = []
+        for key, value in self._engine.scan(self._LOG, b"\x02"):
+            data = msgpack.unpackb(value, raw=False)
+            entries.append(LogEntry(
+                term=data["term"],
+                index=int.from_bytes(key[1:9], 'big'),
+                command=data["command"],
+            ))
+        entries.sort(key=lambda e: e.index)
+        return entries
+
+    def save_commit_index(self, commit_index: int) -> None:
+        self._engine.put(self._COMMIT, commit_index.to_bytes(8, 'big'))
+
+    def load_commit_index(self) -> int:
+        raw = self._engine.get(self._COMMIT)
+        return 0 if raw is None else int.from_bytes(raw, 'big')
+
+    def clear(self) -> None:
+        self._engine.delete_range(b"\x01", b"\x04")
+
+    def close(self) -> None:
+        self._engine.close()
+
+
+def create_raft_storage(data_dir: Optional[str] = None, engine: Optional[Engine] = None) -> RaftStorage:
+    """Engine-backed storage; ``data_dir=None`` gives an in-memory one."""
+    return EngineRaftStorage(engine=engine, data_dir=data_dir)
