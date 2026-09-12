@@ -13,6 +13,13 @@ class NodeState(Enum):
     LEADER = "leader"
 
 
+#: Command of the empty entry a new leader appends, one per term (Raft 8).
+#: It carries no state-machine work: its only job is to let the leader commit
+#: the entries it inherited from previous terms, which Raft otherwise refuses
+#: to do, and to prove the new leader's term for ReadIndex.
+NOOP_COMMAND = b""
+
+
 class LogEntry:
     def __init__(self, term: int, index: int, command: bytes):
         self.term = term
@@ -88,8 +95,11 @@ class MemoryRaftNode:
         self._election_timeout_max = election_timeout_max
         self._heartbeat_interval = heartbeat_interval
         
-        self._election_timer: Optional[threading.Timer] = None
-        self._heartbeat_timer: Optional[threading.Timer] = None
+        # Deadlines (``time.monotonic``) rather than ``threading.Timer``
+        # objects: one ticker thread per node drives both, see _tick().
+        self._election_deadline = float("inf")
+        self._next_heartbeat = float("inf")
+        self._tick_interval = 0.05
         
         self._lock = threading.RLock()
         
@@ -100,10 +110,29 @@ class MemoryRaftNode:
         self._shutdown_flag = False
         
         self._apply_results: Dict[int, ApplyResult] = {}
+
+        # One bounded pool per node instead of a thread per RPC.  Heartbeats
+        # fire every 50 ms and the old code started a thread per peer for each
+        # one, which on an idle three-node cluster meant ~80 new threads per
+        # second; the scheduling churn showed up as heartbeats arriving late
+        # and followers starting elections nobody needed.  ``_rpc_inflight``
+        # drops a heartbeat whose previous RPC to the same peer has not
+        # answered yet, so a slow peer cannot build a backlog either.
+        self._rpc_pool = ThreadPoolExecutor(
+            max_workers=max(4, 2 * len(peers)),
+            thread_name_prefix=f"raft-{node_id}",
+        )
+        self._rpc_gate = threading.Lock()
+        self._rpc_inflight: set = set()
         
         self._load_from_storage()
         
         self._start_election_timer()
+
+        self._ticker = threading.Thread(
+            target=self._tick, daemon=True, name=f"raft-{node_id}-ticker"
+        )
+        self._ticker.start()
     
     def _load_from_storage(self) -> None:
         if self._storage is None:
@@ -115,10 +144,13 @@ class MemoryRaftNode:
         
         self._log = self._storage.load_log()
         
-        self._last_applied = len(self._log)
-        
-        for entry in self._log:
-            self._state_machine.apply(entry.command)
+        # Only *committed* entries may be handed to the state machine.  Entries
+        # past commit_index are merely replicated: they stay in the log for the
+        # next leader to re-drive, and replaying them here would expose writes
+        # that were never acknowledged as committed.
+        self._commit_index = min(self._storage.load_commit_index(), len(self._log))
+        self._last_applied = 0
+        self._apply_committed_entries()
     
     def _save_meta(self) -> None:
         if self._storage is not None:
@@ -127,6 +159,14 @@ class MemoryRaftNode:
     def _save_log_entry(self, entry: LogEntry) -> None:
         if self._storage is not None:
             self._storage.append_log_entry(entry)
+
+    def _save_log_truncate(self, from_index: int) -> None:
+        if self._storage is not None:
+            self._storage.truncate_log(from_index)
+
+    def _save_commit_index(self) -> None:
+        if self._storage is not None:
+            self._storage.save_commit_index(self._commit_index)
 
     @property
     def node_id(self) -> int:
@@ -159,45 +199,63 @@ class MemoryRaftNode:
 
     def _reset_election_timer(self) -> None:
         with self._lock:
-            if self._election_timer:
-                self._election_timer.cancel()
-            timeout = random.randint(self._election_timeout_min, self._election_timeout_max) / 1000.0
-            self._election_timer = threading.Timer(timeout, self._start_election)
-            self._election_timer.daemon = True
-            self._election_timer.start()
+            self._arm_election_deadline()
 
     def _start_election_timer(self) -> None:
         with self._lock:
-            if self._election_timer:
-                self._election_timer.cancel()
-            timeout = random.randint(self._election_timeout_min, self._election_timeout_max) / 1000.0
-            self._election_timer = threading.Timer(timeout, self._start_election)
-            self._election_timer.daemon = True
-            self._election_timer.start()
+            self._arm_election_deadline()
+
+    def _arm_election_deadline(self) -> None:
+        timeout = random.randint(self._election_timeout_min, self._election_timeout_max) / 1000.0
+        self._election_deadline = time.monotonic() + timeout
 
     def _cancel_election_timer(self) -> None:
         with self._lock:
-            if self._election_timer:
-                self._election_timer.cancel()
-                self._election_timer = None
+            self._election_deadline = float("inf")
 
     def _start_heartbeat(self) -> None:
         with self._lock:
-            if self._heartbeat_timer:
-                self._heartbeat_timer.cancel()
-            interval = self._heartbeat_interval / 1000.0
-            self._heartbeat_timer = threading.Timer(interval, self._send_heartbeats)
-            self._heartbeat_timer.daemon = True
-            self._heartbeat_timer.start()
+            self._next_heartbeat = time.monotonic() + self._heartbeat_interval / 1000.0
 
     def _cancel_heartbeat(self) -> None:
         with self._lock:
-            if self._heartbeat_timer:
-                self._heartbeat_timer.cancel()
-                self._heartbeat_timer = None
+            self._next_heartbeat = float("inf")
+
+    def _tick(self) -> None:
+        """Drive the election and heartbeat deadlines from one thread.
+
+        ``threading.Timer`` allocates a thread per schedule, and a node
+        reschedules on every heartbeat it sends *and* every one it receives -
+        measured at 50-80 new threads per second on an idle three-node cluster.
+        That churn delayed heartbeats enough for followers to start elections
+        nobody needed.  Comparing two deadlines on a single thread removes it.
+        """
+        while not self._shutdown_flag:
+            try:
+                now = time.monotonic()
+                if self._state == NodeState.LEADER:
+                    if now >= self._next_heartbeat:
+                        self._next_heartbeat = now + self._heartbeat_interval / 1000.0
+                        self._send_heartbeats()
+                    sleep_for = self._next_heartbeat - time.monotonic()
+                elif now >= self._election_deadline:
+                    # _start_election arms the next deadline for us.
+                    self._election_deadline = float("inf")
+                    self._start_election()
+                    sleep_for = self._tick_interval
+                else:
+                    sleep_for = self._election_deadline - now
+            except Exception:
+                # A dead ticker would silently stop elections, so a broken tick
+                # must not kill the loop.
+                sleep_for = self._tick_interval
+            time.sleep(min(max(sleep_for, 0.001), self._tick_interval))
 
     def _start_election(self) -> None:
         with self._lock:
+            if self._shutdown_flag:
+                return
+
             if self._state == NodeState.LEADER:
                 return
             
@@ -209,9 +267,46 @@ class MemoryRaftNode:
             self._save_meta()
             
             self._reset_election_timer()
+
+            # A single-node cluster has no peers to ask, so its own vote is
+            # already a quorum.  Without this the node stayed a candidate
+            # forever, which made a one-node deployment unable to serve anything.
+            self._check_vote_count()
         
         for peer_id in self._peers:
-            threading.Thread(target=self._request_vote, args=(peer_id,), daemon=True).start()
+            self._submit_rpc(self._request_vote, peer_id)
+
+    def _submit_rpc(self, rpc: Callable, *args) -> bool:
+        """Run ``rpc`` on the node's RPC pool, or drop it if the node is gone."""
+        with self._rpc_gate:
+            if self._shutdown_flag:
+                return False
+        try:
+            self._rpc_pool.submit(rpc, *args)
+        except RuntimeError:
+            # The pool is already shut down; the result no longer matters.
+            return False
+        return True
+
+    def _dispatch_heartbeat(self, peer_id: int, *args) -> None:
+        """Send one heartbeat, unless the previous one to ``peer_id`` is pending."""
+        with self._rpc_gate:
+            if self._shutdown_flag or peer_id in self._rpc_inflight:
+                return
+            self._rpc_inflight.add(peer_id)
+
+        try:
+            self._rpc_pool.submit(self._run_gated_rpc, peer_id, *args)
+        except RuntimeError:
+            with self._rpc_gate:
+                self._rpc_inflight.discard(peer_id)
+
+    def _run_gated_rpc(self, peer_id: int, *args) -> None:
+        try:
+            self._append_entries(*args)
+        finally:
+            with self._rpc_gate:
+                self._rpc_inflight.discard(peer_id)
 
     def _request_vote(self, peer_id: int) -> None:
         try:
@@ -279,11 +374,31 @@ class MemoryRaftNode:
                     self._next_index[peer_id] = len(self._log) + 1
                     self._match_index[peer_id] = 0
                 
+                self._append_noop_entry()
                 self._send_heartbeats()
                 self._start_heartbeat()
 
+    def _append_noop_entry(self) -> None:
+        """Append the current term's empty entry, as Raft 8 requires.
+
+        Raft only commits an entry once one from the *current* term is stored on
+        a majority, so without this a freshly elected leader sat on the entries
+        it inherited from the previous term until some client happened to write
+        something.  A restarted cluster therefore could not serve the last few
+        writes it had already replicated.  One empty entry per term closes that
+        window; ``_update_commit_index`` lets a single-node cluster commit it
+        immediately.
+        """
+        entry = LogEntry(term=self._current_term, index=len(self._log) + 1, command=NOOP_COMMAND)
+        self._log.append(entry)
+        self._save_log_entry(entry)
+        self._update_commit_index()
+
     def _send_heartbeats(self) -> None:
         with self._lock:
+            if self._shutdown_flag:
+                return
+
             if self._state != NodeState.LEADER:
                 return
             
@@ -295,12 +410,13 @@ class MemoryRaftNode:
             leader_commit = self._commit_index
         
         for peer_id in peers:
-            threading.Thread(target=self._append_entries, args=(peer_id, term, next_index.get(peer_id), log, leader_commit), daemon=True).start()
-        
-        self._start_heartbeat()
+            self._dispatch_heartbeat(peer_id, peer_id, term, next_index.get(peer_id), log, leader_commit)
 
-    def _append_entries(self, peer_id: int, term: int, next_index: Optional[int], log: List[LogEntry], leader_commit: int) -> None:
+    def _append_entries(self, peer_id: int, term: int, next_index: Optional[int], log: List[LogEntry], leader_commit: int) -> Optional[AppendEntriesResponse]:
         try:
+            if self._shutdown_flag:
+                return None
+
             if next_index is None:
                 next_index = len(log) + 1
             
@@ -325,11 +441,11 @@ class MemoryRaftNode:
             else:
                 peer_node = self._get_peer_node(peer_id)
                 if peer_node is None:
-                    return
+                    return None
                 response = peer_node.append_entries(request)
             
             if response is None:
-                return
+                return None
             
             with self._lock:
                 if response.term > self._current_term:
@@ -338,10 +454,10 @@ class MemoryRaftNode:
                     self._voted_for = None
                     self._cancel_heartbeat()
                     self._reset_election_timer()
-                    return
+                    return None
                 
                 if self._state != NodeState.LEADER:
-                    return
+                    return None
                 
                 if response.success:
                     self._next_index[peer_id] = response.match_index + 1
@@ -349,8 +465,10 @@ class MemoryRaftNode:
                     self._update_commit_index()
                 else:
                     self._next_index[peer_id] = max(1, self._next_index.get(peer_id, 1) - 1)
+                
+                return response
         except Exception:
-            pass
+            return None
 
     def _update_commit_index(self) -> None:
         with self._lock:
@@ -366,6 +484,7 @@ class MemoryRaftNode:
                     if new_commit_index > 0 and new_commit_index <= len(self._log):
                         if self._log[new_commit_index - 1].term == self._current_term:
                             self._commit_index = new_commit_index
+                            self._save_commit_index()
                             self._apply_committed_entries()
 
     def _apply_committed_entries(self) -> None:
@@ -374,8 +493,13 @@ class MemoryRaftNode:
                 self._last_applied += 1
                 if self._last_applied - 1 < len(self._log):
                     entry = self._log[self._last_applied - 1]
-                    result = self._state_machine.apply(entry.command)
-                    self._apply_results[self._last_applied] = result
+                    if entry.command == NOOP_COMMAND:
+                        # A no-op belongs to the log, not to the state machine:
+                        # handing it an empty command would report an apply
+                        # error on every election.
+                        self._apply_results[self._last_applied] = ApplyResult.success()
+                    else:
+                        self._apply_results[self._last_applied] = self._state_machine.apply(entry.command)
             
             with self._apply_cond:
                 self._apply_cond.notify_all()
@@ -429,6 +553,16 @@ class MemoryRaftNode:
                     self._save_meta()
                 return AppendEntriesResponse(term=self._current_term, success=False, match_index=0)
             
+            if self._state != NodeState.FOLLOWER:
+                # Raft 5.2: a valid AppendEntries *is* the proof that this term
+                # already has a leader, so a candidate has to concede.  Without
+                # this a node that campaigned in the winner's term stayed a
+                # candidate for ever - every heartbeat kept resetting its
+                # election timer, so it never even retried at a higher term,
+                # and the cluster looked like it had never finished electing.
+                self._state = NodeState.FOLLOWER
+                self._votes_received.clear()
+            
             self._reset_election_timer()
             
             if request.prev_log_index > 0:
@@ -446,6 +580,11 @@ class MemoryRaftNode:
                 if entry.index <= len(self._log):
                     if self._log[entry.index - 1].term != entry.term:
                         del self._log[entry.index - 1:]
+                        # Make the truncation durable, otherwise the stale suffix
+                        # is resurrected by the next restart.
+                        self._save_log_truncate(entry.index)
+                        self._commit_index = min(self._commit_index, len(self._log))
+                        self._last_applied = min(self._last_applied, self._commit_index)
                         self._log.append(entry)
                         self._save_log_entry(entry)
                 else:
@@ -459,6 +598,7 @@ class MemoryRaftNode:
             
             if request.leader_commit > self._commit_index:
                 self._commit_index = min(request.leader_commit, len(self._log))
+                self._save_commit_index()
                 self._apply_committed_entries()
             
             return AppendEntriesResponse(term=self._current_term, success=True, match_index=match_index)
@@ -473,6 +613,11 @@ class MemoryRaftNode:
             self._save_log_entry(entry)
             entry_term = self._current_term
             entry_index = entry.index
+
+            # A single-node cluster has no peers to acknowledge the entry, so
+            # advance the commit index from our own match index.  With peers this
+            # is a no-op until a majority has acknowledged.
+            self._update_commit_index()
             
             peers = list(self._peers)
             term = self._current_term
@@ -517,17 +662,36 @@ class MemoryRaftNode:
             leader_commit = self._commit_index
         
         if peers:
-            responses = []
+            # ReadIndex, step 1: confirm we are still the leader by collecting a
+            # quorum of AppendEntries acknowledgements.  The previous version
+            # gathered the responses and then never inspected them, so a deposed
+            # or partitioned leader served reads it could not justify.
+            acks = 1  # our own acknowledgement
             for peer_id in peers:
                 try:
                     response = self._append_entries(peer_id, current_term, next_index.get(peer_id, 1), log, leader_commit)
-                    responses.append(response)
                 except Exception:
-                    responses.append(None)
+                    response = None
+                
+                if response is not None and response.success and response.term == current_term:
+                    acks += 1
             
             with self._lock:
                 if self._state != NodeState.LEADER or self._current_term != current_term:
                     return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Lost leadership during read")
+                
+                majority = (len(self._peers) + 1) // 2 + 1
+                if acks < majority:
+                    return ReadResult.failure(
+                        ErrorCode.ERR_NOT_LEADER,
+                        f"ReadIndex failed: {acks} acks, {majority} required",
+                    )
+                
+                # ReadIndex, step 2: those acks may have moved match_index (and
+                # therefore commit_index) forward, so re-read the commit point
+                # before deciding what "fresh enough" means for this read.
+                self._update_commit_index()
+                read_index = self._commit_index
         
         with self._lock:
             self._wait_for_apply(read_index)
@@ -549,6 +713,11 @@ class MemoryRaftNode:
     def shutdown(self) -> None:
         self._cancel_election_timer()
         self._cancel_heartbeat()
+
+        # In-flight RPCs finish on their own (every call is deadline-bounded);
+        # queued ones are dropped.  Without this the node kept a pool of
+        # worker threads alive for every cluster the tests started.
+        self._rpc_pool.shutdown(wait=False, cancel_futures=True)
         
         if self._grpc_server is not None:
             self._grpc_server.stop(grace=0.5)
@@ -642,6 +811,10 @@ class RaftCluster:
                 server.add_insecure_port(address)
             server.start()
             self._grpc_servers[node_id] = server
+            # Hand the server to the node as well: ``node.shutdown()`` is what
+            # stops it, and keeping it only in this dict leaked a listening
+            # socket plus its thread pool for the lifetime of the process.
+            node._grpc_server = server
         
         print(f"Raft cluster started with {self._num_nodes} nodes (network mode)")
 
