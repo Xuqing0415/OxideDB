@@ -45,8 +45,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   state.
 * **Timestamps** — a `TSO` Raft group hands out monotonic timestamps in batches;
   clients cache a batch to avoid a round trip per transaction.
-* **Sharding** — the keyspace is split into ranges, each range served by its own
-  Raft group.
+* **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
+  into ranges, each range served by its own Raft group, but there is no metadata
+  service, so routing is not usable end to end.
 
 ## Storage engines (plan E)
 
@@ -206,9 +207,13 @@ Honest list of what is *not* done, roughly in priority order.
   `ClientService` but nothing implements it server-side, so `OxideDBClient`
   cannot be used yet.  The CLI drives a local in-memory `Database`, not a
   cluster.
-* **Two incompatible shard maps.**  `ShardRouter` hashes keys with MD5 while
-  `ShardedRaftCluster` uses key ranges, and nothing populates the router.  There
-  is no placement driver or metadata service yet.
+* **Sharding is experimental and frozen - do not use it.**  `ShardRouter` hashes
+  keys with MD5 while `ShardedRaftCluster` uses key ranges, and nothing populates
+  the router; there is no placement driver or metadata service, so routing is not
+  usable end to end.  Making it real needs a separate metadata Raft group, a
+  routing table and a shard migration protocol, which is a project of its own
+  rather than a patch here.  The code is kept as evidence that the layout was
+  explored.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.

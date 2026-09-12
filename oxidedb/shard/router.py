@@ -1,3 +1,4 @@
+# EXPERIMENTAL: routing not wired to a metadata service, do not use
 import hashlib
 from typing import Dict, List, Tuple, Optional
 

@@ -1,3 +1,4 @@
+# EXPERIMENTAL: routing not wired to a metadata service, do not use
 import hashlib
 import time
 from typing import Dict, List, Optional, Callable
