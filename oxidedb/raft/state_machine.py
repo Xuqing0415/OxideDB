@@ -1,7 +1,7 @@
 import time
 from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Dict, Any
-from oxidedb.storage.mvcc import MVCCStorage
+from oxidedb.storage.mvcc import LockStatus, MVCCStorage
 import msgpack
 
 
@@ -45,12 +45,6 @@ class ApplyResult:
         return ApplyResult(False, error_code, error_msg)
 
 
-class LockStatus:
-    LOCKED = b"LOCKED"
-    COMMITTED = b"COMMITTED"
-    ABORTED = b"ABORTED"
-
-
 class ReadResult:
     def __init__(self, success: bool, value: Optional[bytes] = None, error_code: Optional[int] = None, error_msg: Optional[str] = None):
         self.success = success
@@ -90,10 +84,15 @@ class StateMachine(ABC):
 
 
 class MVCCStateMachine(StateMachine):
-    def __init__(self):
-        self._storage = MVCCStorage()
+    def __init__(self, storage=None):
+        """``storage`` may be an :class:`Engine`, or an already built
+        :class:`MVCCStorage`.  Omitted, the state machine keeps its original
+        in-memory behaviour."""
+        if isinstance(storage, MVCCStorage):
+            self._storage = storage
+        else:
+            self._storage = MVCCStorage(engine=storage)
         self._last_applied_timestamp = 0
-        self._locks: Dict[bytes, Dict[str, Any]] = {}
     
     def apply(self, command: bytes) -> ApplyResult:
         try:
@@ -147,10 +146,9 @@ class MVCCStateMachine(StateMachine):
         start_ts = cmd.get("start_ts")
         primary_key = cmd.get("primary_key")
         
-        if key in self._locks:
-            lock = self._locks[key]
-            if lock["status"] == LockStatus.LOCKED:
-                return ApplyResult.failure(101, f"Key {key} is locked by transaction {lock['start_ts']}")
+        lock = self._storage.get_newest_lock(key)
+        if lock is not None and lock["status"] == LockStatus.LOCKED:
+            return ApplyResult.failure(101, f"Key {key} is locked by transaction {lock['start_ts']}")
         
         existing_write = self._storage.get_latest_write(key)
         if existing_write and existing_write["commit_ts"] > start_ts:
@@ -160,15 +158,10 @@ class MVCCStateMachine(StateMachine):
         if existing_version and existing_version.timestamp > start_ts:
             return ApplyResult.failure(102, f"Key {key} has newer version with timestamp {existing_version.timestamp}")
         
-        self._locks[key] = {
-            "primary_key": primary_key,
-            "start_ts": start_ts,
-            "status": LockStatus.LOCKED,
-            "value": value,
-            "lock_time": time.time(),
-        }
-        
-        self._storage.set_write_intent(key, value, start_ts)
+        # The lock *is* the write intent.  Keeping it in the engine instead of a
+        # dict is what lets a restarted replica still commit (or clean up) a
+        # transaction it had prewritten before the crash.
+        self._storage.put_lock(key, start_ts, LockStatus.LOCKED, primary_key, time.time(), value)
         
         return ApplyResult.success()
     
@@ -177,21 +170,24 @@ class MVCCStateMachine(StateMachine):
         start_ts = cmd.get("start_ts")
         commit_ts = cmd.get("commit_ts")
         
-        if key not in self._locks:
-            return ApplyResult.failure(201, f"No lock found for key {key}")
-        
-        lock = self._locks[key]
-        if lock["start_ts"] != start_ts:
-            return ApplyResult.failure(202, f"Start timestamp mismatch: expected {start_ts}, got {lock['start_ts']}")
-        
+        lock = self._storage.get_lock(key, start_ts)
+        if lock is None:
+            newest = self._storage.get_newest_lock(key)
+            if newest is None:
+                return ApplyResult.failure(201, f"No lock found for key {key}")
+            return ApplyResult.failure(
+                ErrorCode.ERR_TIMESTAMP_MISMATCH,
+                f"Start timestamp mismatch: expected {start_ts}, got {newest['start_ts']}",
+            )
+
         if lock["status"] != LockStatus.LOCKED:
             return ApplyResult.failure(203, f"Lock status is {lock['status']}, expected LOCKED")
-        
+
         value = lock["value"]
         self._storage.set(key, value, commit_ts)
         self._storage.write_write_record(key, start_ts, commit_ts)
-        
-        del self._locks[key]
+
+        self._storage.remove_lock(key, start_ts)
         
         if commit_ts > self._last_applied_timestamp:
             self._last_applied_timestamp = commit_ts
@@ -202,17 +198,17 @@ class MVCCStateMachine(StateMachine):
         key = cmd.get("key")
         start_ts = cmd.get("start_ts")
         
-        if key not in self._locks:
-            return ApplyResult.success()
-        
-        lock = self._locks[key]
-        if lock["start_ts"] != start_ts:
-            return ApplyResult.failure(301, f"Start timestamp mismatch: expected {start_ts}, got {lock['start_ts']}")
-        
-        lock["status"] = LockStatus.ABORTED
-        self._storage.remove_write_intent(key, start_ts)
-        
-        del self._locks[key]
+        lock = self._storage.get_lock(key, start_ts)
+        if lock is None:
+            newest = self._storage.get_newest_lock(key)
+            if newest is None:
+                return ApplyResult.success()
+            return ApplyResult.failure(
+                ErrorCode.ERR_TIMESTAMP_MISMATCH,
+                f"Start timestamp mismatch: expected {start_ts}, got {newest['start_ts']}",
+            )
+
+        self._storage.remove_lock(key, start_ts)
         
         return ApplyResult.success()
     
@@ -220,18 +216,17 @@ class MVCCStateMachine(StateMachine):
         key = cmd.get("key")
         start_ts = cmd.get("start_ts")
         
-        if key not in self._locks:
+        lock = self._storage.get_newest_lock(key)
+        if lock is None:
             return ApplyResult.success()
-        
-        lock = self._locks[key]
+
         if start_ts is None or lock["start_ts"] == start_ts:
-            self._storage.remove_write_intent(key, lock["start_ts"])
-            del self._locks[key]
-        
+            self._storage.remove_lock(key, lock["start_ts"])
+
         return ApplyResult.success()
     
     def get(self, key: bytes) -> ReadResult:
-        lock = self._locks.get(key)
+        lock = self._storage.get_newest_lock(key)
         if lock is not None:
             lock_time = lock.get("lock_time", time.time())
             if time.time() - lock_time < 5:
@@ -243,6 +238,14 @@ class MVCCStateMachine(StateMachine):
         return ReadResult.success(value)
     
     def _try_clean_expired_lock(self, key: bytes, lock: Dict[str, Any]):
+        """Deliberately a no-op: a read-path must not mutate replicated state.
+
+        Locks live in the replicated state machine, so releasing one has to go
+        through the Raft log (``CommandType.CLEAN_LOCK``); deleting it here
+        would let this replica silently diverge from the others.  The background
+        ``LockCleaner`` owns that decision.  The TTL check in :meth:`get` only
+        means "stop blocking readers on a lock nobody is going to finish".
+        """
         pass
     
     def scan(self, start_key: bytes, end_key: bytes) -> List[Tuple[bytes, bytes]]:
@@ -252,4 +255,4 @@ class MVCCStateMachine(StateMachine):
         return msgpack.packb({"type": cmd_type, **kwargs})
     
     def get_lock_status(self, key: bytes) -> Optional[Dict[str, Any]]:
-        return self._locks.get(key)
+        return self._storage.get_newest_lock(key)

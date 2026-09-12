@@ -57,7 +57,7 @@ class LockCleaner:
                 state_machine = node._state_machine
                 locks_to_clean = []
                 
-                for key, lock in list(state_machine._locks.items()):
+                for key, lock in state_machine._storage.iter_locks():
                     status = lock.get('status')
                     if status != LockStatus.LOCKED:
                         continue
