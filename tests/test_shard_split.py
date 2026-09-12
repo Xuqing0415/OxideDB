@@ -1,22 +1,20 @@
 import time
+from _ports import free_addresses
+from _wait import wait_for_keys_leader
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 
 
 def test_shard_split():
-    peer_addresses = {
-        1: '127.0.0.1:21001',
-        2: '127.0.0.1:21002',
-        3: '127.0.0.1:21003',
-    }
+    peer_addresses = free_addresses()
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
-    time.sleep(3)
     
     print(f"Initial range map: {cluster._range_map}")
     
     keys = [b"a_key", b"m_key", b"z_key"]
+    wait_for_keys_leader(cluster, keys)
     for key in keys:
         leader_info = cluster.get_leader_for_key(key)
         assert leader_info is not None
@@ -43,6 +41,7 @@ def test_shard_split():
     
     print(f"After split range map: {cluster._range_map}")
     
+    wait_for_keys_leader(cluster, keys)
     for key in keys:
         leader_info = cluster.get_leader_for_key(key)
         assert leader_info is not None

@@ -1,4 +1,6 @@
 import time
+from _ports import free_addresses
+from _wait import wait_for_keys_leader
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 from oxidedb.sql.parser import SQLParser
@@ -27,18 +29,15 @@ def test_sql_parser():
 
 
 def test_sql_executor():
-    peer_addresses = {
-        1: '127.0.0.1:22001',
-        2: '127.0.0.1:22002',
-        3: '127.0.0.1:22003',
-    }
+    peer_addresses = free_addresses(num_shards=2)
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
-    time.sleep(3)
     
-    for i in range(1, 6):
-        key = f"users:{i}".encode()
+    keys = [f"users:{i}".encode() for i in range(1, 6)]
+    wait_for_keys_leader(cluster, keys)
+
+    for i, key in enumerate(keys, start=1):
         leader_info = cluster.get_leader_for_key(key)
         assert leader_info is not None
         _, leader = leader_info
@@ -49,7 +48,7 @@ def test_sql_executor():
             value=f"user_{i}".encode(),
             timestamp=100 + i,
         )
-        leader.propose(command)
+        assert leader.propose(command).success
     
     time.sleep(0.5)
     

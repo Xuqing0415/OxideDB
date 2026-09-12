@@ -2,6 +2,8 @@ import time
 import threading
 import random
 
+from _ports import free_addresses
+from _wait import wait_for_keys_leader, wait_for_leader, wait_for_tso_client
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.shard_server import ShardedRaftCluster as ShardedCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
@@ -10,36 +12,18 @@ from oxidedb.transaction.coordinator import TransactionCoordinator
 from oxidedb.transaction.smart_client import SmartClient
 
 
-_port_counter = 10000
-
-def get_free_port():
-    global _port_counter
-    _port_counter += 1
-    return _port_counter
-
-
 def test_readonly_transaction():
-    tso_peer_addresses = {
-        1: f'127.0.0.1:{get_free_port()}',
-        2: f'127.0.0.1:{get_free_port()}',
-        3: f'127.0.0.1:{get_free_port()}',
-    }
-    
     tso_cluster = TSOCluster(num_nodes=3)
-    tso_cluster.start(tso_peer_addresses)
-    time.sleep(2)
-    
-    shard_peer_addresses = {
-        1: f'127.0.0.1:{get_free_port()}',
-        2: f'127.0.0.1:{get_free_port()}',
-        3: f'127.0.0.1:{get_free_port()}',
-    }
+    tso_cluster.start(free_addresses())
     
     shard_cluster = ShardedCluster(num_nodes=3, num_shards=2)
-    shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=shard_peer_addresses)
-    time.sleep(2)
+    shard_cluster.start_network(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        peer_addresses=free_addresses(num_shards=2),
+    )
+    wait_for_keys_leader(shard_cluster, [b"test_key"])
     
-    tso_client = tso_cluster.get_client()
+    tso_client = wait_for_tso_client(tso_cluster)
     coordinator = TransactionCoordinator(tso_client, shard_cluster)
     
     txn_id1, start_ts1 = coordinator.begin()
@@ -62,27 +46,17 @@ def test_readonly_transaction():
 
 
 def test_smart_client_retry():
-    shard_peer_addresses = {
-        1: f'127.0.0.1:{get_free_port()}',
-        2: f'127.0.0.1:{get_free_port()}',
-        3: f'127.0.0.1:{get_free_port()}',
-    }
-    
     shard_cluster = ShardedCluster(num_nodes=3, num_shards=1)
-    shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=shard_peer_addresses)
-    time.sleep(2)
-    
-    tso_peer_addresses = {
-        1: f'127.0.0.1:{get_free_port()}',
-        2: f'127.0.0.1:{get_free_port()}',
-        3: f'127.0.0.1:{get_free_port()}',
-    }
+    shard_cluster.start_network(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        peer_addresses=free_addresses(),
+    )
     
     tso_cluster = TSOCluster(num_nodes=3)
-    tso_cluster.start(tso_peer_addresses)
-    time.sleep(2)
+    tso_cluster.start(free_addresses())
     
-    tso_client = tso_cluster.get_client()
+    wait_for_keys_leader(shard_cluster, [b"retry_key"])
+    tso_client = wait_for_tso_client(tso_cluster)
     smart_client = SmartClient(tso_client, shard_cluster)
     
     smart_client.put(b"retry_key", b"retry_value")
@@ -106,9 +80,8 @@ def test_smart_client_retry():
 def test_read_index_consistency():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
-    time.sleep(2)
     
-    leader = cluster.get_node(cluster.get_leader())
+    leader = cluster.get_node(wait_for_leader(cluster))
     
     command = leader._state_machine.serialize_command(
         CommandType.SET,

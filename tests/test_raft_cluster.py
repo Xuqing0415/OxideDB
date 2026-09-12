@@ -3,7 +3,44 @@ import time
 import threading
 import tempfile
 import shutil
-from oxidedb.raft import RaftCluster, MVCCStateMachine, CommandType, NodeState, MemoryRaftNode, JSONFileStorage, LogEntry
+from oxidedb.raft import (
+    RaftCluster, MVCCStateMachine, CommandType, NodeState, MemoryRaftNode,
+    JSONFileStorage, LogEntry, NOOP_COMMAND,
+)
+
+
+def _write_entries(node):
+    """The log entries that carry writes.
+
+    Each election appends a no-op entry, so the raw log length depends on how
+    many elections the cluster went through; the write count does not.
+    """
+    return [entry for entry in node._log if entry.command != NOOP_COMMAND]
+
+
+def _wait_for_single_leader(cluster, timeout=10.0):
+    """Wait until exactly one node claims leadership and the rest follow it.
+
+    A leader that has just been superseded keeps reporting LEADER until the
+    higher term reaches it, so asserting on a single instant races with that
+    handover.  What must hold is that the cluster *converges* on one leader - a
+    persistent two-leader state still fails this check.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        leaders = [
+            node_id for node_id, node in cluster._nodes.items()
+            if node.state == NodeState.LEADER
+        ]
+        if len(leaders) == 1:
+            others = [
+                node for node_id, node in cluster._nodes.items()
+                if node_id != leaders[0]
+            ]
+            if all(node.state == NodeState.FOLLOWER for node in others):
+                return leaders[0]
+        time.sleep(0.05)
+    return None
 
 
 class TestRaftCluster:
@@ -11,21 +48,20 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(3)
-        
-        leader = cluster.get_leader()
-        assert leader is not None, "No leader elected after 2 seconds"
-        print(f"Leader elected: Node {leader}")
-        
-        nodes = cluster._nodes
-        leader_node = nodes[leader]
-        assert leader_node.state == NodeState.LEADER
-        
-        for node_id, node in nodes.items():
-            if node_id != leader:
-                assert node.state == NodeState.FOLLOWER
-        
-        cluster.shutdown()
+        try:
+            leader = _wait_for_single_leader(cluster)
+            assert leader is not None, "Cluster did not converge on a single leader"
+            print(f"Leader elected: Node {leader}")
+            
+            nodes = cluster._nodes
+            leader_node = nodes[leader]
+            assert leader_node.state == NodeState.LEADER
+            
+            for node_id, node in nodes.items():
+                if node_id != leader:
+                    assert node.state == NodeState.FOLLOWER
+        finally:
+            cluster.shutdown()
 
     def test_leader_failure(self):
         cluster = RaftCluster(num_nodes=3)
@@ -206,7 +242,7 @@ class TestRaftCluster:
         time.sleep(0.5)
         
         for node_id, node in cluster._nodes.items():
-            assert len(node._log) == 5, f"Node {node_id} should have 5 log entries"
+            assert len(_write_entries(node)) == 5, f"Node {node_id} should have 5 writes"
         
         print("Log replication across all nodes successful")
         
@@ -301,7 +337,16 @@ class TestRaftCluster:
             node._log.append(LogEntry(term=5, index=1, command=command))
             node._save_meta()
             node._save_log_entry(node._log[0])
-            
+
+            # A restarted node only replays *committed* entries, so the commit
+            # index is part of the persisted state (see the state-machine safety
+            # rule in the Raft paper).
+            storage.save_commit_index(1)
+
+            # Stop the node's timers before dropping the reference: with `del`
+            # alone the election timer keeps running against a directory the
+            # test is about to remove.
+            node.shutdown()
             del node
             del state_machine
             
@@ -363,7 +408,7 @@ class TestRaftCluster:
             assert new_leader_id is not None
             
             for node_id, node in new_cluster._nodes.items():
-                assert len(node._log) == 5, f"Node {node_id} should have 5 log entries"
+                assert len(_write_entries(node)) == 5, f"Node {node_id} should have 5 writes"
                 node_sm = node._state_machine
                 for i in range(5):
                     key = f"key{i}".encode()

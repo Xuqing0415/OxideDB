@@ -1,18 +1,14 @@
 import time
 import tempfile
 import shutil
-import socket
+from _ports import allocate_port
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 from oxidedb.raft.node import NodeState
 
 
 def get_free_port():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return allocate_port()
 
 
 def test_sharded_election():
@@ -102,12 +98,15 @@ def test_sharded_proposal():
     for key in keys:
         leader_info = cluster.get_leader_for_key(key)
         assert leader_info is not None
-        
+
         _, node = leader_info
-        value = node.get(key)
+        read_result = node.get(key)
         expected = f"value_{key.decode()}".encode()
-        assert value == expected, f"Key {key} should have value {expected}, got {value}"
-        print(f"Verified key '{key.decode()}' = '{value.decode()}'")
+        assert read_result.success, f"Read for key {key} should succeed: {read_result.error_msg}"
+        assert read_result.value == expected, (
+            f"Key {key} should have value {expected}, got {read_result.value}"
+        )
+        print(f"Verified key '{key.decode()}' = '{read_result.value.decode()}'")
     
     cluster.shutdown()
     print("Sharded proposal test passed!")

@@ -1,5 +1,5 @@
 import time
-import socket
+from _ports import allocate_port
 import hashlib
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, LockStatus
@@ -9,11 +9,7 @@ from oxidedb.transaction.lock_cleaner import LockCleaner
 
 
 def get_free_port():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return allocate_port()
 
 
 def test_read_with_lock():

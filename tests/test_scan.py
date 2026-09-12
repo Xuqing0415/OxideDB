@@ -1,4 +1,5 @@
 import time
+from _ports import free_addresses
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 
@@ -62,11 +63,7 @@ def test_scan_empty_range():
 def test_scan_across_shards():
     from oxidedb.raft.shard_server import ShardedRaftCluster
     
-    peer_addresses = {
-        1: '127.0.0.1:20001',
-        2: '127.0.0.1:20002',
-        3: '127.0.0.1:20003',
-    }
+    peer_addresses = free_addresses(num_shards=2)
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)

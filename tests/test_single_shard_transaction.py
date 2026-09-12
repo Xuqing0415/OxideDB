@@ -1,15 +1,11 @@
 import time
-import socket
+from _ports import allocate_port
 from oxidedb.raft.node import RaftCluster, NodeState
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ApplyResult
 
 
 def get_free_port():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    return allocate_port()
 
 
 def test_single_shard_prewrite_commit():
