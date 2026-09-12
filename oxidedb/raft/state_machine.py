@@ -82,6 +82,19 @@ class StateMachine(ABC):
     def serialize_command(self, cmd_type: bytes, **kwargs) -> bytes:
         pass
 
+    def snapshot(self) -> bytes:
+        """Serialise the whole applied state, for log compaction.
+
+        Raising :class:`NotImplementedError` (the default) marks this state
+        machine as unsupported; a node then never compacts its log rather than
+        silently discarding state it cannot rebuild.
+        """
+        raise NotImplementedError
+
+    def restore(self, data: bytes) -> None:
+        """Replace the whole state with whatever :meth:`snapshot` produced."""
+        raise NotImplementedError
+
 
 class MVCCStateMachine(StateMachine):
     def __init__(self, storage=None):
@@ -256,3 +269,22 @@ class MVCCStateMachine(StateMachine):
     
     def get_lock_status(self, key: bytes) -> Optional[Dict[str, Any]]:
         return self._storage.get_newest_lock(key)
+
+    # -- snapshots ---------------------------------------------------------
+
+    def snapshot(self) -> bytes:
+        # The read timestamp travels with the state: a restored machine that
+        # still thought it had applied timestamp 0 would read nothing back.
+        return msgpack.packb(
+            {"ts": self._last_applied_timestamp, "storage": self._storage.dump()},
+            use_bin_type=True,
+        )
+
+    def restore(self, data: bytes) -> None:
+        if not data:
+            self._storage.load(b"")
+            self._last_applied_timestamp = 0
+            return
+        record = msgpack.unpackb(data, raw=False)
+        self._storage.load(record["storage"])
+        self._last_applied_timestamp = record["ts"]

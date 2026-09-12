@@ -41,6 +41,10 @@ _WRITE = b"\x03"
 _LOCK = b"\x04"
 _SEP = b"\x00"
 
+#: The whole MVCC keyspace.  Every namespace lives in [\x01, \x05).
+_ALL_START = b"\x01"
+_ALL_END = b"\x05"
+
 _MAX_TS = (1 << 64) - 1
 
 
@@ -296,6 +300,25 @@ class MVCCStorage:
     def close(self) -> None:
         self._engine.close()
 
+    # -- snapshots ---------------------------------------------------------
+    #
+    # A snapshot is every entry of the keyspace in a single blob.  It covers
+    # versions, write records *and* locks on purpose: restoring a state that
+    # still held an older lock would resurrect an intent the snapshot already
+    # resolved.  The blob is held in memory whole, which is fine for a
+    # prototype but is the first thing to change for a large keyspace.
+
+    def dump(self) -> bytes:
+        with self._lock:
+            rows = self._engine.scan(_ALL_START, _ALL_END)
+        return msgpack.packb(rows, use_bin_type=True)
+
+    def load(self, data: bytes) -> None:
+        rows = msgpack.unpackb(data, raw=False) if data else []
+        with self._lock:
+            self._engine.delete_range(_ALL_START, _ALL_END)
+            self._engine.put_batch((bytes(key), bytes(value)) for key, value in rows)
+
     def clear(self) -> None:
         with self._lock:
-            self._engine.delete_range(b"\x01", b"\x05")
+            self._engine.delete_range(_ALL_START, _ALL_END)

@@ -51,6 +51,17 @@ class TSOSMStateMachine(StateMachine):
     def scan(self, start_key: bytes, end_key: bytes) -> list:
         return []
 
+    def snapshot(self) -> bytes:
+        # This state machine is a counter, so the snapshot is the counter.  It
+        # is also the reason the counter must never go backwards: nothing here
+        # may hand out a timestamp twice.
+        with self._lock:
+            return msgpack.packb({"current_ts": self._current_ts})
+
+    def restore(self, data: bytes) -> None:
+        with self._lock:
+            self._current_ts = msgpack.unpackb(data, raw=False)["current_ts"] if data else 0
+
 
 class TSOClient:
     def __init__(self, tso_node: MemoryRaftNode, batch_size: int = 1000):
