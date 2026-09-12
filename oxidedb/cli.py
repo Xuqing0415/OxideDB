@@ -5,6 +5,13 @@ from oxidedb.database import Database
 
 def main():
     parser = argparse.ArgumentParser(description="OxideDB CLI")
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        metavar="DIR",
+        help="keep the data in DIR/data.sqlite3 (SQLite engine) instead of an "
+             "in-memory store that is discarded when the command exits",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     get_parser = subparsers.add_parser("get", help="Get a value by key")
@@ -23,7 +30,11 @@ def main():
 
     args = parser.parse_args()
 
-    db = Database()
+    if args.command is None:
+        parser.print_help()
+        return
+
+    db = Database(data_dir=args.data_dir)
 
     if args.command == "get":
         result = db.get(args.key.encode())
@@ -31,6 +42,7 @@ def main():
             print(result.decode())
         else:
             print("Key not found")
+            db.close()
             sys.exit(1)
     elif args.command == "set":
         db.set(args.key.encode(), args.value.encode())
@@ -44,6 +56,8 @@ def main():
             print(f"{key.decode()}: {value.decode()}")
     else:
         parser.print_help()
+
+    db.close()
 
 
 if __name__ == "__main__":

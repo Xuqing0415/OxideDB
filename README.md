@@ -4,9 +4,11 @@ A distributed transactional key/value store written in Python: Raft for
 replication, a Percolator-style two-phase commit for distributed transactions,
 MVCC for snapshot reads, and a range-sharded keyspace.
 
-It is a working prototype rather than a production database.  The sections below
-describe what is actually implemented, how the storage layers fit together, and
-which gaps are known and deliberate.
+It is a working prototype rather than a production database.  `docs/design.md`
+records why the keyspace encoding, the snapshot, the 2PC protocol and the read
+path are shaped the way they are.  The sections below describe what is actually
+implemented, how the storage layers fit together, and which gaps are known and
+deliberate.
 
 ## Quickstart
 
@@ -14,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 93 tests, roughly three minutes
+pytest tests -q             # 96 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -39,11 +41,16 @@ oxidedb scan user: user:9
 oxidedb delete user:1
 ```
 
-The CLI drives the embedded in-memory database, so **every invocation starts from
-an empty keyspace**: a `set` in one process is not visible to the next, and `get`
-exits 1 with `Key not found`.  Treat it as a way to poke at one command at a
-time, not as a store - for anything that has to persist, use the library API
-below.
+Without `--data-dir` the CLI drives the embedded database in memory, so **every
+invocation starts from an empty keyspace**: a `set` in one process is not visible
+to the next, and `get` exits 1 with `Key not found`.  That mode is a way to poke
+at one command at a time.  `--data-dir` (before the subcommand) keeps the data in
+`<dir>/data.sqlite3` behind the SQLite engine instead, and the commands persist:
+
+```
+oxidedb --data-dir ./demo set user:1 alice
+oxidedb --data-dir ./demo get user:1      # alice
+```
 
 ## Architecture
 
@@ -179,7 +186,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-93 tests.  `tests/test_durability.py` covers the correctness properties that
+96 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -194,6 +201,9 @@ rebuilt from the leader's snapshot, and the protobuf request/response mapping is
 checked byte for byte.  `tests/test_apply_results.py` covers the bounded window
 of apply results: it evicts oldest-first, and the result of the command a
 proposal waited for is still there afterwards, a rejected one included.
+`tests/test_cli.py` runs the command line front end as a subprocess: the default
+in-memory mode starts empty every time, `--data-dir` persists, and `get` reports a
+missing key with exit code 1.
 
 Three environment notes:
 
@@ -242,9 +252,7 @@ Honest list of what is *not* done, roughly in priority order.
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 * **The gRPC client path is scaffolding.**  `proto/client.proto` defines
   `ClientService` but nothing implements it server-side, so `OxideDBClient`
-  cannot be used yet.  The CLI drives a local in-memory `Database`, not a
-  cluster, and each invocation starts from an empty keyspace, so the CLI cannot
-  store anything across calls.
+  cannot be used yet.  The CLI drives a local `Database`, not a cluster.
 * **Sharding is experimental and frozen - do not use it.**  `ShardRouter` hashes
   keys with MD5 while `ShardedRaftCluster` uses key ranges, and nothing populates
   the router; there is no placement driver or metadata service, so routing is not
@@ -255,6 +263,11 @@ Honest list of what is *not* done, roughly in priority order.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
+* **A multi-key commit is atomic only on the Percolator path.**
+  `oxidedb/transaction/local.py` - the embedded `Database` and the CLI - has no
+  locks and no primary key: it writes every key of a transaction with one shared
+  `commit_ts`, so a crash between two of those writes, or a reader arriving
+  mid-commit, can observe part of a transaction.  See `docs/design.md`.
 
 ## Layout
 
@@ -269,5 +282,6 @@ oxidedb/
   client/        gRPC client SDK (server side not implemented)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
+docs/            design notes (the why, where the README has the what)
 proto/           gRPC service definitions
 tests/           pytest suite

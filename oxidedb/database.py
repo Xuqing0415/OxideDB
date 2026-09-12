@@ -1,11 +1,21 @@
 from typing import Optional, List, Tuple
+from oxidedb.storage.engine import create_engine
 from oxidedb.storage.mvcc import MVCCStorage
 from oxidedb.transaction.local import Transaction, TransactionManager
 
 
 class Database:
-    def __init__(self):
-        self._storage = MVCCStorage()
+    """Embedded single-process database over the MVCC storage layer.
+
+    ``data_dir`` picks the engine: ``None`` keeps everything in memory and throws
+    it away when the process exits, while a directory puts the keyspace in
+    ``<data_dir>/data.sqlite3`` behind the durable ``SQLiteEngine``.
+    """
+
+    def __init__(self, data_dir: Optional[str] = None):
+        # ``name="data"`` matches the convention the clusters use, where the MVCC
+        # keyspace lives in ``<data_dir>/data.sqlite3`` next to the Raft one.
+        self._storage = MVCCStorage(engine=create_engine(data_dir, name="data"))
         self._txn_manager = TransactionManager(self._storage)
 
     def begin(self) -> Transaction:
@@ -38,3 +48,6 @@ class Database:
 
     def clear(self) -> None:
         self._storage.clear()
+
+    def close(self) -> None:
+        self._storage.close()
