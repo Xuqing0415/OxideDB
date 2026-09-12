@@ -139,15 +139,19 @@ embedded tests rely on.
 python -m pytest tests -q
 ```
 
-88 tests.  `tests/test_durability.py` covers the correctness properties that
+90 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
-ReadIndex quorum.  `tests/test_snapshot.py` covers snapshots and log compaction:
-the storage round trip behind them, what a snapshot has to contain (MVCC history
-and unresolved locks included), a restart that rebuilds from the snapshot because
-the entries are gone, and a replica catching up through `InstallSnapshot` after
-the leader compacted past what it was missing.
+ReadIndex quorum.  `tests/test_snapshot.py` covers snapshots and log compaction
+in process: the storage round trip behind them, what a snapshot has to contain
+(MVCC history and unresolved locks included), a restart that rebuilds from the
+snapshot because the entries are gone, and a replica catching up through
+`InstallSnapshot` after the leader compacted past what it was missing.
+`tests/test_network_snapshot.py` drives the same catch-up over a real gRPC
+channel: a replica whose disk was wiped comes back with an empty log and is
+rebuilt from the leader's snapshot, and the protobuf request/response mapping is
+checked byte for byte.
 
 Three environment notes:
 
