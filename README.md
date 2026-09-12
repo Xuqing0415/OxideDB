@@ -14,7 +14,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 90 tests, roughly three minutes
+pytest tests -q             # 93 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -68,7 +68,8 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
 * **Raft** — leader election, log replication, commit index, durable term/vote,
   a no-op entry per election (so a new leader can commit what it inherited),
   log compaction behind a state-machine snapshot, `InstallSnapshot` for a
-  replica that fell behind that snapshot, and a ReadIndex read path.  Runs either
+  replica that fell behind that snapshot, a ReadIndex read path, and a bounded
+  window of apply results for a waiting `propose` to read back.  Runs either
   fully in-process (embedded, used by most tests) or over gRPC
   (`RaftCluster.start` vs `RaftCluster.start_network`).
 * **MVCC** — every write becomes a version keyed by timestamp, so a read at
@@ -178,7 +179,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-90 tests.  `tests/test_durability.py` covers the correctness properties that
+93 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -190,7 +191,9 @@ snapshot because the entries are gone, and a replica catching up through
 `tests/test_network_snapshot.py` drives the same catch-up over a real gRPC
 channel: a replica whose disk was wiped comes back with an empty log and is
 rebuilt from the leader's snapshot, and the protobuf request/response mapping is
-checked byte for byte.
+checked byte for byte.  `tests/test_apply_results.py` covers the bounded window
+of apply results: it evicts oldest-first, and the result of the command a
+proposal waited for is still there afterwards, a rejected one included.
 
 Three environment notes:
 
@@ -223,10 +226,6 @@ Honest list of what is *not* done, roughly in priority order.
   Over gRPC the payload also has to fit in one message: the 4 MiB default limit
   means a snapshot past that size is dropped by the peer until the channel is
   configured for more.
-* **`_apply_results` grows with the applied log.**  Results are kept per index so
-  a waiting `propose` can read the one it is waiting for; nothing prunes them
-  yet, so a long-lived cluster leaks a small object per applied command even
-  though its log is now compacted.
 * **No membership change.**  Cluster size is fixed at construction; there is no
   joint-consensus configuration change.
 * **Timing is a thread per node, not an event loop.**  Elections and heartbeats

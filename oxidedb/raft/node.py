@@ -1,6 +1,7 @@
 import time
 import random
 import threading
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Callable
 from enum import Enum
@@ -18,6 +19,27 @@ class NodeState(Enum):
 #: the entries it inherited from previous terms, which Raft otherwise refuses
 #: to do, and to prove the new leader's term for ReadIndex.
 NOOP_COMMAND = b""
+
+
+#: How many recent apply results a node keeps.  ``propose`` records the result
+#: of the index it waited for and reads exactly that one back; nothing reads
+#: older entries.  Keeping one per applied command forever is a leak, because a
+#: node that has compacted its log still pays for every command it ever applied,
+#: so the map is a window instead.  It only has to outlive a proposal timeout.
+APPLY_RESULTS_WINDOW = 1024
+
+
+class _ApplyResults(OrderedDict):
+    """Apply results for the most recent indices, oldest evicted first."""
+
+    def __init__(self, capacity: int = APPLY_RESULTS_WINDOW):
+        super().__init__()
+        self._capacity = max(1, capacity)
+
+    def record(self, index: int, result: ApplyResult) -> None:
+        self[index] = result
+        while len(self) > self._capacity:
+            self.popitem(last=False)
 
 
 class LogEntry:
@@ -101,6 +123,7 @@ class MemoryRaftNode:
         network_client: Optional['RaftNetworkClient'] = None,
         grpc_server: Optional = None,
         snapshot_interval: int = 100,
+        apply_results_window: int = APPLY_RESULTS_WINDOW,
     ):
         self._node_id = node_id
         self._peers = peers
@@ -149,7 +172,7 @@ class MemoryRaftNode:
         
         self._shutdown_flag = False
         
-        self._apply_results: Dict[int, ApplyResult] = {}
+        self._apply_results = _ApplyResults(apply_results_window)
 
         # One bounded pool per node instead of a thread per RPC.  Heartbeats
         # fire every 50 ms and the old code started a thread per peer for each
@@ -685,9 +708,11 @@ class MemoryRaftNode:
                     # A no-op belongs to the log, not to the state machine:
                     # handing it an empty command would report an apply
                     # error on every election.
-                    self._apply_results[self._last_applied] = ApplyResult.success()
+                    self._apply_results.record(self._last_applied, ApplyResult.success())
                 else:
-                    self._apply_results[self._last_applied] = self._state_machine.apply(entry.command)
+                    self._apply_results.record(
+                        self._last_applied, self._state_machine.apply(entry.command)
+                    )
             
             self._maybe_snapshot()
             
@@ -1070,7 +1095,8 @@ class RaftCluster:
 
     def start(self, state_machine_factory: Callable[[], StateMachine],
               storage_factory: Optional[Callable[[int], 'RaftStorage']] = None,
-              snapshot_interval: int = 100):
+              snapshot_interval: int = 100,
+              apply_results_window: int = APPLY_RESULTS_WINDOW):
         for node_id in range(1, self._num_nodes + 1):
             state_machine = state_machine_factory()
             self._state_machines[node_id] = state_machine
@@ -1089,6 +1115,7 @@ class RaftCluster:
                 get_peer_node=self._get_node,
                 storage=storage,
                 snapshot_interval=snapshot_interval,
+                apply_results_window=apply_results_window,
             )
             self._nodes[node_id] = node
         
@@ -1097,7 +1124,8 @@ class RaftCluster:
     def start_network(self, state_machine_factory: Callable[[], StateMachine], 
                       peer_addresses: Dict[int, str], 
                       storage_factory: Optional[Callable[[int], 'RaftStorage']] = None,
-                      snapshot_interval: int = 100):
+                      snapshot_interval: int = 100,
+                      apply_results_window: int = APPLY_RESULTS_WINDOW):
         import grpc
         from .raft_servicer import RaftServicer
         from .network_client import RaftNetworkClient
@@ -1125,6 +1153,7 @@ class RaftCluster:
                 storage=storage,
                 network_client=network_client,
                 snapshot_interval=snapshot_interval,
+                apply_results_window=apply_results_window,
             )
             self._nodes[node_id] = node
             
