@@ -8,6 +8,43 @@ It is a working prototype rather than a production database.  The sections below
 describe what is actually implemented, how the storage layers fit together, and
 which gaps are known and deliberate.
 
+## Quickstart
+
+Developed and tested on Python 3.14.  From a fresh clone:
+
+```
+pip install -e ".[test]"     # runtime dependencies, plus pytest
+pytest tests -q             # 90 tests, roughly three minutes
+```
+
+`pip install -e .` on its own installs what the library needs; the `[test]` extra
+adds `pytest` and `pytest-asyncio`, and `pip install -r requirements.txt`
+installs the same set.  The tests start dozens of local gRPC servers and need a
+writable temp directory.
+
+Next, the example, which runs set/get, a range scan, a transaction and a rollback
+against the embedded database:
+
+```
+python examples/basic_usage.py
+```
+
+There is also a small CLI, installed as `oxidedb` (equivalently
+`python -m oxidedb.cli`):
+
+```
+oxidedb set user:1 alice
+oxidedb get user:1
+oxidedb scan user: user:9
+oxidedb delete user:1
+```
+
+The CLI drives the embedded in-memory database, so **every invocation starts from
+an empty keyspace**: a `set` in one process is not visible to the next, and `get`
+exits 1 with `Key not found`.  Treat it as a way to poke at one command at a
+time, not as a store - for anything that has to persist, use the library API
+below.
+
 ## Architecture
 
 A write travels through five layers:
@@ -137,6 +174,7 @@ embedded tests rely on.
 ## Tests
 
 ```
+pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
@@ -206,7 +244,8 @@ Honest list of what is *not* done, roughly in priority order.
 * **The gRPC client path is scaffolding.**  `proto/client.proto` defines
   `ClientService` but nothing implements it server-side, so `OxideDBClient`
   cannot be used yet.  The CLI drives a local in-memory `Database`, not a
-  cluster.
+  cluster, and each invocation starts from an empty keyspace, so the CLI cannot
+  store anything across calls.
 * **Sharding is experimental and frozen - do not use it.**  `ShardRouter` hashes
   keys with MD5 while `ShardedRaftCluster` uses key ranges, and nothing populates
   the router; there is no placement driver or metadata service, so routing is not
