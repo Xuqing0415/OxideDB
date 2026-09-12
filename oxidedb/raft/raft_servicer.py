@@ -1,7 +1,16 @@
 import grpc
 from oxidedb.proto.raft_pb2_grpc import RaftServiceServicer
 from oxidedb.proto import raft_pb2
-from .node import MemoryRaftNode, RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse, LogEntry
+from .node import (
+    MemoryRaftNode,
+    RequestVoteRequest,
+    RequestVoteResponse,
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
+    LogEntry,
+)
 
 
 class RaftServicer(RaftServiceServicer):
@@ -47,4 +56,20 @@ class RaftServicer(RaftServiceServicer):
             term=response.term,
             success=response.success,
             match_index=response.match_index,
+        )
+
+    def InstallSnapshot(self, request: raft_pb2.InstallSnapshotRequest, context):
+        internal_request = InstallSnapshotRequest(
+            term=request.term,
+            leader_id=request.leader_id,
+            last_included_index=request.last_included_index,
+            last_included_term=request.last_included_term,
+            data=request.data,
+        )
+        
+        response = self._node.install_snapshot(internal_request)
+        
+        return raft_pb2.InstallSnapshotResponse(
+            term=response.term,
+            success=response.success,
         )

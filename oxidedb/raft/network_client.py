@@ -2,7 +2,14 @@ import grpc
 from typing import Dict, Optional
 from oxidedb.proto.raft_pb2_grpc import RaftServiceStub
 from oxidedb.proto import raft_pb2
-from .node import RequestVoteRequest, RequestVoteResponse, AppendEntriesRequest, AppendEntriesResponse
+from .node import (
+    RequestVoteRequest,
+    RequestVoteResponse,
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    InstallSnapshotRequest,
+    InstallSnapshotResponse,
+)
 
 
 class RaftNetworkClient:
@@ -71,6 +78,32 @@ class RaftNetworkClient:
                 term=grpc_response.term,
                 success=grpc_response.success,
                 match_index=grpc_response.match_index,
+            )
+        except grpc.RpcError:
+            return None
+
+    def install_snapshot(self, peer_id: int, request: InstallSnapshotRequest) -> Optional[InstallSnapshotResponse]:
+        stub = self._stubs.get(peer_id)
+        if stub is None:
+            return None
+        
+        try:
+            # A snapshot is much larger than a heartbeat, so it gets more room
+            # than ``self._timeout`` before the peer is written off.  A peer that
+            # times out here is simply retried with the next heartbeat.
+            grpc_request = raft_pb2.InstallSnapshotRequest(
+                term=request.term,
+                leader_id=request.leader_id,
+                last_included_index=request.last_included_index,
+                last_included_term=request.last_included_term,
+                data=request.data,
+            )
+            
+            grpc_response = stub.InstallSnapshot(grpc_request, timeout=max(self._timeout, 1.0))
+            
+            return InstallSnapshotResponse(
+                term=grpc_response.term,
+                success=grpc_response.success,
             )
         except grpc.RpcError:
             return None
