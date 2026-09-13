@@ -68,3 +68,10 @@ def wait_for_tso_client(tso_cluster, timeout: float = DEFAULT_TIMEOUT):
     """Wait until the TSO Raft group has a leader, then return a client for it."""
     return wait_until(tso_cluster.get_client, timeout=timeout,
                       message="TSO cluster elected no leader")
+
+
+def wait_for_metadata_client(metadata_cluster, timeout: float = DEFAULT_TIMEOUT):
+    """Wait until the metadata Raft group has a leader, then return a client."""
+    wait_until(metadata_cluster.get_leader_node, timeout=timeout,
+               message="metadata cluster elected no leader")
+    return metadata_cluster.get_client()

@@ -379,3 +379,49 @@ records nothing and a phantom is not detected; the read set is a set of keys.  T
 embedded `Database` path (`local.py`) has no read set at all, for the reasons in section
 3.  And a read set of n keys costs n lookups at commit, with no batching and no Bloom
 filter, which is the price of the simple version.
+
+## 7. Where the shards are: one table, read like any other
+
+Sharding was frozen because nothing owned the routing table.  Every process built one at
+startup and kept its own copy, so "which shard holds this key" was a local belief: no
+split could change it and no client had anyone to ask.  The table now has an owner - its
+own Raft group, three nodes like the timestamp group, holding one document.
+
+**Why a group of its own.**  A table that lives inside one of the shards it describes
+cannot be read while that shard is electing, and the client that needs the table most is
+the one whose shard has just moved.  The metadata group is the one group whose placement
+never changes, which makes it the one thing a client can find without first being told
+where to look.
+
+**Why one document, not a keyspace.**  Reading is a point-in-time act.  A client that
+read the ranges and then, separately, the leaders of the shards those ranges point at
+has routed on a table that never existed - the torn read of section 5, one layer up.  So
+the whole table is one key, read in one call, and the version travels with it.  That read
+is `MemoryRaftNode.get`, so the ReadIndex handshake of section 4 applies to it unchanged:
+a metadata leader that cannot reach a quorum refuses to serve the table rather than hand
+out one it cannot justify.
+
+**Why terms.**  A shard's leader is discovered by the shard, not decided by the table:
+the node that wins an election reports it, with the term it won at, and the table keeps
+the newest claim.  Without the term, two reports crossing on the wire would let a deposed
+leader write itself back in, and the table would point clients at a node that no longer
+leads - the ReadIndex bug one layer up, and just as quiet.  A report from a node outside
+the shard's replica set is refused outright, and replacing a replica set clears the
+leader if the node that claimed it is not in the new set.
+
+**Why the client caches it.**  Routing is on the hot path; the table changes when a
+shard splits or a leader moves, which is to say rarely.  So a client reads the table once
+and hands out `get_shard_for` / `get_shard_leader` from that read, refreshing when a shard
+tells it the answer was stale.  The cost is one linearizable read per refresh instead of
+one per key, and the thing that makes it safe is that the cached table was a decision
+when it was read - not that it is still current.  A stale cached table routes a key to a
+shard that will refuse it, which is a retry; a guessed table routes it somewhere nothing
+checks.
+
+**What is not covered.**  Nobody publishes to the table yet: `ShardedRaftCluster` still
+builds its range map locally and no shard server reports its leader, so the join between
+the data path and the table is the next step rather than part of this one.  A split is not
+a command here either, and it cannot be one yet: the table may only say that a range
+belongs to a new shard after the rows in it have moved, so that command arrives with the
+migration that moves them.  A table that could be told about a split before the data moved
+would be a faster way to lose data, not a feature.
