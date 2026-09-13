@@ -18,6 +18,8 @@ never looks at the cluster's own nodes, and a coordinator reads and writes by th
 table rather than by a scan of its own.
 """
 
+import time
+
 from _ports import free_addresses
 from _wait import (wait_for_keys_leader, wait_for_metadata_client,
                    wait_for_tso_client, wait_until)
@@ -139,13 +141,26 @@ def test_a_table_that_names_a_node_which_stepped_down_is_read_again():
     assert cache.refreshes == 1, "the table was read again exactly once"
 
 
-def test_a_table_that_names_nobody_is_not_a_reason_to_read_it_again():
-    """A shard with no leader is a fact about the shard, not staleness in the table."""
-    cluster = _single_shard_cluster({1: _FakeNode()})
-    cache = RoutingCache(cluster, _FakeTableSource(_table(None)))
+def test_a_table_that_names_nobody_is_read_again_once_the_publisher_could_have_spoken():
+    """A range with no leader yet is a table mid-publication, not a final answer.
 
+    Placement is published a command at a time - the ranges, then a shard's replica set,
+    then its leader - so a client whose first read lands in between holds a table that
+    names a range nobody leads.  Believed for ever, that is a client that never routes
+    again; re-read on every lookup, it is a metadata round trip per read for a shard that
+    really has no leader.  Hence a bound, which is what this pins: not this read, not the
+    next one, but the one after the publisher has had time to write.
+    """
+    cluster = _single_shard_cluster({1: _FakeNode()})
+    source = _FakeTableSource(_table(None))
+    cache = RoutingCache(cluster, source, missing_leader_refresh_interval=0.05)
+
+    assert cache.leader_for_key(KEY_A) is None, "the table does name nobody"
+    assert cache.refreshes == 0, "the table was read a moment ago; nobody could have written"
+
+    time.sleep(0.06)
     assert cache.leader_for_key(KEY_A) is None
-    assert cache.refreshes == 0, "reading it again would learn the same thing"
+    assert cache.refreshes == 1, "the client went back to the table"
 
 
 # -- the staleness only the shard knows ----------------------------------------
