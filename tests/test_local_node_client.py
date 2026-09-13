@@ -227,6 +227,29 @@ def test_a_node_that_does_not_lead_says_so_through_the_client_too():
     assert client.get(b"any").error_code == ErrorCode.ERR_NOT_LEADER
 
 
+def test_propose_on_non_leader_returns_not_leader_code():
+    """A proposal a node cannot take because it is not leading says so in the code.
+
+    The message - "Not leader" - is prose, and a client that has to match on prose to
+    decide whether to retry somewhere else is a client with a string comparison in its
+    retry path.  Reads already answered this way; this is the proposal path agreeing
+    with them, so a caller can dispatch on the code alone.  It used to be a bare 1,
+    which is `ERR_UNKNOWN`: the same code a command the machine cannot read comes back
+    with, and no way to tell "ask the leader" from "this command is broken".
+
+    Asserted through the client as well, because the thing that will be doing the
+    dispatching holds a client and not the node.
+    """
+    node = _quiet_follower()
+    client = LocalNodeClient(node)
+    command = serialize_command(CommandType.SET, key=b"k", value=b"v", timestamp=1)
+
+    for result in (node.propose(command), client.propose(command)):
+        assert not result.success
+        assert result.error_code == ErrorCode.ERR_NOT_LEADER
+        assert result.error_code != ErrorCode.ERR_UNKNOWN
+
+
 def _two_shard_cluster():
     """A TSO group and a two-shard cluster, both started but not yet settled.
 

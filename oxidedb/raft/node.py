@@ -956,7 +956,11 @@ class MemoryRaftNode:
         """
         with self._lock:
             if self._state != NodeState.LEADER:
-                return ApplyResult.failure(1, "Not leader")
+                # ERR_NOT_LEADER and not a bare 1: a caller that reaches a node
+                # which has stopped leading has to be able to tell that from a
+                # command the node could not read, and only the code can carry that
+                # - the message is prose.  Reads already answer this way.
+                return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
             if self._writes_frozen and writes_new_data(command):
                 return ApplyResult.failure(
@@ -1033,7 +1037,9 @@ class MemoryRaftNode:
     def _propose_command(self, command: bytes, timeout: float) -> ApplyResult:
         with self._lock:
             if self._state != NodeState.LEADER:
-                return ApplyResult.failure(1, "Not leader")
+                # Leadership can also be lost between the check above and this
+                # one; same code, for the same reason.
+                return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
             
             entry = LogEntry(term=self._current_term, index=self._last_log_index() + 1, command=command)
             self._log.append(entry)
