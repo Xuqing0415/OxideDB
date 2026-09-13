@@ -19,7 +19,8 @@ from .storage import RaftStorage, JSONFileStorage
 
 
 class ShardServer:
-    def __init__(self, node_id: int, num_shards: int, total_nodes: int):
+    def __init__(self, node_id: int, num_shards: int, total_nodes: int,
+                 get_peer_shard_node: Optional[Callable[[int, int], MemoryRaftNode]] = None):
         self._node_id = node_id
         self._num_shards = num_shards
         self._total_nodes = total_nodes
@@ -31,6 +32,15 @@ class ShardServer:
         #: table publishes these rather than recomputing them: an address a client is
         #: sent to has to be the one the server bound.
         self._shard_addresses: Dict[int, str] = {}
+        #: How to build one more shard.  A split asks for a group the node was not
+        #: started with, and it has to be the same kind of group as the others: the
+        #: same state machine, the same storage, the same peers, and - in network mode
+        #: - a port of its own at the address the routing table will publish.
+        self._state_machine_factory: Optional[Callable[[], StateMachine]] = None
+        self._storage_factory: Optional[Callable[[int, int], RaftStorage]] = None
+        self._peer_addresses: Optional[Dict[int, str]] = None
+        self._base_address: Optional[str] = None
+        self._get_peer_shard_node = get_peer_shard_node
     
     def set_range_map(self, range_map: Dict[int, tuple]):
         self._range_map = range_map
@@ -43,7 +53,38 @@ class ShardServer:
         return self._node_id
 
     def _get_shard_port(self, shard_id: int) -> int:
-        return self._base_port + shard_id * SHARD_PORT_STRIDE + self._node_id
+        """Where shard ``shard_id`` of this node listens.
+
+        One copy of the arithmetic for either mode: an in-process server derives it
+        from the base port and the node id, a networked one from the address the node
+        was given.  A split that worked the new shard's port out a second way would
+        publish an address nothing is listening on.
+        """
+        if self._base_address is None:
+            return self._base_port + shard_id * SHARD_PORT_STRIDE + self._node_id
+        return self._shard_port_of(self._base_address, shard_id)
+
+    @staticmethod
+    def _shard_port_of(base_address: str, shard_id: int) -> int:
+        """The port the node at ``base_address`` serves ``shard_id`` on."""
+        return int(base_address.split(":")[1]) + shard_id * SHARD_PORT_STRIDE
+
+    def _peer_address(self, base_address: str, shard_id: int) -> str:
+        host, _ = base_address.split(":")
+        return f"{host}:{self._shard_port_of(base_address, shard_id)}"
+
+    def _shard_address_for(self, shard_id: int) -> Optional[str]:
+        """Where this node serves ``shard_id``, or None for an in-process server."""
+        if self._base_address is None:
+            return None
+        host, _ = self._base_address.split(":")
+        return f"{host}:{self._get_shard_port(shard_id)}"
+
+    def _peer_node_lookup(self, shard_id: int) -> Optional[Callable[[int], MemoryRaftNode]]:
+        """How an in-process peer of ``shard_id`` is reached, or None if there is none."""
+        if self._get_peer_shard_node is None:
+            return None
+        return lambda peer_id: self._get_peer_shard_node(shard_id, peer_id)
 
     
     def _get_peer_nodes(self, shard_id: int) -> List[int]:
@@ -61,82 +102,87 @@ class ShardServer:
         """Where this node serves ``shard_id``, or None in process."""
         return self._shard_addresses.get(shard_id)
 
-    def start_shards(self, state_machine_factory: Callable[[], StateMachine], 
-                     storage_factory: Optional[Callable[[int, int], RaftStorage]] = None):
+    def start_shards(self, state_machine_factory: Callable[[], StateMachine],
+                     storage_factory: Optional[Callable[[int, int], RaftStorage]] = None,
+                     peer_addresses: Optional[Dict[int, str]] = None):
+        """Start this node's shards, in process unless ``peer_addresses`` is given.
+
+        The factories and the addresses are kept rather than used and dropped: a split
+        asks for one more shard, and :meth:`add_shard` has to build it the way these
+        were built.
+        """
+        self._state_machine_factory = state_machine_factory
+        self._storage_factory = storage_factory
+        self._peer_addresses = peer_addresses
+        if peer_addresses is not None:
+            self._base_address = peer_addresses[self._node_id]
+
         for shard_id in range(self._num_shards):
-            state_machine = state_machine_factory()
-            
-            storage = None
-            if storage_factory is not None:
-                storage = storage_factory(self._node_id, shard_id)
-            
-            peers = self._get_peer_nodes(shard_id)
-            
-            node = MemoryRaftNode(
-                node_id=self._node_id,
-                peers=peers,
-                state_machine=state_machine,
-                storage=storage,
-            )
-            
-            self._shards[shard_id] = node
-            self._shard_peers[shard_id] = peers
-        
-        print(f"ShardServer {self._node_id} started with {self._num_shards} shards")
-    
+            self.add_shard(shard_id)
+
+        mode = " (network mode)" if peer_addresses is not None else ""
+        print(f"ShardServer {self._node_id} started with {self._num_shards} shards{mode}")
+
     def start_shards_network(self, state_machine_factory: Callable[[], StateMachine],
                              peer_addresses: Dict[int, str],
                              storage_factory: Optional[Callable[[int, int], RaftStorage]] = None):
-        import grpc
-        from .raft_servicer import RaftServicer
-        from .network_client import RaftNetworkClient
-        from oxidedb.proto.raft_pb2_grpc import add_RaftServiceServicer_to_server
-        from concurrent.futures import ThreadPoolExecutor
-        
-        for shard_id in range(self._num_shards):
-            state_machine = state_machine_factory()
-            
-            storage = None
-            if storage_factory is not None:
-                storage = storage_factory(self._node_id, shard_id)
-            
-            peers = self._get_peer_nodes(shard_id)
-            
-            shard_peer_addresses = {}
-            for peer_id in peers:
-                base_addr = peer_addresses[peer_id]
-                host, port = base_addr.split(":")
-                peer_port = int(port) + shard_id * SHARD_PORT_STRIDE
-                shard_peer_addresses[peer_id] = f"{host}:{peer_port}"
-            
-            network_client = RaftNetworkClient(shard_peer_addresses)
-            
-            node = MemoryRaftNode(
-                node_id=self._node_id,
-                peers=peers,
-                state_machine=state_machine,
-                storage=storage,
-                network_client=network_client,
-            )
-            
-            self._shards[shard_id] = node
-            self._shard_peers[shard_id] = peers
-            
+        self.start_shards(state_machine_factory, storage_factory, peer_addresses)
+
+    def add_shard(self, shard_id: int) -> MemoryRaftNode:
+        """Build one more Raft group for ``shard_id`` on this node, and serve it.
+
+        This is how the groups the node started with are built, and a split goes
+        through it rather than growing its own copy: the new shard has to have the
+        same state machine and storage as its peers, and in network mode a port of its
+        own.  A group that existed only in memory would be a shard whose published
+        address nothing answers on - a range no client could reach.
+        """
+        if self._state_machine_factory is None:
+            raise RuntimeError("start the shards on this server before adding one")
+
+        storage = None
+        if self._storage_factory is not None:
+            storage = self._storage_factory(self._node_id, shard_id)
+
+        peers = self._get_peer_nodes(shard_id)
+
+        network_client = None
+        if self._peer_addresses is not None:
+            import grpc
+            from .raft_servicer import RaftServicer
+            from .network_client import RaftNetworkClient
+            from oxidedb.proto.raft_pb2_grpc import add_RaftServiceServicer_to_server
+            from concurrent.futures import ThreadPoolExecutor
+
+            network_client = RaftNetworkClient({
+                peer_id: self._peer_address(self._peer_addresses[peer_id], shard_id)
+                for peer_id in peers
+            })
+
+        node = MemoryRaftNode(
+            node_id=self._node_id,
+            peers=peers,
+            state_machine=self._state_machine_factory(),
+            storage=storage,
+            network_client=network_client,
+            get_peer_node=None if network_client is not None else self._peer_node_lookup(shard_id),
+        )
+
+        self._shards[shard_id] = node
+        self._shard_peers[shard_id] = peers
+        self._num_shards = max(self._num_shards, shard_id + 1)
+
+        address = self._shard_address_for(shard_id)
+        if address is not None:
             server = grpc.server(ThreadPoolExecutor(max_workers=10))
-            servicer = RaftServicer(node)
-            add_RaftServiceServicer_to_server(servicer, server)
-            
-            host, port = peer_addresses[self._node_id].split(":")
-            shard_port = int(port) + shard_id * SHARD_PORT_STRIDE
-            address = f"{host}:{shard_port}"
+            add_RaftServiceServicer_to_server(RaftServicer(node), server)
             server.add_insecure_port(address)
             server.start()
             self._shard_addresses[shard_id] = address
-            
             node._grpc_server = server
-        
-        print(f"ShardServer {self._node_id} started with {self._num_shards} shards (network mode)")
-    
+
+        return node
+
     def get_shard_node(self, shard_id: int) -> Optional[MemoryRaftNode]:
         return self._shards.get(shard_id)
     
@@ -168,6 +214,16 @@ class ShardedRaftCluster:
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
         return default_range_map(self._num_shards)
+
+    def _get_peer_shard_node(self, shard_id: int, peer_id: int) -> Optional[MemoryRaftNode]:
+        """The node ``peer_id`` holds for ``shard_id``, for an in-process cluster.
+
+        Networked nodes reach each other by address instead; this is what lets an
+        in-process cluster be a cluster at all rather than a set of nodes that never
+        hear from each other.
+        """
+        server = self._shard_servers.get(peer_id)
+        return None if server is None else server.get_shard_node(shard_id)
     
     def update_range_map(self, range_map: Dict[int, tuple]):
         self._range_map = range_map
@@ -181,7 +237,8 @@ class ShardedRaftCluster:
               metadata=None,
               metadata_publish_interval: float = DEFAULT_PUBLISH_INTERVAL):
         for node_id in range(1, self._num_nodes + 1):
-            server = ShardServer(node_id, self._num_shards, self._num_nodes)
+            server = ShardServer(node_id, self._num_shards, self._num_nodes,
+                                 get_peer_shard_node=self._get_peer_shard_node)
             server.set_range_map(self._range_map)
             server.start_shards(state_machine_factory, storage_factory)
             self._shard_servers[node_id] = server
@@ -198,7 +255,8 @@ class ShardedRaftCluster:
                       metadata=None,
                       metadata_publish_interval: float = DEFAULT_PUBLISH_INTERVAL):
         for node_id in range(1, self._num_nodes + 1):
-            server = ShardServer(node_id, self._num_shards, self._num_nodes)
+            server = ShardServer(node_id, self._num_shards, self._num_nodes,
+                                 get_peer_shard_node=self._get_peer_shard_node)
             server.set_range_map(self._range_map)
             server.start_shards_network(state_machine_factory, peer_addresses, storage_factory)
             self._shard_servers[node_id] = server
@@ -344,21 +402,11 @@ class ShardedRaftCluster:
             new_range_map[shard_id] = (start, split_key)
             new_range_map[new_shard_id] = (split_key, end)
             
+            # The new shard is built by each server the same way it built the shards it
+            # started with - same state machine, same storage, and in network mode a
+            # port at the address the table is about to publish.
             for server in self._shard_servers.values():
-                peers = server._get_peer_nodes(new_shard_id)
-                
-                state_machine = server._shards[shard_id]._state_machine.__class__()
-                
-                node = type(server._shards[shard_id])(
-                    node_id=server._node_id,
-                    peers=peers,
-                    state_machine=state_machine,
-                    storage=None,
-                    get_peer_node=lambda x, s=server, nid=server._node_id: self._shard_servers.get(x, s).get_shard_node(new_shard_id) if x != nid else None,
-                )
-                
-                server._shards[new_shard_id] = node
-                server._shard_peers[new_shard_id] = peers
+                server.add_shard(new_shard_id)
             
             self.update_range_map(new_range_map)
             

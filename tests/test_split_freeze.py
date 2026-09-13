@@ -48,7 +48,10 @@ def _started_cluster(num_shards=1):
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=num_shards)
     cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=num_shards),
+        # Two shards' worth of ports even for a one-shard cluster: a split binds a
+        # port for the shard it creates, and shard ``s`` of a node lives at
+        # ``base + 100 * s``, so the nodes have to be further apart than one shard.
+        peer_addresses=free_addresses(num_shards=2),
         lock_cleaner_interval=None,
     )
     return cluster
