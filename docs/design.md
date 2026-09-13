@@ -428,6 +428,20 @@ it again would learn the same thing for the price of a round trip.  Nothing is r
 on a timer, because the table is on the hot path and a fetch per key is the cost the
 cache exists to avoid.
 
+**Why a split is a command, and checked by the group.**  A split is proposed after
+the rows have moved - the table may only say a range belongs to a new shard once the
+data is there - so by the time the group hears about it the caller has already done
+the dangerous part.  That is exactly why the group does not take the caller's word for
+the shape of it.  The split point has to be strictly inside the shard's range (a half
+of zero width answers for nothing), the new id has to be free, neither half may
+overlap a range another shard owns, and all of it is checked before anything is
+replaced: a half-applied split is a range nobody owns.  A retry is a success, because
+a caller cannot tell a lost response from a lost proposal and the group has to answer
+both the same way - but only for the split it actually applied, so the same ids with a
+different replica set is a different proposal and is refused.  The left half keeps the
+old shard's id: it is the same group with less to answer for, and giving it a new one
+would mean standing up a second group to hold a copy of a shard that is already there.
+
 **What is not covered.**  The publishing half of the join is in place: the cluster starts a
 `MetadataPublisher`, which proposes the ranges once, each shard's replica set and addresses
 once, and a leader report only when the leader or its term moves.  That restraint is the
@@ -441,11 +455,12 @@ place.  What this client still is not is a client on the far side of a socket: i
 resolves the node the table names to an object it already holds, so it is a client
 inside the cluster, and dialling the address the table publishes is what the
 unimplemented client service would be.  The lock resolver - the other thing in the
-transaction path that looks for a leader - still scans the cluster's own nodes.  A split
-is not a command here either, and `split_shard` is the reason: it copies the rows into
-the new shard's group and *then* re-ranges the servers locally, which is the reverse of
-the order this section argues for, and it never tells the table - so a client routing by
-the table keeps reading the shard the rows came from.  The command cannot arrive before
-the migration does: the table may only say that a range belongs to a new shard after
-the rows in it have moved.  A table that could be told about a split before the data
-moved would be a faster way to lose data, not a feature.
+transaction path that looks for a leader - still scans the cluster's own nodes.  The
+command exists; what is missing is the caller.  `split_shard` copies the rows into the
+new shard's group and *then* re-ranges the servers locally, which is the reverse of the
+order argued above, and it never proposes the split - so a client routing by the table
+keeps reading the shard the rows came from.  Nor is it crash safe: a split that dies
+between the copy and the proposal leaves rows in a group the table has never heard of.
+Wiring it up means freezing the source shard's range for the duration and keeping a
+"split in progress" record to recover from, which is the next step rather than this
+one.

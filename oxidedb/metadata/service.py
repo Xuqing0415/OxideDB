@@ -50,6 +50,10 @@ class MetadataCommandType:
     INIT_ROUTES = b"init_routes"
     SET_SHARD_NODES = b"set_shard_nodes"
     REPORT_LEADER = b"report_leader"
+    #: Split one shard's range in two.  This is the only command that changes which
+    #: range a shard answers for, and it is proposed after the rows have moved, so
+    #: the group checks it against the table rather than believing the caller.
+    SPLIT = b"split"
 
 
 class ShardPlacement:
@@ -179,6 +183,8 @@ class MetadataStateMachine(StateMachine):
                 return self._apply_set_shard_nodes(cmd)
             if cmd_type == MetadataCommandType.REPORT_LEADER:
                 return self._apply_report_leader(cmd)
+            if cmd_type == MetadataCommandType.SPLIT:
+                return self._apply_split(cmd)
 
             return ApplyResult.failure(1, f"Unknown metadata command: {cmd_type!r}")
         except Exception as error:
@@ -236,6 +242,100 @@ class MetadataStateMachine(StateMachine):
             placement.leader_term = term
             self._version += 1
         return ApplyResult.success()
+
+    def _apply_split(self, cmd: Dict[str, Any]) -> ApplyResult:
+        """Replace one shard's range with the two halves that partition it.
+
+        The group is the arbiter here, not the caller's notebook.  A split arrives
+        after the rows have already moved - that is the only order that is safe, see
+        design.md section 7 - so applying one the caller got wrong would point clients
+        at a range that is not the range whose data was copied.  Every check is made
+        against the table as it stands, and a failure is refused whole: a half-applied
+        split would leave a range nobody owns.
+
+        The refusals, each with its own code because they mean different things to a
+        caller deciding whether to retry or to give up:
+
+        * 7 - the shard to split is not in the table.
+        * 8 - the split point is not strictly inside that shard's range, so one half
+          would be empty or the point is outside the range altogether.
+        * 9 - the new shard's id is already in the table, and not as the shard this
+          proposal would have created.
+        * 10 - the new shard's id is the shard this proposal did create, but it holds
+          a replica set that is not the one being proposed now.
+        * 11 - either half would overlap a range another shard already owns.
+
+        A retry of a split that already applied is a success rather than a conflict.
+        The caller cannot tell a lost response from a lost proposal, so the group has to
+        answer both the same way; what identifies the retry is the geometry - the left
+        half ending exactly at the split point, the new shard beginning exactly there -
+        together with the replica set that was asked for.
+
+        The left half keeps the old shard's id.  It is the same Raft group with less to
+        answer for, so its replica set, its addresses and a leader that has already
+        reported stay as they are - only the range it answers for changes.
+        """
+        shard_id = int(cmd["shard_id"])
+        new_shard_id = int(cmd["new_shard_id"])
+        split_key = bytes(cmd["split_key"])
+        nodes = [int(node_id) for node_id in cmd["nodes"]]
+        addresses = {int(entry[0]): str(entry[1]) for entry in cmd["addresses"]}
+
+        with self._lock:
+            if new_shard_id in self._shards:
+                return self._split_again(shard_id, new_shard_id, split_key, nodes)
+
+            placement = self._shards.get(shard_id)
+            if placement is None:
+                return ApplyResult.failure(
+                    7, f"shard {shard_id} is not in the routing table")
+
+            if not placement.start < split_key < placement.end:
+                return ApplyResult.failure(
+                    8, f"split point {split_key!r} is not inside shard {shard_id}'s "
+                       f"range ({placement.start!r}, {placement.end!r})")
+
+            left = ShardPlacement(shard_id, placement.start, split_key,
+                                  nodes=placement.nodes, addresses=placement.addresses,
+                                  leader_id=placement.leader_id,
+                                  leader_term=placement.leader_term)
+            right = ShardPlacement(new_shard_id, split_key, placement.end,
+                                   nodes=nodes, addresses=addresses)
+
+            for other_id, other in self._shards.items():
+                if other_id == shard_id:
+                    continue
+                for half in (left, right):
+                    if other.start < half.end and half.start < other.end:
+                        return ApplyResult.failure(
+                            11, f"shard {other_id} ({other.start!r}, {other.end!r}) "
+                                f"overlaps the new range ({half.start!r}, "
+                                f"{half.end!r})")
+
+            self._shards[shard_id] = left
+            self._shards[new_shard_id] = right
+            self._version += 1
+        return ApplyResult.success()
+
+    def _split_again(self, shard_id: int, new_shard_id: int, split_key: bytes,
+                     nodes: List[int]) -> ApplyResult:
+        """The new id is taken: is this proposal the split that took it?
+
+        Called with the lock held.  Anything that is not recognisably that same split is
+        refused, because a caller that cannot tell a lost response from a lost proposal
+        must not be able to make the second one real.
+        """
+        left = self._shards.get(shard_id)
+        right = self._shards[new_shard_id]
+        if left is not None and left.end == split_key and right.start == split_key:
+            if right.nodes == nodes:
+                return ApplyResult.success()
+            return ApplyResult.failure(
+                10, f"shard {new_shard_id} was created by a split at {split_key!r} "
+                    f"with replica set {right.nodes}, not {nodes}")
+        return ApplyResult.failure(
+            9, f"shard {new_shard_id} is already in the routing table "
+               f"({right.start!r}, {right.end!r})")
 
     # -- reads -------------------------------------------------------------
 
@@ -375,6 +475,26 @@ class MetadataClient:
         return self._propose(
             MetadataCommandType.SET_SHARD_NODES,
             shard_id=shard_id,
+            nodes=list(nodes),
+            addresses=[[node_id, address]
+                       for node_id, address in sorted((addresses or {}).items())],
+        )
+
+    def split_shard(self, shard_id: int, split_key: bytes, new_shard_id: int,
+                    nodes: List[int],
+                    addresses: Optional[Dict[int, str]] = None) -> ApplyResult:
+        """Record that ``shard_id``'s range is now two ranges, one of them new.
+
+        The rows have to have been moved before this is proposed: the table is what
+        clients route by, so a range it hands out is a range whose data has to be
+        there.  Proposing a split early is a faster way to lose data, not a feature.
+        A retry is safe - the group recognises the split it already applied.
+        """
+        return self._propose(
+            MetadataCommandType.SPLIT,
+            shard_id=shard_id,
+            split_key=split_key,
+            new_shard_id=new_shard_id,
             nodes=list(nodes),
             addresses=[[node_id, address]
                        for node_id, address in sorted((addresses or {}).items())],

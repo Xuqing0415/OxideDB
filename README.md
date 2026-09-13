@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 139 tests, roughly three minutes
+pytest tests -q             # 148 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -212,7 +212,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-139 tests.  `tests/test_durability.py` covers the correctness properties that
+148 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -266,6 +266,15 @@ loses and one from outside the replica set is refused, a second bootstrap does n
 a table that has since changed, a table restores from a snapshot with its version, and
 a group that cannot reach a quorum refuses to serve the table instead of answering from
 a local copy.
+`tests/test_split_proposal.py` covers the one command that changes which range a
+shard answers for.  A split is proposed after the rows have moved, so the group
+checks the proposal against the table instead of believing the caller: the split
+point has to be strictly inside the shard's range, the new id has to be free, and
+neither half may overlap a range another shard owns - and anything refused leaves the
+table at the same version, because a half-applied split is a range nobody owns.  A
+retry of the split that applied is a success, since a caller cannot tell a lost
+response from a lost proposal, while a retry carrying a different replica set is
+refused; and every replica is asserted to apply the same two ranges.
 `tests/test_metadata_wiring.py` closes the join: it starts the metadata group beside a
 real sharded cluster and asserts that the table a client reads names each shard's
 actual leader, at its actual term, at an address that is really listening - the test
@@ -396,9 +405,13 @@ Honest list of what is *not* done, roughly in priority order.
   looks for a leader - still scans the cluster's own nodes.  Beyond that, two things are
   missing from a split.  It does not tell the table: `split_shard` copies the newest
   committed version of each row into the new shard's group and updates every server's
-  range map locally, but nothing publishes the new ranges, so a client routing by the
-  table keeps reading the shard the rows came from.  And it does not coordinate with a
-  write: it refuses while a transaction holds a lock in the range, because that lock
+  range map locally, but proposes nothing, so a client routing by the table keeps
+  reading the shard the rows came from.  The command that would tell it exists -
+  `MetadataCommandType.SPLIT`, checked against the table by the group and idempotent for a
+  retry - and wiring `split_shard` to it, with the freeze of the source range and the
+  crash recovery that comes with it, is the next step rather than this one.  And it does
+  not coordinate with a write: it refuses while a transaction holds a lock in the range,
+  because that lock
   may be a commit that has not been applied, but one that resolved to the old shard
   just before the range moved still lands there and the copy ends up behind by it.  The
   old copies are left in the old shard, and there is no migration and no follower
