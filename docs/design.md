@@ -298,7 +298,58 @@ the key from a reader that could have seen the version the lock holds:
 a reader tripping over a lock and a cleaner hunting for abandoned ones are asking
 the same question, and a second implementation of it would be a second answer.
 
-Two limits are worth naming.  `scan` was not given the parameter, so range reads
-are still newest-only.  And none of this is serializable: reads are not recorded
-anywhere, so two transactions can still write a skew that each of them would have
-had to see to be correct.
+One limit is worth naming here: `scan` was not given the parameter, so range reads are
+still newest-only.  What makes the rest of it serializable is section 6 - the reads are
+recorded, and validated at commit.
+
+## 6. Isolation: what the read set buys
+
+Snapshot isolation gives a transaction a fixed snapshot and stops it from writing over a
+version it did not see.  It does not stop two transactions from deciding *opposite*
+things from that same snapshot and then writing keys that do not overlap.  The example
+this section is named for: two doctors are on call, each checks that the other is there,
+each concludes the shift is covered, and each writes its own key to say it is going
+home.  Percolator's prewrite check looks at the key being written and nothing else, so it
+has nothing to say about either write, and both commit.  The rule that somebody stays on
+call is broken by two commits that each look fine on their own, so no amount of care in
+the write path finds it.
+
+**What the read set is.**  A transaction records every key `coordinator.read` served it.
+At commit, after its locks are taken and before the primary key is committed, each of
+those keys is checked for a version committed after the transaction's `start_ts`.  A
+commit after the snapshot means the decision the transaction made from that read was made
+from data the serial order no longer contains, so the transaction is rolled back - locks
+released - and reported as a `SerializationError`: a refusal, not a failure.
+
+Why that catches the two doctors: each of them read what the other was about to write, so
+whichever commits second finds its own read invalidated.  One of them has to lose, which
+is the whole point - it is the rule, not either doctor, that the database is being asked
+to keep.
+
+**Why validation and the commit have to be one step.**  Validation alone is not enough.
+If two transactions validate and only then commit, they can validate a moment apart and
+both pass: at the instant each looks, the other has not committed yet, so both conclude
+their reads are still good.  That is the same anomaly one layer up.  `commit` therefore
+holds one lock across the validation and the primary commit.  It is the coordinator's
+lock, which is also the honest limit of the guarantee: two coordinators, or two
+processes, committing at once would need the conflict graph, and there is one of those.
+
+**Why not a conflict graph.**  PostgreSQL's SSI keeps rw-antidependencies in both
+directions and refuses only transactions that close a cycle.  That is less pessimistic
+than what is here - this refuses any transaction whose snapshot was superseded, even when
+no cycle exists - but it needs a registry of live transactions, edges between them, and a
+rule for which one to sacrifice.  The simpler rule is sound, needs no shared state beyond
+the keyspace, and costs one lookup per read key.  What it is not is SSI, and the README
+says so.
+
+**Why not read locks.**  The other way to catch it is to mark keys as read while a
+transaction is open and have a writer refuse to prewrite a key with a live reader.  That
+is the read half of two-phase locking, and here it would mean a second kind of lock
+record going through Raft with its own TTL and its own resolver - a second lifecycle to
+get right, for a guarantee that validation already gives.
+
+**What is not covered.**  `scan` is not part of the transaction path, so a range read
+records nothing and a phantom is not detected; the read set is a set of keys.  The
+embedded `Database` path (`local.py`) has no read set at all, for the reasons in section
+3.  And a read set of n keys costs n lookups at commit, with no batching and no Bloom
+filter, which is the price of the simple version.

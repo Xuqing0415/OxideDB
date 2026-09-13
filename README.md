@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 111 tests, roughly three minutes
+pytest tests -q             # 115 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -96,6 +96,13 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   started is a cleaner nobody runs.  A reader that trips over such a lock resolves
   it on the spot with the same code the cleaner uses, and retries, so only a
   transaction that is still live stops a read.
+* **Isolation** — snapshot reads plus a read set validated at commit: a transaction
+  remembers every key it read and is refused if any of them was committed over
+  since its snapshot.  That is what stops write skew - two doctors who each check
+  the other is on call, each decide they can go home, and each write their own key,
+  with no write conflict between them.  It is optimistic validation rather than the
+  conflict-graph SSI, so it refuses more than SSI would, and `SmartClient.run`
+  reruns the work on a fresh snapshot when a commit is refused.
 * **Timestamps** — a `TSO` Raft group hands out monotonic timestamps in batches;
   clients cache a batch to avoid a round trip per transaction.
 * **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
@@ -194,7 +201,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-111 tests.  `tests/test_durability.py` covers the correctness properties that
+115 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -224,6 +231,14 @@ the coordinator may still be about to commit.  A third does the same recovery th
 past any TTL is still reported as an obstacle, because expiry is the resolver's policy
 and the state machine deciding it would answer with a version older than one that is
 already committed.
+`tests/test_serializable.py` is the write-skew story: two transactions read the same
+snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
+the read set validated the second commit is refused and one doctor stays on call;
+with `validate_reads=False` - the control - both commits land and nobody is on call,
+which is the anomaly the validation exists for.  A third test pins the other
+direction, that a read nobody superseded does not abort, and a fourth drives the
+retry: `SmartClient.run` reruns the work, which this time sees the commit that
+invalidated it and decides not to go off call.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
@@ -268,10 +283,16 @@ Honest list of what is *not* done, roughly in priority order.
   parameter, so a range read is always the newest version.  A key whose lock is
   *older* than the snapshot is resolved by asking the primary key's write record and
   then rolled forward or cleared; what is missing is waiting, so a reader that meets
-  a lock whose transaction is still live raises and has to come back.  A
-  transaction also keeps no read set, so nothing detects a write skew - what is
-  implemented is snapshot reads plus Percolator's write conflict check, not
-  serializable snapshot isolation.
+  a lock whose transaction is still live raises and has to come back.
+* **Serializable isolation is validated, not SSI.**  A transaction is refused when any
+  key it read was committed over after its snapshot.  That prevents write skew, but it
+  also refuses read-write overlaps that a conflict graph would allow, so it aborts more
+  than SSI would.  The validation and the primary commit are ordered by one lock on the
+  coordinator, which is what makes the check atomic with the commit - and bounds the
+  guarantee to the transactions that commit through one coordinator; two committing at
+  the same time would need the graph.  The read set covers keys, not ranges: `scan` is
+  not part of the transaction path, so a phantom is not detected, and a transaction
+  with a large read set pays one lookup per key with no batching or Bloom filter.
 * **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
   every row in a single msgpack payload, so the cost of a snapshot grows with the
   data set, and it is taken and restored while holding the node lock - the node
