@@ -11,10 +11,12 @@ timestamp before that.
 """
 
 from _ports import free_addresses
-from _wait import wait_for_keys_leader, wait_for_single_leader, wait_for_tso_client
+from _wait import (wait_for_keys_leader, wait_for_single_leader,
+                   wait_for_tso_client, wait_until)
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ErrorCode
+from oxidedb.shard.router import locate
 from oxidedb.tso.tso import TSOCluster
 from oxidedb.transaction.coordinator import TransactionCoordinator
 
@@ -101,3 +103,78 @@ def test_transaction_reads_the_snapshot_it_started_with():
     shard_cluster.shutdown()
     tso_cluster.shutdown()
     print("Transaction snapshot read test passed!")
+
+
+def test_reads_of_two_keys_share_one_snapshot():
+    """Two keys, two Raft groups, one snapshot.
+
+    A reader that went to the newest version of each key could see a commit on the
+    second key that happened after it had already read the first - a torn snapshot,
+    and the thing a start_ts exists to prevent.  The two keys here are in different
+    shards, so the one snapshot has to come out of two separate Raft groups.
+    """
+    tso_cluster = TSOCluster(num_nodes=3)
+    tso_cluster.start(free_addresses())
+
+    shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
+    shard_cluster.start_network(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        peer_addresses=free_addresses(num_shards=2),
+    )
+
+    key_a = b"key0"      # first byte 0x6b -> shard 0
+    key_b = b"\x80key1"  # first byte 0x80 -> shard 1
+    shard_a = locate(shard_cluster._range_map, key_a)
+    shard_b = locate(shard_cluster._range_map, key_b)
+    assert shard_a != shard_b, "the two keys have to be in different shards"
+
+    wait_for_keys_leader(shard_cluster, [key_a, key_b])
+    tso_client = wait_for_tso_client(tso_cluster)
+    coordinator = TransactionCoordinator(tso_client, shard_cluster)
+
+    def newest(key):
+        return shard_cluster.get_leader_for_key(key)[1].get(key)
+
+    # One cross-shard transaction writes both keys.
+    writer, _ = coordinator.begin()
+    coordinator.add_write(writer, key_a, b"a1")
+    coordinator.add_write(writer, key_b, b"b1")
+    committed, commit_1 = coordinator.commit(writer)
+    assert committed, "the cross-shard commit should succeed"
+
+    # commit() returns once the primary key is committed; the secondary shard is
+    # committed in the background, so the lock on key_b outlives the call.  Wait
+    # for the commit to be visible on both shards rather than assuming it.
+    wait_until(
+        lambda: newest(key_a).success and newest(key_a).value == b"a1"
+        and newest(key_b).success and newest(key_b).value == b"b1",
+        message="the cross-shard commit never became visible on both shards",
+    )
+
+    reader, reader_start = coordinator.begin()
+    assert commit_1 <= reader_start, "the write has to be inside this snapshot"
+    assert coordinator.read(reader, key_a) == b"a1"
+    assert coordinator.read(reader, key_b) == b"b1"
+
+    # The second key changes, on its own shard, after the snapshot was taken.
+    writer2, _ = coordinator.begin()
+    coordinator.add_write(writer2, key_b, b"b2")
+    committed, commit_2 = coordinator.commit(writer2)
+    assert committed, "the second commit should succeed"
+    assert reader_start < commit_2, "it has to fall outside this snapshot"
+    wait_until(lambda: newest(key_b).success and newest(key_b).value == b"b2",
+               message="the second commit never became visible")
+
+    # The reader is still looking at one snapshot: both keys as of its start.
+    assert coordinator.read(reader, key_a) == b"a1"
+    assert coordinator.read(reader, key_b) == b"b1"
+
+    # Fresh reads are not: the key that did not change still reads a1, and the one
+    # that did now reads b2.
+    assert newest(key_a).value == b"a1"
+    assert newest(key_b).value == b"b2"
+
+    coordinator.shutdown()
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Multi-key snapshot read test passed!")

@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 104 tests, roughly three minutes
+pytest tests -q             # 105 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -189,7 +189,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-104 tests.  `tests/test_durability.py` covers the correctness properties that
+105 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -202,7 +202,9 @@ cross-shard prewrite fails: one shard refusing the lock, and one shard with no
 leader at all.  `tests/test_snapshot_read.py` reads a key at a timestamp older
 than its newest version and gets the older one, and through the coordinator checks
 that a transaction sees its own prewrite while a snapshot taken before it still
-cannot.
+cannot.  A third one reads two keys that live in different shards, changes one of
+them in between, and asserts both reads come out of the one snapshot - a torn read
+across two Raft groups is the failure it is there to catch.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
