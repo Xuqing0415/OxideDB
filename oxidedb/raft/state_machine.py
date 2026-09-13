@@ -27,6 +27,30 @@ class ErrorCode:
     ERR_LEADERSHIP_LOST = 302
     ERR_TIMEOUT = 303
     ERR_ENTRY_OVERWRITTEN = 304
+    ERR_SPLIT_IN_PROGRESS = 305
+
+
+#: The commands that add rows to a shard, as opposed to finishing work that is
+#: already in flight over it.  A shard whose rows are being copied into a new
+#: shard refuses the first kind and still accepts the second: a commit or a
+#: rollback is how a transaction that prewrote before the copy finishes, and
+#: dropping one of those would drop a write that had already been promised.
+DATA_COMMANDS = frozenset({CommandType.SET, CommandType.DELETE, CommandType.PREWRITE})
+
+
+def writes_new_data(command: bytes) -> bool:
+    """Whether ``command``, proposed to a shard, adds rows to it.
+
+    A command that cannot be read at all is treated as one that does: the only
+    thing a caller can do with an unreadable proposal is refuse it, and a shard
+    in the middle of copying its rows out is the one place where guessing the
+    other way loses a row.
+    """
+    try:
+        kind = msgpack.unpackb(command).get("type")
+    except Exception:
+        return True
+    return kind in DATA_COMMANDS
 
 
 class ApplyResult:

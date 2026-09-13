@@ -311,57 +311,91 @@ class ShardedRaftCluster:
             return False
         
         _, leader = leader_info
-        
-        # Committed state, and not while a transaction is in flight over the range.
-        # A lock in there may be a commit that has not been applied yet, and a copy
-        # taken without it would be a write lost at the moment the row moved, so the
-        # split refuses rather than race the coordinator that is making it.
-        state_machine = leader._state_machine
-        storage = state_machine._storage
-        if any(start <= key < end for key, _ in storage.iter_locks()):
-            return False
 
-        scan_result = storage.scan(start, end, state_machine._last_applied_timestamp)
-        
-        self._num_shards += 1
-        new_shard_id = self._num_shards - 1
-        
-        new_range_map = dict(self._range_map)
-        new_range_map[shard_id] = (start, split_key)
-        new_range_map[new_shard_id] = (split_key, end)
-        
-        for server in self._shard_servers.values():
-            peers = server._get_peer_nodes(new_shard_id)
-            
-            state_machine = server._shards[shard_id]._state_machine.__class__()
-            
-            node = type(server._shards[shard_id])(
-                node_id=server._node_id,
-                peers=peers,
-                state_machine=state_machine,
-                storage=None,
-                get_peer_node=lambda x, s=server, nid=server._node_id: self._shard_servers.get(x, s).get_shard_node(new_shard_id) if x != nid else None,
-            )
-            
-            server._shards[new_shard_id] = node
-            server._shard_peers[new_shard_id] = peers
-        
-        self.update_range_map(new_range_map)
-        
-        time.sleep(1)
-        
-        for key, value in scan_result:
-            if key < split_key:
-                continue  # this row stays where it is
+        # Step 1: freeze.  Everything below reads this shard's rows at one
+        # moment, and that moment only exists if nothing is writing: a row
+        # proposed after the copy was taken would sit in the shard the table is
+        # about to stop sending anyone to.  Freezing first and looking at the
+        # locks afterwards is the order that matters - the other way round, a
+        # prewrite could land between the look and the freeze.
+        self._freeze_shard(shard_id)
+        try:
+            if not self._drain_shard(shard_id):
+                return False
 
-            target = self.get_leader_for_key(key)
-            if target is not None:
-                _, new_leader = target
-                self._move_row(leader, new_leader, key, value)
-        
-        time.sleep(0.5)
-        
-        return True
+            # Committed state, and not while a transaction is in flight over the
+            # range.  A lock in there may be a commit that has not been applied
+            # yet, and a copy taken without it would be a write lost at the
+            # moment the row moved, so the split refuses rather than race the
+            # coordinator that is making it.  Nothing new can arrive while the
+            # shard is frozen, so what is left in flight is a transaction that
+            # prewrote before it and has a commit on the way.
+            state_machine = leader._state_machine
+            storage = state_machine._storage
+            if any(start <= key < end for key, _ in storage.iter_locks()):
+                return False
+
+            scan_result = storage.scan(start, end, state_machine._last_applied_timestamp)
+            
+            self._num_shards += 1
+            new_shard_id = self._num_shards - 1
+            
+            new_range_map = dict(self._range_map)
+            new_range_map[shard_id] = (start, split_key)
+            new_range_map[new_shard_id] = (split_key, end)
+            
+            for server in self._shard_servers.values():
+                peers = server._get_peer_nodes(new_shard_id)
+                
+                state_machine = server._shards[shard_id]._state_machine.__class__()
+                
+                node = type(server._shards[shard_id])(
+                    node_id=server._node_id,
+                    peers=peers,
+                    state_machine=state_machine,
+                    storage=None,
+                    get_peer_node=lambda x, s=server, nid=server._node_id: self._shard_servers.get(x, s).get_shard_node(new_shard_id) if x != nid else None,
+                )
+                
+                server._shards[new_shard_id] = node
+                server._shard_peers[new_shard_id] = peers
+            
+            self.update_range_map(new_range_map)
+            
+            time.sleep(1)
+            
+            for key, value in scan_result:
+                if key < split_key:
+                    continue  # this row stays where it is
+
+                target = self.get_leader_for_key(key)
+                if target is not None:
+                    _, new_leader = target
+                    self._move_row(leader, new_leader, key, value)
+            
+            time.sleep(0.5)
+            
+            return True
+        finally:
+            self._unfreeze_shard(shard_id)
+
+    def _shard_nodes(self, shard_id: int) -> List[MemoryRaftNode]:
+        """Every replica of ``shard_id`` this cluster is holding."""
+        nodes = [server.get_shard_node(shard_id) for server in self._shard_servers.values()]
+        return [node for node in nodes if node is not None]
+
+    def _freeze_shard(self, shard_id: int) -> None:
+        """Stop the shard taking new rows, on every replica.  See MemoryRaftNode."""
+        for node in self._shard_nodes(shard_id):
+            node.freeze_writes()
+
+    def _unfreeze_shard(self, shard_id: int) -> None:
+        for node in self._shard_nodes(shard_id):
+            node.resume_writes()
+
+    def _drain_shard(self, shard_id: int) -> bool:
+        """Wait out the writes that were admitted before the freeze."""
+        return all(node.wait_for_writes_to_drain() for node in self._shard_nodes(shard_id))
 
     def _move_row(self, source_leader: MemoryRaftNode, target_leader: MemoryRaftNode,
                   key: bytes, value: bytes) -> None:

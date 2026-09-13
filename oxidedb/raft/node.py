@@ -5,7 +5,8 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Callable, Tuple
 from enum import Enum
-from .state_machine import StateMachine, ApplyResult, ReadResult, ScanRefused, ErrorCode
+from .state_machine import (StateMachine, ApplyResult, ReadResult, ScanRefused, ErrorCode,
+                          writes_new_data)
 
 
 class NodeState(Enum):
@@ -167,6 +168,16 @@ class MemoryRaftNode:
         self._lock = threading.RLock()
         
         self._votes_received: Dict[int, bool] = {}
+
+        # Set while this shard's rows are being copied into a new shard.  A
+        # proposal that would add a row is refused from here rather than
+        # appended, so a row can neither land after the copy was taken nor be
+        # replicated to followers the copy has already moved past.  ``_proposes``
+        # counts the proposals that were admitted before the freeze and have not
+        # answered yet; draining them is what makes the copy a moment with a
+        # beginning rather than a race with whatever is already in the air.
+        self._writes_frozen = False
+        self._proposes = 0
         
         self._apply_cond = threading.Condition(self._lock)
         
@@ -938,6 +949,71 @@ class MemoryRaftNode:
             return InstallSnapshotResponse(term=self._current_term, success=True)
 
     def propose(self, command: bytes, timeout: float = 5.0) -> ApplyResult:
+        """Append ``command``, wait for it to commit and apply, and return its result.
+
+        A frozen shard refuses a command that would add rows to it (see
+        :meth:`freeze_writes`); everything else is proposed as usual.
+        """
+        with self._lock:
+            if self._state != NodeState.LEADER:
+                return ApplyResult.failure(1, "Not leader")
+
+            if self._writes_frozen and writes_new_data(command):
+                return ApplyResult.failure(
+                    ErrorCode.ERR_SPLIT_IN_PROGRESS,
+                    "the shard is being split; a new write is refused")
+
+            self._proposes += 1
+        try:
+            return self._propose_command(command, timeout)
+        finally:
+            with self._lock:
+                self._proposes -= 1
+                self._apply_cond.notify_all()
+
+    def freeze_writes(self) -> None:
+        """Refuse the proposals that would add rows to this shard.
+
+        Called before the rows are copied into the shard that will own them, and
+        cleared only once the routing table says that shard owns them.  Between
+        the two the shard answers for a range it is not allowed to add to, which
+        is the only state in which a copy can be taken and still be the whole
+        truth about that range: a row written after the copy would live in a
+        shard the table no longer sends anyone to.
+
+        Applied to every replica of the shard, not just the leader, so that an
+        election in the middle of the copy does not silently unfreeze it.
+        """
+        with self._lock:
+            self._writes_frozen = True
+
+    def resume_writes(self) -> None:
+        """Take the freeze off.  See :meth:`freeze_writes`."""
+        with self._lock:
+            self._writes_frozen = False
+
+    @property
+    def writes_frozen(self) -> bool:
+        return self._writes_frozen
+
+    def wait_for_writes_to_drain(self, timeout: float = 5.0) -> bool:
+        """Wait until no admitted proposal is still in flight.
+
+        A proposal is admitted under the same lock that the freeze is set
+        under, so once this returns, every write that was under way when the
+        freeze went on has committed and applied - and no new one was admitted
+        after it.  That is the boundary the copy is taken at.
+        """
+        deadline = time.time() + timeout
+        with self._lock:
+            while self._proposes:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._apply_cond.wait(timeout=remaining)
+            return True
+
+    def _propose_command(self, command: bytes, timeout: float) -> ApplyResult:
         with self._lock:
             if self._state != NodeState.LEADER:
                 return ApplyResult.failure(1, "Not leader")
