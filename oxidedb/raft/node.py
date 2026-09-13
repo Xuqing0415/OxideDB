@@ -971,6 +971,23 @@ class MemoryRaftNode:
                 self._proposes -= 1
                 self._apply_cond.notify_all()
 
+    def has_committed_in_its_own_term(self) -> bool:
+        """Whether this leader knows which of its entries are committed.
+
+        A node that has just won an election has a commit index it did not earn.  The
+        entries in its log were appended by leaders of earlier terms, and whether they
+        committed is something only a majority acknowledging an entry of *this* term
+        can reveal - the rule :meth:`_update_commit_index` applies, and the reason a new
+        leader appends a no-op.  Until that happens its state machine is behind what the
+        group has already committed, so a caller that has to trust that state machine
+        rather than merely append to it has to wait for this.
+        """
+        with self._lock:
+            if self._state != NodeState.LEADER:
+                return False
+            entry = self._entry_at(self._commit_index)
+            return entry is not None and entry.term == self._current_term
+
     def freeze_writes(self) -> None:
         """Refuse the proposals that would add rows to this shard.
 

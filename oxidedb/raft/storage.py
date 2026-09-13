@@ -21,6 +21,7 @@ the whole file per append, so treat it as a development aid rather than a
 durable store.
 """
 
+import base64
 import json
 import os
 import tempfile
@@ -82,6 +83,25 @@ class RaftStorage(ABC):
         pass
 
     @abstractmethod
+    def save_admin(self, key: str, value: bytes) -> None:
+        """Write a note about this node's own bookkeeping, by name.
+
+        Not Raft state: nothing here is replicated, voted on or replayed, and a
+        replica that loses its copy loses nothing another replica cannot tell it.  It
+        is where a node writes down something it is in the middle of - a shard split,
+        say - so that a restart can pick it up instead of leaving a half-done job
+        behind for nobody to notice.
+        """
+
+    @abstractmethod
+    def load_admin(self, key: str) -> Optional[bytes]:
+        """Read a note written by :meth:`save_admin`, or None if there is none."""
+
+    @abstractmethod
+    def delete_admin(self, key: str) -> None:
+        """Forget a note written by :meth:`save_admin`.  Its absence is the point."""
+
+    @abstractmethod
     def clear(self) -> None:
         pass
 
@@ -95,6 +115,7 @@ class JSONFileStorage(RaftStorage):
         self._meta_path = os.path.join(data_dir, "raft_meta.json")
         self._log_path = os.path.join(data_dir, "raft_log.json")
         self._snapshot_path = os.path.join(data_dir, "raft_snapshot.bin")
+        self._admin_path = os.path.join(data_dir, "raft_admin.json")
 
     def _atomic_write(self, path: str, data: dict) -> None:
         fd, temp_path = tempfile.mkstemp(dir=self._data_dir)
@@ -195,6 +216,28 @@ class JSONFileStorage(RaftStorage):
         with open(self._meta_path, 'r') as f:
             return json.load(f).get("commit_index", 0)
 
+    def _read_admin(self) -> dict:
+        if not os.path.exists(self._admin_path):
+            return {}
+        with open(self._admin_path, 'r') as f:
+            return json.load(f)
+
+    def save_admin(self, key: str, value: bytes) -> None:
+        # Bytes through JSON, so base64: a note is a serialised record, not text.
+        admin = self._read_admin()
+        admin[key] = base64.b64encode(value).decode('ascii')
+        self._atomic_write(self._admin_path, admin)
+
+    def load_admin(self, key: str) -> Optional[bytes]:
+        encoded = self._read_admin().get(key)
+        return None if encoded is None else base64.b64decode(encoded)
+
+    def delete_admin(self, key: str) -> None:
+        admin = self._read_admin()
+        if key in admin:
+            del admin[key]
+            self._atomic_write(self._admin_path, admin)
+
     def clear(self) -> None:
         if os.path.exists(self._meta_path):
             os.remove(self._meta_path)
@@ -202,6 +245,8 @@ class JSONFileStorage(RaftStorage):
             os.remove(self._log_path)
         if os.path.exists(self._snapshot_path):
             os.remove(self._snapshot_path)
+        if os.path.exists(self._admin_path):
+            os.remove(self._admin_path)
 
 
 class EngineRaftStorage(RaftStorage):
@@ -213,12 +258,16 @@ class EngineRaftStorage(RaftStorage):
     * ``\\x02``                         -> msgpack ``{current_term, voted_for}``
     * ``\\x03``                         -> ``commit_index`` as 8 bytes big-endian
     * ``\\x04``                         -> msgpack ``{index, term, data}`` snapshot
+    * ``\\x05 || name``                 -> whatever :meth:`save_admin` was given
+
+    The last one is not Raft state and is never replayed; see ``save_admin``.
     """
 
     _LOG = b"\x01"
     _META = b"\x02"
     _COMMIT = b"\x03"
     _SNAPSHOT = b"\x04"
+    _ADMIN = b"\x05"
 
     def __init__(self, engine: Optional[Engine] = None, data_dir: Optional[str] = None):
         if engine is None:
@@ -290,8 +339,19 @@ class EngineRaftStorage(RaftStorage):
         record = msgpack.unpackb(raw, raw=False)
         return record["index"], record["term"], record["data"]
 
+    def save_admin(self, key: str, value: bytes) -> None:
+        self._engine.put(self._ADMIN + key.encode('utf-8'), bytes(value))
+
+    def load_admin(self, key: str) -> Optional[bytes]:
+        return self._engine.get(self._ADMIN + key.encode('utf-8'))
+
+    def delete_admin(self, key: str) -> None:
+        self._engine.delete(self._ADMIN + key.encode('utf-8'))
+
     def clear(self) -> None:
-        self._engine.delete_range(b"\x01", b"\x05")
+        # \x06 rather than \x05: an admin note is state about this node too, and a
+        # node that has been wiped has not been in the middle of anything.
+        self._engine.delete_range(b"\x01", b"\x06")
 
     def close(self) -> None:
         self._engine.close()

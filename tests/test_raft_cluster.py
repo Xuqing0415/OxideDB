@@ -63,6 +63,37 @@ class TestRaftCluster:
         finally:
             cluster.shutdown()
 
+    def test_a_new_leader_does_not_know_its_commit_index_until_it_commits_one(self):
+        """Raft 5.4.2, as a split's copy check has to see it.
+
+        The entries a node finds in its log after a restart were appended by leaders of
+        earlier terms, and whether they ever committed is something only a majority
+        acknowledging an entry of *this* term reveals - which is why a new leader
+        appends a no-op.  Until that lands, its state machine can be missing rows the
+        group has long since committed, and a caller that reads that state machine
+        rather than merely appending to it has to be able to tell the difference.
+        """
+        cluster = RaftCluster(num_nodes=3)
+        cluster.start(lambda: MVCCStateMachine())
+
+        try:
+            leader = _wait_for_single_leader(cluster)
+            assert leader is not None, "Cluster did not converge on a single leader"
+            node = cluster._nodes[leader]
+
+            # An elected leader has committed the no-op of its own term, so it knows
+            # which of the entries before it are committed.
+            assert node.has_committed_in_its_own_term()
+
+            # A node that has just come back is in neither state.  The commit index is
+            # zeroed under the node's own lock, which the heartbeat acknowledgements
+            # also take, so nothing can put it back between the two lines.
+            with node._lock:
+                node._commit_index = 0
+                assert not node.has_committed_in_its_own_term()
+        finally:
+            cluster.shutdown()
+
     def test_leader_failure(self):
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
