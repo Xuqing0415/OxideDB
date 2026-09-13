@@ -65,6 +65,25 @@ class ReadResult:
         return ReadResult(False, error_code=ErrorCode.ERR_LOCKED, error_msg="Key is locked by another transaction")
 
 
+class ScanRefused(RuntimeError):
+    """A range read that will not guess.
+
+    ``scan`` answers with rows, so there is no error code to put a refusal in, and
+    an empty list is a legitimate answer: a refusal that came back as "no keys
+    matched" would be indistinguishable from a right answer, and a key left out
+    because it was locked looks exactly like a key that is not there.  So a range
+    read that cannot answer raises this instead, carrying the ``ErrorCode`` a caller
+    would need to react to (``ERR_LOCKED`` with the ``.key`` that is in the way, or
+    ``ERR_NOT_LEADER``), and an empty list from ``scan`` means the range is empty.
+    """
+
+    def __init__(self, error_code: int, error_msg: str, key: Optional[bytes] = None):
+        super().__init__(error_msg)
+        self.error_code = error_code
+        self.error_msg = error_msg
+        self.key = key
+
+
 class StateMachine(ABC):
     @abstractmethod
     def apply(self, command: bytes) -> ApplyResult:
@@ -75,7 +94,14 @@ class StateMachine(ABC):
         pass
 
     @abstractmethod
-    def scan(self, start_key: bytes, end_key: bytes) -> List[Tuple[bytes, bytes]]:
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+        """Every key in ``[start_key, end_key)``, at ``timestamp``.
+
+        The same timestamp ``get`` takes: None means the newest version, and a
+        transaction passes its own ``start_ts``.  A range read that cannot answer
+        without guessing raises :class:`ScanRefused` rather than leaving a key out.
+        """
         pass
     
     @abstractmethod
@@ -274,8 +300,37 @@ class MVCCStateMachine(StateMachine):
         value = self._storage.get(key, read_timestamp)
         return ReadResult.success(value)
     
-    def scan(self, start_key: bytes, end_key: bytes) -> List[Tuple[bytes, bytes]]:
-        return self._storage.scan(start_key, end_key, self._last_applied_timestamp)
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+        """Every key in the range, read the way :meth:`get` reads one key.
+
+        None is the newest version; a transaction passes its own ``start_ts`` and
+        gets the snapshot it started with.
+
+        A lock in the range is judged per key by the same rule as in ``get``.  One
+        older than the timestamp may hold a version this snapshot is owed, and the
+        lock does not say whether it does, so the scan refuses to answer rather
+        than leave the key out - an omitted key and a key that is not there are the
+        same thing to a caller.  A lock at the timestamp is the reader's own write
+        intent, so its value is the answer; a newer one cannot have committed into
+        this snapshot and is ignored.
+        """
+        read_timestamp = self._last_applied_timestamp if timestamp is None else timestamp
+        rows = dict(self._storage.scan(start_key, end_key, read_timestamp))
+
+        for key, lock in self._storage.iter_locks():
+            if not start_key <= key < end_key:
+                continue
+            if timestamp is None or lock["start_ts"] < timestamp:
+                raise ScanRefused(
+                    ErrorCode.ERR_LOCKED,
+                    f"Key {key!r} is locked by transaction {lock['start_ts']}",
+                    key=key,
+                )
+            if lock["start_ts"] == timestamp:
+                rows[key] = lock["value"]
+
+        return sorted(rows.items())
     
     def serialize_command(self, cmd_type: bytes, **kwargs) -> bytes:
         return msgpack.packb({"type": cmd_type, **kwargs})

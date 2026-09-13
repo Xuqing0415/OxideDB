@@ -48,7 +48,10 @@ class TSOSMStateMachine(StateMachine):
     def get(self, key: bytes, timestamp: Optional[int] = None) -> Optional[bytes]:
         return None
     
-    def scan(self, start_key: bytes, end_key: bytes) -> list:
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> list:
+        # The timestamp group is a counter, not a keyspace: there is nothing here
+        # for a range read to find, at any timestamp.
         return []
 
     def snapshot(self) -> bytes:

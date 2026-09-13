@@ -235,6 +235,11 @@ uncommitted.  Linearity was assumed, not established.
    `commit_index` is the one the answer uses.
 7. `_wait_for_apply(read_index)`, then read the local state machine.
 
+Steps 1-6 are one method, `_read_index`, because `scan` needs exactly the same
+handshake: a range read at a timestamp is only as safe as the replica serving it, so
+the quorum is a requirement of reading at all rather than a cost of reading one key.
+Only step 7 differs - the range instead of the key.
+
 ### Why the quorum proves what it needs to
 
 An acknowledgement from a majority at term `T` means no other node can have won an
@@ -310,9 +315,18 @@ a commit that lands while it waits, and the deadline is the lock's remaining TTL
 one round trip - so a lock that the shard cannot settle (no leader to ask) ends in an
 error after a bounded wait rather than in a hang.
 
-One limit is worth naming here: `scan` was not given the parameter, so range reads are
-still newest-only.  What makes the rest of it serializable is section 6 - the reads are
-recorded, and validated at commit.
+A range read is the same read over a range and gets the same rules per key: `scan`
+takes the timestamp, does the same handshake, and applies all three lock rules to every
+key it covers.  What it does not do is invent an answer.  A key whose lock it cannot
+decide about, and a replica that is not the leader, both raise `ScanRefused` instead of
+coming back with rows, because a key left out and a key that was never written are the
+same thing to a caller - and an empty list is a legitimate answer, so a refusal
+delivered as one would be indistinguishable from it.
+
+What is still missing is a range read anyone can reach.  No client or transaction path
+passes a timestamp to `scan`, and the read set is a set of keys, so a range read is not
+part of a transaction and a phantom is not detected.  What makes the rest of it
+serializable is section 6.
 
 ## 6. Isolation: what the read set buys
 

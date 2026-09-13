@@ -3,9 +3,9 @@ import random
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Tuple
 from enum import Enum
-from .state_machine import StateMachine, ApplyResult, ReadResult, ErrorCode
+from .state_machine import StateMachine, ApplyResult, ReadResult, ScanRefused, ErrorCode
 
 
 class NodeState(Enum):
@@ -994,6 +994,60 @@ class MemoryRaftNode:
         
         return ApplyResult.success()
 
+    def _read_index(self) -> Tuple[Optional[int], Optional[str]]:
+        """The commit index a read may be served at, and why not when there is none.
+
+        ReadIndex, step 1: confirm we are still the leader by collecting a quorum of
+        AppendEntries acknowledgements.  The previous version gathered the responses
+        and then never inspected them, so a deposed or partitioned leader served
+        reads it could not justify.  Step 2: those acks may have moved match_index
+        (and therefore commit_index) forward, so the commit point is re-read before
+        deciding what "fresh enough" means.
+
+        This lives here rather than inside ``get`` because ``scan`` needs the same
+        answer: a range read at a timestamp is only as safe as the replica serving
+        it, so the quorum check is the same requirement, not a cost a range read
+        could skip.
+        """
+        with self._lock:
+            if self._state != NodeState.LEADER:
+                return None, "Not leader"
+
+            current_term = self._current_term
+            peers = list(self._peers)
+            next_index = dict(self._next_index)
+            log = list(self._log)
+            log_base = self._last_included_index
+            last_log_index = self._last_log_index()
+            log_base_term = self._last_included_term
+            leader_commit = self._commit_index
+            read_index = self._commit_index
+
+        if not peers:
+            return read_index, None
+
+        acks = 1  # our own acknowledgement
+        for peer_id in peers:
+            try:
+                response = self._replicate(peer_id, current_term, next_index.get(peer_id, 1), log,
+                                           leader_commit, log_base, last_log_index, log_base_term)
+            except Exception:
+                response = None
+
+            if response is not None and response.success and response.term == current_term:
+                acks += 1
+
+        with self._lock:
+            if self._state != NodeState.LEADER or self._current_term != current_term:
+                return None, "Lost leadership during read"
+
+            majority = (len(self._peers) + 1) // 2 + 1
+            if acks < majority:
+                return None, f"ReadIndex failed: {acks} acks, {majority} required"
+
+            self._update_commit_index()
+            return self._commit_index, None
+
     def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
         """Read ``key``, at ``timestamp`` if one is given and at the newest version
         otherwise.
@@ -1005,70 +1059,44 @@ class MemoryRaftNode:
         which is at or past ``start_ts``, since the TSO issued that timestamp
         before this call.
         """
-        with self._lock:
-            if self._state != NodeState.LEADER:
-                return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
-            
-            read_index = self._commit_index
-            current_term = self._current_term
-            
-            peers = list(self._peers)
-            next_index = dict(self._next_index)
-            log = list(self._log)
-            log_base = self._last_included_index
-            last_log_index = self._last_log_index()
-            log_base_term = self._last_included_term
-            leader_commit = self._commit_index
-        
-        if peers:
-            # ReadIndex, step 1: confirm we are still the leader by collecting a
-            # quorum of AppendEntries acknowledgements.  The previous version
-            # gathered the responses and then never inspected them, so a deposed
-            # or partitioned leader served reads it could not justify.
-            acks = 1  # our own acknowledgement
-            for peer_id in peers:
-                try:
-                    response = self._replicate(peer_id, current_term, next_index.get(peer_id, 1), log,
-                                               leader_commit, log_base, last_log_index, log_base_term)
-                except Exception:
-                    response = None
-                
-                if response is not None and response.success and response.term == current_term:
-                    acks += 1
-            
-            with self._lock:
-                if self._state != NodeState.LEADER or self._current_term != current_term:
-                    return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Lost leadership during read")
-                
-                majority = (len(self._peers) + 1) // 2 + 1
-                if acks < majority:
-                    return ReadResult.failure(
-                        ErrorCode.ERR_NOT_LEADER,
-                        f"ReadIndex failed: {acks} acks, {majority} required",
-                    )
-                
-                # ReadIndex, step 2: those acks may have moved match_index (and
-                # therefore commit_index) forward, so re-read the commit point
-                # before deciding what "fresh enough" means for this read.
-                self._update_commit_index()
-                read_index = self._commit_index
-        
+        read_index, failure = self._read_index()
+        if read_index is None:
+            return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, failure)
+
         with self._lock:
             self._wait_for_apply(read_index)
-            
+
             if self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
-            
+
             return self._state_machine.get(key, timestamp)
 
-    def scan(self, start_key: bytes, end_key: bytes) -> List[tuple]:
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+        """Every key in ``[start_key, end_key)``, at ``timestamp`` if one is given.
+
+        The same read as :meth:`get`, over a range: no timestamp means the newest
+        versions, and a transaction passes its own ``start_ts``.  The ReadIndex
+        handshake is done first for the same reason - an older timestamp is only
+        safe on a replica that is at or past everything committed before the read
+        began.
+
+        What this does not do is answer when it cannot.  A key the snapshot may be
+        owed but that is behind a lock, and a read on a replica that is not the
+        leader, both raise ``ScanRefused`` rather than come back with rows: an
+        empty list means the range is empty, never that this replica could not say.
+        """
+        read_index, failure = self._read_index()
+        if read_index is None:
+            raise ScanRefused(ErrorCode.ERR_NOT_LEADER, failure)
+
         with self._lock:
+            self._wait_for_apply(read_index)
+
             if self._state != NodeState.LEADER:
-                return []
-            
-            self._wait_for_apply(self._commit_index)
-            
-            return self._state_machine.scan(start_key, end_key)
+                raise ScanRefused(ErrorCode.ERR_NOT_LEADER, "Not leader")
+
+            return self._state_machine.scan(start_key, end_key, timestamp)
 
     def shutdown(self) -> None:
         self._cancel_election_timer()

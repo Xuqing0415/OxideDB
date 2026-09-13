@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 115 tests, roughly three minutes
+pytest tests -q             # 120 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -82,7 +82,8 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
 * **MVCC** — every write becomes a version keyed by timestamp, so a read at
   timestamp `t` sees a consistent snapshot and an old transaction keeps seeing
   the data it started with.  The read path takes that timestamp (`node.get(key,
-  ts)`, `coordinator.read(txn_id, key)`); a read with no timestamp still means the
+  ts)`, `node.scan(start, end, ts)`, `coordinator.read(txn_id, key)`); a read with no
+  timestamp still means the
   newest version, which is what a linearizable read wants.  A lock in the way is a
   question rather than an error: the reader resolves it - see Transactions.  Deletes
   are tombstones, not erasures.
@@ -202,7 +203,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-115 tests.  `tests/test_durability.py` covers the correctness properties that
+120 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -217,7 +218,12 @@ than its newest version and gets the older one, and through the coordinator chec
 that a transaction sees its own prewrite while a snapshot taken before it still
 cannot.  A third one reads two keys that live in different shards, changes one of
 them in between, and asserts both reads come out of the one snapshot - a torn read
-across two Raft groups is the failure it is there to catch.
+across two Raft groups is the failure it is there to catch.  Three more do it over a
+range: a range read at a timestamp older than the newest version answers as of that
+timestamp, a key behind a lock the snapshot may be owed refuses the whole range
+instead of being left out, and a leader that cannot reach a quorum refuses the range
+the way a single-key read is refused - without that handshake it would answer with
+rows.
 `tests/test_lock_cleaner_wiring.py` starts a cluster and lets the cluster's own
 cleaner resolve a lock whose coordinator never came back; the same lock is left
 alone when the cleaner is switched off, which is what makes the first test evidence
@@ -226,12 +232,15 @@ rather than coincidence.
 coordinator that died between its primary commit and its secondary commits: the read
 asks the primary key what happened, rolls the lock forward, and returns the committed
 value that used to be an error.  A second test covers the other answer - a lock from a
-transaction that never committed is cleared, but only after its TTL, because inside it
-the coordinator may still be about to commit.  A third does the same recovery through
-`SmartClient`, which is the call a user makes.  A fourth pins the layer below: a lock
-past any TTL is still reported as an obstacle, because expiry is the resolver's policy
-and the state machine deciding it would answer with a version older than one that is
-already committed.
+transaction that never committed is cleared, and the read gets the version from before
+it, after waiting the lock's TTL out instead of reporting it.  `SmartClient` gets the
+same treatment twice: a stranded lock is resolved, and a read that meets a lock whose
+transaction is still live blocks until the writer commits, then returns what it
+committed - a value no TTL expiry could have produced.  The give-up path is pinned as
+well, with the resolver stubbed to answer the way it does when no leader can.  A last
+test is the layer below: a lock past any TTL is still reported as an obstacle, because
+expiry is the resolver's policy and the state machine deciding it would answer with a
+version older than one that is already committed.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
 snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
 the read set validated the second commit is refused and one doctor stays on call;
@@ -278,14 +287,17 @@ Honest list of what is *not* done, roughly in priority order.
   replicas hold TTLs that differ by a few milliseconds and the value is not
   covered by Raft.  Deriving it from the entry itself would make the state
   machine deterministic.
-* **Snapshot reads are not reachable from a client, and `scan` cannot do them at
-  all.**  `coordinator.read(txn_id, key)` reads at the transaction's `start_ts`,
-  but the gRPC client path is scaffolding (below), and `scan` has no timestamp
-  parameter, so a range read is always the newest version.  A key whose lock is
-  *older* than the snapshot is resolved by asking the primary key's write record and
-  then rolled forward or cleared, and a lock whose transaction is still live is waited
-  out up to the lock's remaining TTL - a reader is stopped only by a lock that outlives
-  its TTL, which means the shard could not settle it.
+* **Snapshot reads are reachable from the state machine and the node, not from a
+  client.**  `node.get(key, ts)`, `node.scan(start, end, ts)` and
+  `coordinator.read(txn_id, key)` all take a timestamp, but the gRPC client path is
+  scaffolding (below) and nothing outside the tests passes one, so a user still gets
+  the newest version.  A read whose snapshot is hidden by a lock is resolved by asking
+  the primary key's write record and then rolled forward or cleared, and a lock whose
+  transaction is still live is waited out up to the lock's remaining TTL - a reader is
+  stopped only by a lock that outlives its TTL, which means the shard could not settle
+  it.  A range read refuses rather than guesses (`ScanRefused`): a key it cannot decide
+  about, or a replica that is not the leader, is an error, because an empty range and a
+  range nobody could answer must not look the same.
 * **Serializable isolation is validated, not SSI.**  A transaction is refused when any
   key it read was committed over after its snapshot.  That prevents write skew, but it
   also refuses read-write overlaps that a conflict graph would allow, so it aborts more
@@ -293,8 +305,9 @@ Honest list of what is *not* done, roughly in priority order.
   coordinator, which is what makes the check atomic with the commit - and bounds the
   guarantee to the transactions that commit through one coordinator; two committing at
   the same time would need the graph.  The read set covers keys, not ranges: `scan` is
-  not part of the transaction path, so a phantom is not detected, and a transaction
-  with a large read set pays one lookup per key with no batching or Bloom filter.
+  not part of the transaction path - it can be read at a timestamp, but it records
+  nothing - so a phantom is not detected, and a transaction with a large read set pays
+  one lookup per key with no batching or Bloom filter.
 * **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
   every row in a single msgpack payload, so the cost of a snapshot grows with the
   data set, and it is taken and restored while holding the node lock - the node

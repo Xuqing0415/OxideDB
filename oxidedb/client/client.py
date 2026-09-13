@@ -60,7 +60,8 @@ class OxideDBClient:
                 return False
             raise
 
-    def scan(self, start_key: bytes, end_key: bytes) -> List[Tuple[bytes, bytes]]:
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
         address = self._router.get_leader_address_for_key(start_key)
         if not address:
             return []
