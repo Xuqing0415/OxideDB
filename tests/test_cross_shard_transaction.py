@@ -1,14 +1,36 @@
 import time
 from _ports import allocate_port
-import hashlib
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
+from oxidedb.shard.router import locate
 from oxidedb.tso.tso import TSOCluster, TSOClient
 from oxidedb.transaction.coordinator import TransactionCoordinator
 
 
 def get_free_port():
     return allocate_port()
+
+
+def shard_ids(cluster, *keys):
+    '''Which shard the cluster's own router puts each key in.'''
+    return [locate(cluster._range_map, key) for key in keys]
+
+
+def assert_spans_two_shards(coordinator, txn_id, shard_id_1, shard_id_2):
+    '''Fail loudly unless this transaction really touches two shards.
+
+    Two separate checks on purpose.  The first pins the keys to different
+    ranges; the second pins the commit path's own grouping.  A change to either
+    one lands here instead of quietly turning this back into a single-shard
+    test - which is how the md5 assertion this replaced stayed green.
+    '''
+    assert shard_id_1 != shard_id_2, "Keys should be in different shards"
+
+    groups = coordinator._group_keys_by_shard(coordinator.get_transaction(txn_id))
+    assert len(groups) == 2, (
+        "Commit path grouped the keys into shard(s) %s; it would touch one Raft group"
+        % sorted(groups)
+    )
 
 
 def test_cross_shard_prewrite():
@@ -39,16 +61,21 @@ def test_cross_shard_prewrite():
     
     txn_id, start_ts = coordinator.begin()
     
-    key1 = b"key_shard_a"
-    key2 = b"key_shard_b"
-    
+    key1 = b"key_shard_a"       # first byte 0x6b -> shard 0
+    key2 = b"\x80key_shard_b"   # first byte 0x80 -> shard 1
+
     coordinator.add_write(txn_id, key1, b"value_a")
     coordinator.add_write(txn_id, key2, b"value_b")
-    
-    shard_id_1 = int(hashlib.md5(key1).hexdigest(), 16) % 2
-    shard_id_2 = int(hashlib.md5(key2).hexdigest(), 16) % 2
-    
-    assert shard_id_1 != shard_id_2, "Keys should be in different shards"
+
+    shard_id_1, shard_id_2 = shard_ids(shard_cluster, key1, key2)
+    assert_spans_two_shards(coordinator, txn_id, shard_id_1, shard_id_2)
+
+    print(f"{key1!r} -> shard {shard_id_1}, {key2!r} -> shard {shard_id_2}")
+
+    leader_1 = shard_cluster.get_leader_for_key(key1)
+    leader_2 = shard_cluster.get_leader_for_key(key2)
+    assert leader_1 is not None and leader_2 is not None
+    assert leader_1[1] is not leader_2[1], "Both keys are served by the same Raft group"
     
     commit_success, commit_ts = coordinator.commit(txn_id)
     assert commit_success, "Cross-shard commit should succeed"
@@ -66,7 +93,7 @@ def test_cross_shard_prewrite():
         expected = b"value_a" if key == key1 else b"value_b"
         assert value == expected, f"Key {key} should have value {expected}, got {value}"
     
-    print(f"Cross-shard transaction: key1={key1.decode()} in shard {shard_id_1}, key2={key2.decode()} in shard {shard_id_2}")
+    print(f"Cross-shard transaction: {key1!r} in shard {shard_id_1}, {key2!r} in shard {shard_id_2}")
     print("Both keys committed successfully!")
     
     coordinator.shutdown()
@@ -101,8 +128,8 @@ def test_cross_shard_rollback():
     
     coordinator = TransactionCoordinator(tso_client, shard_cluster)
     
-    key1 = b"key0"
-    key2 = b"key1"
+    key1 = b"key0"              # first byte 0x6b -> shard 0
+    key2 = b"\x80key1"          # first byte 0x80 -> shard 1
     
     leader_info = shard_cluster.get_leader_for_key(key1)
     assert leader_info is not None
@@ -124,11 +151,11 @@ def test_cross_shard_rollback():
     coordinator.add_write(txn_id, key1, b"new_value_a")
     coordinator.add_write(txn_id, key2, b"new_value_b")
     
-    shard_id_1 = int(hashlib.md5(key1).hexdigest(), 16) % 2
-    shard_id_2 = int(hashlib.md5(key2).hexdigest(), 16) % 2
-    
-    assert shard_id_1 != shard_id_2, "Keys should be in different shards"
-    
+    shard_id_1, shard_id_2 = shard_ids(shard_cluster, key1, key2)
+    assert_spans_two_shards(coordinator, txn_id, shard_id_1, shard_id_2)
+
+    print(f"{key1!r} -> shard {shard_id_1}, {key2!r} -> shard {shard_id_2}")
+
     rollback_success = coordinator.rollback(txn_id)
     assert rollback_success, "Rollback should succeed"
     
