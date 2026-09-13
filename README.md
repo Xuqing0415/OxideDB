@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 96 tests, roughly three minutes
+pytest tests -q             # 100 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -186,12 +186,17 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-96 tests.  `tests/test_durability.py` covers the correctness properties that
+100 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
-ReadIndex quorum.  `tests/test_snapshot.py` covers snapshots and log compaction
-in process: the storage round trip behind them, what a snapshot has to contain
+ReadIndex quorum.  `tests/test_routing_consistency.py` pins the one routing rule:
+the shard server, the transaction coordinator and the client router are asserted
+to put the same key in the same shard, on the default range map and on a
+post-split one.  `tests/test_cross_shard_transaction.py` commits two keys that
+land in different shards, which it did not used to do - see Known gaps.
+`tests/test_snapshot.py` covers snapshots and log compaction in process: the
+storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
 snapshot because the entries are gone, and a replica catching up through
 `InstallSnapshot` after the leader compacted past what it was missing.
@@ -253,13 +258,16 @@ Honest list of what is *not* done, roughly in priority order.
 * **The gRPC client path is scaffolding.**  `proto/client.proto` defines
   `ClientService` but nothing implements it server-side, so `OxideDBClient`
   cannot be used yet.  The CLI drives a local `Database`, not a cluster.
-* **Sharding is experimental and frozen - do not use it.**  `ShardRouter` hashes
-  keys with MD5 while `ShardedRaftCluster` uses key ranges, and nothing populates
-  the router; there is no placement driver or metadata service, so routing is not
-  usable end to end.  Making it real needs a separate metadata Raft group, a
-  routing table and a shard migration protocol, which is a project of its own
-  rather than a patch here.  The code is kept as evidence that the layout was
-  explored.
+* **Sharding is experimental and frozen - do not use it.**  Every component now
+  routes through one range lookup (`shard/router.py`), but nothing populates the
+  routing table: there is no placement driver or metadata service, so a client
+  cannot find a shard end to end.  Making it real needs a separate metadata Raft
+  group, a routing table and a shard migration protocol, which is a project of its
+  own rather than a patch here.  The code is kept as evidence that the layout was
+  explored.  Two gaps inside the part that does run: the cross-shard test drives
+  the coordinator directly rather than through a client, and its rollback case
+  cannot fail as written, because `rollback()` returns early for a PENDING
+  transaction without touching a shard.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
