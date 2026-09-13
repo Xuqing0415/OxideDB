@@ -1,25 +1,28 @@
 import threading
 import time
-import hashlib
 from typing import Dict, Optional, Callable
 from ..raft.node import MemoryRaftNode, NodeState
 from ..raft.state_machine import CommandType, LockStatus
+from ..shard.router import locate
+
+#: How long a lock has to sit untouched before the cleaner asks what happened to
+#: the transaction that left it.  This is the trigger for the question, not the
+#: answer: the answer comes from the primary key's write record.
+DEFAULT_LOCK_TTL = 5.0
 
 
 class LockCleaner:
-    def __init__(self, shard_cluster, poll_interval: int = 10):
+    def __init__(self, shard_cluster, poll_interval: float = 10,
+                 lock_ttl: float = DEFAULT_LOCK_TTL):
         self._shard_cluster = shard_cluster
         self._poll_interval = poll_interval
+        self._lock_ttl = lock_ttl
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
     
     def _get_shard_id(self, key: bytes) -> int:
-        range_map = self._shard_cluster._range_map
-        for shard_id, (start, end) in range_map.items():
-            if start <= key < end:
-                return shard_id
-        return 0
+        return locate(self._shard_cluster._range_map, key)
     
     def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
         for server in self._shard_cluster._shard_servers.values():
@@ -42,7 +45,7 @@ class LockCleaner:
         lock = leader._state_machine.get_lock_status(primary_key)
         if lock is not None and lock["start_ts"] == start_ts:
             lock_time = lock.get("lock_time", 0)
-            if time.time() - lock_time < 5:
+            if time.time() - lock_time < self._lock_ttl:
                 return "LOCKED"
         
         return "ABORTED"
@@ -63,7 +66,7 @@ class LockCleaner:
                         continue
                     
                     lock_time = lock.get("lock_time", 0)
-                    if time.time() - lock_time >= 5:
+                    if time.time() - lock_time >= self._lock_ttl:
                         locks_to_clean.append((key, lock))
                 
                 for key, lock in locks_to_clean:
