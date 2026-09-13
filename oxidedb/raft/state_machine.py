@@ -53,6 +53,18 @@ def writes_new_data(command: bytes) -> bool:
     return kind in DATA_COMMANDS
 
 
+def serialize_command(cmd_type: bytes, **kwargs) -> bytes:
+    """The bytes of a command: what ``apply`` parses and what a client builds.
+
+    A function rather than a state machine method, because no state machine appears
+    in it.  The client is the side that builds a command - the coordinator is the
+    one that knows a transaction is being committed - and those bytes have to be the
+    same on both sides of the seam between a client and a node, so there is exactly
+    one implementation and the machines call it too.
+    """
+    return msgpack.packb({"type": cmd_type, **kwargs})
+
+
 class ApplyResult:
     def __init__(self, success: bool, error_code: Optional[int] = None, error_msg: Optional[str] = None, data: Optional[bytes] = None):
         self.success = success
@@ -363,10 +375,21 @@ class MVCCStateMachine(StateMachine):
         return sorted(rows.items())
     
     def serialize_command(self, cmd_type: bytes, **kwargs) -> bytes:
-        return msgpack.packb({"type": cmd_type, **kwargs})
+        return serialize_command(cmd_type, **kwargs)
     
     def get_lock_status(self, key: bytes) -> Optional[Dict[str, Any]]:
         return self._storage.get_newest_lock(key)
+
+    def get_write_record(self, key: bytes) -> Optional[Dict[str, Any]]:
+        """The newest committed version's write record, or None when there is none.
+
+        The other half of what the lock resolver asks: ``get_lock_status`` says what
+        is holding a key, and this says what became of the transaction that left the
+        lock - which transaction wrote the key and when it was published.  A lock
+        whose transaction never committed has no write record here, and that is how a
+        reader tells the two apart without the row itself being visible.
+        """
+        return self._storage.get_latest_write(key)
 
     # -- snapshots ---------------------------------------------------------
 

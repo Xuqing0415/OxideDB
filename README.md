@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 173 tests, roughly five minutes
+pytest tests -q             # 183 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -214,7 +214,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-173 tests.  `tests/test_durability.py` covers the correctness properties that
+183 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -356,6 +356,14 @@ status; a leader hint that is present for `NOT_LEADER` and absent otherwise; and
 difference between a field that is unset and one that is empty, which is the reason
 those fields are `optional` - a key with an empty value and a key with no version are
 different answers.
+`tests/test_local_node_client.py` is the evidence that the seam does not change an
+answer.  `LocalNodeClient` wraps a node the caller already holds, and the test asks the
+node and the client the same questions on a real state machine - a committed key, a
+locked key, an empty snapshot, and a node that never led - and requires the answers to
+match field for field, refusals and "no value" included.  Then it drives a cross-shard
+transaction with one client per shard, having first asserted that the two keys really
+are in different shards *and* in different Raft groups, so that a routing change cannot
+quietly turn it back into a single-shard test that still passes.
 
 Three environment notes:
 
@@ -423,9 +431,14 @@ Honest list of what is *not* done, roughly in priority order.
   matters.
 * **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
-* **The gRPC client path is scaffolding.**  `proto/client.proto` now defines what a
-  client may ask a node - six node-level primitives, with a four-value `error_code` and
-  a leader hint - but nothing implements it server-side and no client speaks it yet.
+* **The gRPC client path is scaffolding.**  The contract exists - six node-level
+  primitives in `proto/client.proto`, with a four-value `error_code` and a leader hint -
+  and so does the in-process side of it: `oxidedb/client/node_client.py` is the protocol a
+  caller meets a shard through, and `LocalNodeClient` implements it over a node in this
+  process.  What does not exist is the remote side: no servicer answers those six calls
+  and no client speaks them over a channel.  The callers that will hold one - the
+  coordinator, the lock resolver, the SQL executor - still hold node objects directly,
+  which is why the client can only reach a shard in its own process.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
@@ -490,11 +503,13 @@ oxidedb/
                  its publisher, and the client-side cache of what it says
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
+  client/        the six primitives a client may ask one node, and the in-process
+                 implementation of them (`proto/client.proto` is the wire form)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
 docs/            design notes and posts
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   blog/          the ReadIndex story: a read path that passed every test while wrong
 proto/           gRPC service definitions: raft.proto, and client.proto's six
-                 node-level primitives (no implementation on either side yet)
+                 node-level primitives (nothing answers them over a wire yet)
 tests/           pytest suite
