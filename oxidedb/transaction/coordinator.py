@@ -72,6 +72,35 @@ class TransactionCoordinator:
                 raise RuntimeError(f"Transaction {txn_id} is {txn.status}")
             txn.add_key(key, value)
     
+    def prewrite(self, txn_id: int) -> bool:
+        """Lock every key but stop before the commit point.
+
+        ``commit`` is this plus the primary-key commit and then the secondaries.
+        It is public because a crash between the two halves is the interesting
+        case - the locks are durable and nothing is committed - and a test needs a
+        way to put a transaction in that state without also finishing it.
+        """
+        with self._lock:
+            txn = self._transactions.get(txn_id)
+            if txn is None:
+                return False
+            if txn.status != TxnStatus.PENDING:
+                return False
+            if not txn.keys:
+                return False
+
+        shard_groups = self._group_keys_by_shard(txn)
+
+        if not self._prewrite_all_shards(txn, shard_groups):
+            with self._lock:
+                txn.status = TxnStatus.ABORTED
+            return False
+
+        with self._lock:
+            txn.status = TxnStatus.PREWRITTEN
+
+        return True
+
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
         with self._lock:
             txn = self._transactions.get(txn_id)
