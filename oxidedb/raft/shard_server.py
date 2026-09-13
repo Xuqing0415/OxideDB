@@ -2,6 +2,10 @@
 import time
 from typing import Dict, List, Optional, Callable
 from ..shard.router import default_range_map, locate
+from ..transaction.lock_cleaner import DEFAULT_LOCK_TTL, LockCleaner
+
+#: How often the cluster's own lock cleaner looks for abandoned locks, in seconds.
+DEFAULT_LOCK_CLEANER_INTERVAL = 30.0
 from .node import MemoryRaftNode, RaftCluster, NodeState
 from .state_machine import StateMachine, CommandType, ApplyResult
 from .storage import RaftStorage, JSONFileStorage
@@ -133,6 +137,7 @@ class ShardedRaftCluster:
         self._num_shards = num_shards
         self._shard_servers: Dict[int, ShardServer] = {}
         self._range_map: Dict[int, tuple] = self._create_default_range_map()
+        self._lock_cleaner = None
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
         return default_range_map(self._num_shards)
@@ -143,25 +148,48 @@ class ShardedRaftCluster:
             server.set_range_map(range_map)
     
     def start(self, state_machine_factory: Callable[[], StateMachine],
-              storage_factory: Optional[Callable[[int, int], RaftStorage]] = None):
+              storage_factory: Optional[Callable[[int, int], RaftStorage]] = None,
+              lock_cleaner_interval: Optional[float] = DEFAULT_LOCK_CLEANER_INTERVAL,
+              lock_cleaner_ttl: float = DEFAULT_LOCK_TTL):
         for node_id in range(1, self._num_nodes + 1):
             server = ShardServer(node_id, self._num_shards, self._num_nodes)
             server.set_range_map(self._range_map)
             server.start_shards(state_machine_factory, storage_factory)
             self._shard_servers[node_id] = server
-        
+
+        self.start_lock_cleaner(lock_cleaner_interval, lock_cleaner_ttl)
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards")
     
     def start_network(self, state_machine_factory: Callable[[], StateMachine],
                       peer_addresses: Dict[int, str],
-                      storage_factory: Optional[Callable[[int, int], RaftStorage]] = None):
+                      storage_factory: Optional[Callable[[int, int], RaftStorage]] = None,
+                      lock_cleaner_interval: Optional[float] = DEFAULT_LOCK_CLEANER_INTERVAL,
+                      lock_cleaner_ttl: float = DEFAULT_LOCK_TTL):
         for node_id in range(1, self._num_nodes + 1):
             server = ShardServer(node_id, self._num_shards, self._num_nodes)
             server.set_range_map(self._range_map)
             server.start_shards_network(state_machine_factory, peer_addresses, storage_factory)
             self._shard_servers[node_id] = server
         
+        self.start_lock_cleaner(lock_cleaner_interval, lock_cleaner_ttl)
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards (network mode)")
+
+    def start_lock_cleaner(self, interval: Optional[float] = DEFAULT_LOCK_CLEANER_INTERVAL,
+                           lock_ttl: float = DEFAULT_LOCK_TTL) -> None:
+        """Start the background cleaner that resolves abandoned locks.
+
+        A coordinator that dies before its primary commit leaves locks that nobody
+        is going to resolve, and the read path can only report them as locked.  The
+        cleaner re-derives each one from the primary key's write record - committed
+        if there is one there, aborted otherwise - which is the decision a reader
+        would make for itself if it had the protocol.  ``interval=None`` leaves it
+        off.
+        """
+        if interval is None or self._lock_cleaner is not None:
+            return
+
+        self._lock_cleaner = LockCleaner(self, poll_interval=interval, lock_ttl=lock_ttl)
+        self._lock_cleaner.start()
     
     def get_shard_server(self, node_id: int) -> Optional[ShardServer]:
         return self._shard_servers.get(node_id)
@@ -245,5 +273,11 @@ class ShardedRaftCluster:
         return int(time.time() * 1000000)
     
     def shutdown(self):
+        # Before the servers: the cleaner proposes entries onto shard leaders, so
+        # stopping it first keeps it from racing the shutdown.
+        if self._lock_cleaner is not None:
+            self._lock_cleaner.stop()
+            self._lock_cleaner = None
+
         for server in self._shard_servers.values():
             server.shutdown()
