@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 102 tests, roughly three minutes
+pytest tests -q             # 104 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -81,7 +81,10 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   (`RaftCluster.start` vs `RaftCluster.start_network`).
 * **MVCC** — every write becomes a version keyed by timestamp, so a read at
   timestamp `t` sees a consistent snapshot and an old transaction keeps seeing
-  the data it started with.  Deletes are tombstones, not erasures.
+  the data it started with.  The read path takes that timestamp (`node.get(key,
+  ts)`, `coordinator.read(txn_id, key)`); a read with no timestamp still means the
+  newest version, which is what a linearizable read wants.  Deletes are
+  tombstones, not erasures.
 * **Transactions** — Percolator-style 2PC: `prewrite` locks each key, the
   primary key's commit decides the transaction, then the secondary keys are
   committed.  Locks live in the engine rather than in memory, so a restarted
@@ -186,7 +189,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-102 tests.  `tests/test_durability.py` covers the correctness properties that
+104 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -196,7 +199,10 @@ to put the same key in the same shard, on the default range map and on a
 post-split one.  `tests/test_cross_shard_transaction.py` commits two keys that
 land in different shards, which it did not used to do, and covers the two ways a
 cross-shard prewrite fails: one shard refusing the lock, and one shard with no
-leader at all.
+leader at all.  `tests/test_snapshot_read.py` reads a key at a timestamp older
+than its newest version and gets the older one, and through the coordinator checks
+that a transaction sees its own prewrite while a snapshot taken before it still
+cannot.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
@@ -235,6 +241,15 @@ Honest list of what is *not* done, roughly in priority order.
   replicas hold TTLs that differ by a few milliseconds and the value is not
   covered by Raft.  Deriving it from the entry itself would make the state
   machine deterministic.
+* **Snapshot reads are not reachable from a client, and `scan` cannot do them at
+  all.**  `coordinator.read(txn_id, key)` reads at the transaction's `start_ts`,
+  but the gRPC client path is scaffolding (below), and `scan` has no timestamp
+  parameter, so a range read is always the newest version.  A key whose lock is
+  *older* than the snapshot raises instead of being resolved: deciding which way
+  that lock went needs the lock-resolution protocol, which is not written.  A
+  transaction also keeps no read set, so nothing detects a write skew - what is
+  implemented is snapshot reads plus Percolator's write conflict check, not
+  serializable snapshot isolation.
 * **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
   every row in a single msgpack payload, so the cost of a snapshot grows with the
   data set, and it is taken and restored while holding the node lock - the node

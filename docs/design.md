@@ -100,9 +100,10 @@ restart* rather than a copy of the data:
     namespace under one lock, so there is no ordering in which the locks and the
     versions disagree with each other: the snapshot is a consistent cut of all
     three namespaces, not three pieces stitched together.
-* **`_last_applied_timestamp` travels with it.**  Reads are served at that
-  timestamp (`get` -> `storage.get(key, self._last_applied_timestamp)`), so a
-  machine restored without it would read as of timestamp 0 and see nothing.
+* **`_last_applied_timestamp` travels with it.**  A read that is not given a
+  timestamp is served at that one (`get` -> `storage.get(key,
+  self._last_applied_timestamp)`), so a machine restored without it would read as
+  of timestamp 0 and see nothing.
 
 Ordering on the node matters as much as the contents: `_maybe_snapshot` writes
 the snapshot *before* compacting the log.  A crash in between leaves entries that
@@ -237,3 +238,41 @@ election both safe and possible.
 The remaining cost is latency: every read pays a round of AppendEntries.  Batching
 many reads behind one confirmation, or leader leases, are the standard
 optimizations; neither is implemented.
+
+## 5. Which timestamp a read uses
+
+A read has two possible answers and only one of them can be "the value of `k`".
+Reads with no timestamp - `node.get(key)`, the CLI, the SQL layer - answer with the
+newest version the replica has applied, and section 4 is what makes that answer
+fresh.  A transaction answering that way would be wrong: the newest version is not
+the one it started with, and two reads of the same key inside one transaction could
+straddle somebody else's commit.  So the read path takes a timestamp, and a
+transaction passes its own `start_ts`.
+
+The ReadIndex handshake stays, and it is what makes the older timestamp safe.  A
+snapshot read at `start_ts` needs every commit up to `start_ts` to be applied
+locally; the quorum puts this replica at or past everything committed before the
+read began, and the TSO issued `start_ts` before the read began, so everything at
+or below that timestamp is included.  Freshness is a requirement for the newest
+read, not a cost that a snapshot read could skip.
+
+Which locks a read has to respect follows from the same idea - a lock only hides
+the key from a reader that could have seen the version the lock holds:
+
+* `lock.start_ts == read_ts`: the lock is this transaction's own write intent, so
+  the value it carries is the answer.  This is what makes a read-modify-write
+  inside a transaction behave.
+* `lock.start_ts > read_ts`: the writer started after this snapshot, so it cannot
+  have committed into it.  The lock is ignored and the older version is returned.
+  Blocking here would let any concurrent writer stall a reader that is not
+  looking at its key.
+* `lock.start_ts < read_ts`: the writer may have committed at or below this
+  snapshot, and then the version to return is the one the lock holds.  Deciding
+  that needs the primary key's write record, so the read reports `ERR_LOCKED`
+  rather than guessing.  Lock resolution is the missing piece (README, Known
+  gaps).
+
+Two limits are worth naming.  `scan` was not given the parameter, so range reads
+are still newest-only.  And none of this is serializable: reads are not recorded
+anywhere, so two transactions can still write a skew that each of them would have
+had to see to be correct.
