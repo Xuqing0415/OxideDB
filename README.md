@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 148 tests, roughly three minutes
+pytest tests -q             # 163 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -115,10 +115,12 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   or its term moves, so a client that reads the table can route without being told.
   Clients route by it too (`metadata/cache.py`): one read of the table instead of a
   lookup per key, read again when a shard refuses a request or when the node the table
-  names has stopped leading.  What is still missing is a split: `split_shard` moves the
-  rows into the new shard's group and re-ranges the servers locally, but nothing tells
-  the table, so a client that routes by it keeps reading the shard they came from; see
-  Known gaps.
+  names has stopped leading.  `split_shard` is wired end to end: it freezes the range,
+  copies the rows into the new shard's group as the versions they already were, proposes
+  the split to the table, and re-ranges the servers locally before thawing the source -
+  and a split that dies before its proposal is finished on the next start.  See Known
+  gaps for what is still missing: no migration, no follower reads, and a client that
+  resolves the table's answer to an object in its own process.
 
 ## Storage engines (plan E)
 
@@ -212,7 +214,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-148 tests.  `tests/test_durability.py` covers the correctness properties that
+163 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -275,6 +277,32 @@ table at the same version, because a half-applied split is a range nobody owns. 
 retry of the split that applied is a success, since a caller cannot tell a lost
 response from a lost proposal, while a retry carrying a different replica set is
 refused; and every replica is asserted to apply the same two ranges.
+`tests/test_split_freeze.py` and `tests/test_split_group.py` are the two things a split
+needs before it can be proposed at all.  The first pins the freeze: the source shard
+refuses the commands that would add rows to it while a split is copying, still accepts a
+commit for a transaction that prewrote before the freeze, waits the proposals that were
+admitted before the freeze out rather than reading past them, and is thawed again when the
+proposal is refused - because a split whose rows are in a group the table has not been told
+about must not take rows for the range it is giving away, and a split that moved nothing
+has nothing that could be written outside of.  The second pins the shard it creates: built
+through the same `add_shard` as the shards the node started with, in network mode bound to
+and listening on the address the table will publish, electing a leader and replicating into
+it.  In-process clusters get peer links for it too, which they did not have before - which
+is why an in-process cluster had never elected anything.
+`tests/test_split_publish.py` is the order that matters: the rows are in the new shard while
+the table and the cluster's own range map still say what they said before, and the test
+stands inside the proposal to assert exactly that.  A refused proposal leaves the source
+frozen and the split remembered, and asking again finishes that same split rather than
+starting a second one; a proposal whose response is lost is applied once and copies once.
+`tests/test_split_recovery.py` kills the process between the copy and the proposal, which is
+the one state nobody else can see: rows in a group the table has not been told about, and a
+freeze that died with the process that held it.  The split is written down in the source
+shard's own storage before the first row moves, so a cluster that comes back freezes the
+shard again, copies only what the new shard is missing - the rows read back out of the
+source's state, not out of the note, because a note carrying rows would be a second copy of
+the shard taken at some earlier moment - and makes the proposal, which the group recognises
+as the split it already applied.  A third test is the control for the note itself: a split
+that finished leaves none behind, so the next start has nothing to pick up.
 `tests/test_metadata_wiring.py` closes the join: it starts the metadata group beside a
 real sharded cluster and asserts that the table a client reads names each shard's
 actual leader, at its actual term, at an address that is really listening - the test
@@ -288,11 +316,13 @@ ranges is refused rather than overwritten.
 routes by it and never looks at the cluster's own nodes - the test turns that into a
 failure rather than a convention - and a transaction reads and writes by the same
 placement, because a client that read by the table and wrote by scanning the cluster
-would be two clients wearing one name.  The two ways the cache is kept honest are
-pinned with fakes: a lookup that finds the node the table names has stopped leading
-reads the table again, while a table that names nobody is left alone - the shard having
-no leader is a fact about the shard, not staleness in the table - and a shard that
-refuses a read sends the client back for the new answer.  The last test is all real:
+would be two clients wearing one name.  The ways the cache is kept honest are pinned with
+fakes: a lookup that finds the node the table names has stopped leading reads the table
+again; a table that names nobody is read again too, but no faster than the publisher could
+have written an answer - a range published before its leader is, and a shard that really
+has no leader, look identical from the client's side and only one of them is worth waiting
+out; and a shard that refuses a read sends the client back for the new answer.  The last
+test is all real:
 a three-node cluster, a live metadata group, and a leader whose node is shut down
 while the client holds a table naming it.  The read still returns what was committed.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
@@ -395,28 +425,37 @@ Honest list of what is *not* done, roughly in priority order.
   too: `ShardedRaftCluster` starts a `MetadataPublisher` that publishes the ranges once,
   each shard's replica set and addresses once, and a leader report whenever a shard's
   leader or its term moves, so the table names the node that actually won the election -
-  and stops rather than overwrite a table holding a different range map.  A client reads
-  that table and routes by it (`metadata/cache.py`), reading it again when a shard
-  refuses a request or when the node it names has stopped leading.  What that client
-  cannot do is reach a shard it does not already hold a handle on: it resolves the node
-  the table names to an object in its own process, which makes it a client *inside* the
-  cluster, and the hop across a process boundary is what the unimplemented gRPC client
-  service would be.  The lock resolver - the other thing in the transaction path that
-  looks for a leader - still scans the cluster's own nodes.  Beyond that, two things are
-  missing from a split.  It does not tell the table: `split_shard` copies the newest
-  committed version of each row into the new shard's group and updates every server's
-  range map locally, but proposes nothing, so a client routing by the table keeps
-  reading the shard the rows came from.  The command that would tell it exists -
-  `MetadataCommandType.SPLIT`, checked against the table by the group and idempotent for a
-  retry - and wiring `split_shard` to it, with the freeze of the source range and the
-  crash recovery that comes with it, is the next step rather than this one.  And it does
-  not coordinate with a write: it refuses while a transaction holds a lock in the range,
-  because that lock
-  may be a commit that has not been applied, but one that resolved to the old shard
-  just before the range moved still lands there and the copy ends up behind by it.  The
-  old copies are left in the old shard, and there is no migration and no follower
-  reads.  The cross-shard test also drives the coordinator directly rather than through
-  a client, so no hop of it crosses a process boundary.
+  and stops rather than overwrite a map it cannot account for.  The maps it can account
+  for are the one it routes by and the one its own split in flight will produce, which it
+  is asked for rather than left to guess: a split reaches the group from the shard's own
+  thread, so the publisher's first pass can find the table a step ahead of the cluster.
+  A client reads that table and routes by it (`metadata/cache.py`), reading it again when
+  a shard refuses a request, when the node it names has stopped leading, or when it names
+  nobody and the read being held is older than the publisher's own poll interval - a range
+  whose leader report has not been published yet and a shard that has no leader are the
+  same thing to a client, and only one of them is worth waiting out.
+  A split is wired end to end.  `split_shard` freezes the range, waits out the writes that
+  were admitted before the freeze, refuses rather than copy under a lock that may be an
+  unapplied commit, moves the rows above the split point into the new shard's group as the
+  versions they already were, proposes `SPLIT` to the metadata group, and applies the new
+  range map locally before thawing the source.  The group checks the proposal against its
+  own table rather than believing the caller - the split point strictly inside the range,
+  the new id free, neither half overlapping another shard - and answers a retry of a split
+  it already applied with success, because a caller cannot tell a lost response from a lost
+  proposal.  The intent is written into the source shard's own storage before the first row
+  moves, so a cluster that dies between the copy and the proposal comes back, freezes the
+  shard again, copies only what the new shard is missing, and proposes the split.
+  What is still missing around it: it does not coordinate with a write that resolved to the
+  old shard just before the range moved, so the copy can end up behind such a write; the
+  copies left in the old shard are never reclaimed; nothing chooses split points or moves a
+  shard between nodes, so there is no migration, no automatic splitting and no follower
+  reads - every read goes to the leader; and the client cannot reach a shard it does not
+  already hold a handle on, because it resolves the node the table names to an object in
+  its own process, which makes it a client *inside* the cluster.  The hop across a process
+  boundary is what the unimplemented gRPC client service would be, and the lock resolver -
+  the other thing in the transaction path that looks for a leader - still scans the
+  cluster's own nodes.  The cross-shard test also drives the coordinator directly rather
+  than through a client, so no hop of it crosses a process boundary.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.

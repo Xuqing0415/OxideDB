@@ -418,15 +418,21 @@ when it was read - not that it is still current.  A stale cached table routes a 
 shard that will refuse it, which is a retry; a guessed table routes it somewhere nothing
 checks.
 
-**How the cache is kept honest.**  There are two ways back to the table and no third.  A
-lookup that finds the node the table names has stopped leading reads the table again -
-the one staleness a cache can see for itself, and the one an election produces - and a
-shard that refuses a request because this client reached a node that is no longer its
-leader sends the client back for the new answer.  A table that names nobody is not a
-reason to read it again: that is the table saying the shard has no leader, and reading
-it again would learn the same thing for the price of a round trip.  Nothing is refreshed
-on a timer, because the table is on the hot path and a fetch per key is the cost the
-cache exists to avoid.
+**How the cache is kept honest.**  There are three ways back to the table and no fourth.
+A lookup that finds the node the table names has stopped leading reads the table again -
+the one staleness a cache can see for itself, and the one an election produces.  A shard
+that refuses a request because this client reached a node that is no longer its leader
+sends the client back for the new answer.  And a table that names nobody is read again,
+because "nobody leads this shard" and "this table was read before the leader was published"
+are the same answer from the client's side, and only one of them is worth waiting out.
+Placement arrives a command at a time - the ranges, then a shard's replica set, then its
+leader - so a client whose first read lands in the gap holds a range nobody leads, and a
+client that believed that for ever would never route again.  It is the one read that
+repeats, and it is rate-limited to the publisher's own poll interval per shard
+(`MISSING_LEADER_REFRESH_INTERVAL`): re-reading faster than the publisher can write cannot
+learn anything, and a shard that really has no leader must not turn every read into a
+metadata round trip.  Nothing else is refreshed on a timer, because the table is on the hot
+path and a fetch per key is the cost the cache exists to avoid.
 
 **Why a split is a command, and checked by the group.**  A split is proposed after
 the rows have moved - the table may only say a range belongs to a new shard once the
@@ -448,19 +454,41 @@ once, and a leader report only when the leader or its term moves.  That restrain
 design, not an optimisation - every write to the table is a reason for every client's
 cache to refresh, so a pass that found nothing has to say nothing, and the publisher
 compares before it proposes rather than rewriting the table on a timer.  A refused report
-is normal, because two reports racing is what terms are for; a table that holds
-*different* ranges is not, and the publisher stops with the disagreement attached rather
-than overwrite a keyspace belonging to another cluster.  Both ends of the join are in
-place.  What this client still is not is a client on the far side of a socket: it
-resolves the node the table names to an object it already holds, so it is a client
-inside the cluster, and dialling the address the table publishes is what the
-unimplemented client service would be.  The lock resolver - the other thing in the
-transaction path that looks for a leader - still scans the cluster's own nodes.  The
-command exists; what is missing is the caller.  `split_shard` copies the rows into the
-new shard's group and *then* re-ranges the servers locally, which is the reverse of the
-order argued above, and it never proposes the split - so a client routing by the table
-keeps reading the shard the rows came from.  Nor is it crash safe: a split that dies
-between the copy and the proposal leaves rows in a group the table has never heard of.
-Wiring it up means freezing the source shard's range for the duration and keeping a
-"split in progress" record to recover from, which is the next step rather than this
-one.
+is normal, because two reports racing is what terms are for; a table holding ranges the
+cluster cannot account for is not, and the publisher stops with the disagreement attached
+rather than overwrite a keyspace belonging to another cluster.  The maps it can account for
+are the one it routes by and the one its own split in flight will produce, which it asks
+the cluster for rather than guessing: a split reaches the group from the shard's own
+thread, so the publisher's first pass can find the table a step ahead of the cluster, and
+a map of one's own is not a reason to stop.
+The other end is wired too.  `split_shard` freezes the range, waits out the writes admitted
+before the freeze, refuses rather than copy out from under a lock that may be an unapplied
+commit, moves the rows above the split point into the new shard's group *as the versions
+they already were* - a copy stamped with the moment of the move is newer than any timestamp
+the TSO will hand out, so the row would be present and unreadable at once - and only then
+proposes the split, so the range the table hands out is a range whose data is there.  It
+re-ranges its own servers before thawing the source, because until the thaw the shard still
+answers for a range it is no longer allowed to add to, and a thaw without the table would
+send clients to a shard whose right half has been copied away.  A refused proposal leaves
+the shard frozen and the split remembered, and asking again finishes that same split
+instead of starting a second one.  The intent is written into the source shard's own
+storage before the first row moves, so a cluster that dies between the copy and the
+proposal comes back, freezes the shard again, copies only what the new shard is missing -
+read back out of the source's state, not out of the note, because a note carrying rows is a
+second copy of the shard taken at some earlier moment - and makes the proposal, which the
+group recognises as the split it already applied.  The new shard's leader is asked for
+those rows only once it has committed an entry of its own term: a node that has just been
+elected cannot yet tell which of the entries in its log ever committed, and taking "not
+there" for an answer at that moment would copy a row that had already arrived.
+What that split still cannot do: coordinate with a write that resolved to the old shard
+just before the range moved, so the copy can end up behind such a write - it refuses while
+a lock is held in the range, because that lock may be a commit that has not been applied,
+but it cannot see one that committed somewhere else first; reclaim the copies left behind
+in the old shard, which are simply stale from then on; or start itself, since nothing
+chooses split points and two splits of different shards are not serialised against each
+other.  What the client still is not is a client on the far side of a socket: it resolves
+the node the table names to an object it already holds, so it is a client inside the
+cluster, and dialling the address the table publishes is what the unimplemented client
+service would be.  The lock resolver - the other thing in the transaction path that looks
+for a leader - still scans the cluster's own nodes.  Migration and follower reads do not
+exist at all: a shard cannot move between nodes, and every read goes to the leader.
