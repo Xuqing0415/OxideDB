@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 126 tests, roughly three minutes
+pytest tests -q             # 131 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -109,10 +109,13 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   clients cache a batch to avoid a round trip per transaction.
 * **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
   into ranges, each range served by its own Raft group, and the table that says which
-  range is where now has an owner of its own (`metadata/service.py`, another Raft
-  group).  What is missing is the wiring: nothing publishes placement to that table yet
-  and no client refreshes from it, so routing is still not usable end to end - see
-  Known gaps.
+  range is where has an owner of its own (`metadata/service.py`, another Raft group).
+  The cluster publishes it through `metadata/publisher.py`: the ranges once, each
+  shard's replica set and addresses once, and a leader report whenever a shard's leader
+  or its term moves, so a client that reads the table can route without being told.
+  What is still missing is the other end of that join - no client refreshes its cache
+  from the table - and a split moves none of the rows it cuts off, so routing is still
+  not usable end to end; see Known gaps.
 
 ## Storage engines (plan E)
 
@@ -206,7 +209,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-126 tests.  `tests/test_durability.py` covers the correctness properties that
+131 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -252,6 +255,15 @@ loses and one from outside the replica set is refused, a second bootstrap does n
 a table that has since changed, a table restores from a snapshot with its version, and
 a group that cannot reach a quorum refuses to serve the table instead of answering from
 a local copy.
+`tests/test_metadata_wiring.py` closes the join: it starts the metadata group beside a
+real sharded cluster and asserts that the table a client reads names each shard's
+actual leader, at its actual term, at an address that is really listening - the test
+opens the socket rather than comparing strings.  A second test stops a leader's node
+and watches the table follow the election to the node that took over, at a higher term.
+The publisher's own rules are pinned without a cluster: it writes when something moved
+and not on a timer, so the table's version stands still across polls; a restart that
+re-proposes the same ranges is not a disagreement; and a table holding different
+ranges is refused rather than overwritten.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
 snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
 the read set validated the second commit is refused and one doctor stays on call;
@@ -345,20 +357,23 @@ Honest list of what is *not* done, roughly in priority order.
   `ClientService` but nothing implements it server-side, so `OxideDBClient`
   cannot be used yet.  The CLI drives a local `Database`, not a cluster.
 * **Sharding is experimental and frozen - do not use it.**  Every component routes
-  through one range lookup (`shard/router.py`), and the table that lookup needs now has
-  an owner: `metadata/service.py` is a Raft group holding each shard's range, its
-  replica set and the leaders that reported themselves, and `MetadataClient` reads it
-  with the same ReadIndex path as any other read (design.md, section 7).  What is
-  missing is both ends of it: nothing in `ShardedRaftCluster` publishes placement or
-  leader changes to that table, and no client refreshes its cache from it, so as
-  shipped a client still cannot find a shard end to end.  Beyond that, a split has to
-  move the rows it cuts off before the table may say they belong to a new shard;
-  `split_shard` changes the range map without moving anything, and stamps the rows it
-  does move with a wall-clock timestamp while the TSO hands out a counter starting at
-  1 - those rows are then newer than every start timestamp a client can be given, so
-  every prewrite against them is refused as a write conflict.  The cross-shard test
-  also drives the coordinator directly rather than through a client, so no hop of it
-  crosses a process boundary.
+  through one range lookup (`shard/router.py`), and the table that lookup needs has an
+  owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
+  set and the leaders that reported themselves, and `MetadataClient` reads it with the
+  same ReadIndex path as any other read (design.md, section 7).  The cluster writes it
+  too: `ShardedRaftCluster` starts a `MetadataPublisher` that publishes the ranges once,
+  each shard's replica set and addresses once, and a leader report whenever a shard's
+  leader or its term moves, so the table names the node that actually won the election -
+  and stops rather than overwrite a table holding a different range map.  What is still
+  missing is the other end: no client refreshes its cache from the table, so as shipped
+  a client still cannot find a shard end to end.  Beyond that, a split has to move the
+  rows it cuts off before the table may say they belong to a new shard; `split_shard`
+  changes the range map without moving anything, and stamps the rows it does move with a
+  wall-clock timestamp while the TSO hands out a counter starting at 1 - those rows are
+  then newer than every start timestamp a client can be given, so every prewrite
+  against them is refused as a write conflict.  The cross-shard test also drives the
+  coordinator directly rather than through a client, so no hop of it crosses a process
+  boundary.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
@@ -376,7 +391,8 @@ oxidedb/
   storage/       engine abstraction, MVCC, timestamp allocator
   transaction/   2PC coordinator, local transactions, lock cleaner, retrying client
   tso/           timestamp oracle on its own Raft group
-  metadata/      shard map - ranges, placement, leaders - on its own Raft group
+  metadata/      shard map - ranges, placement, leaders - on its own Raft group,
+                 and the publisher that keeps it in step with the cluster
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
   client/        gRPC client SDK (server side not implemented)

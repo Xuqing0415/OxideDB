@@ -1,4 +1,5 @@
-# EXPERIMENTAL: routing not wired to a metadata service, do not use
+# EXPERIMENTAL: the routing table is published, but no client refreshes from it and
+# split does not move data, do not use
 """The one routing rule in the codebase.
 
 Every component that needs to know which shard owns a key - the shard server,
