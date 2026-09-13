@@ -156,15 +156,19 @@ def test_cross_shard_rollback():
     leader_info = shard_cluster.get_leader_for_key(key1)
     assert leader_info is not None
     _, leader = leader_info
-    
-    set_cmd = leader._state_machine.serialize_command(CommandType.SET, key=key1, value=b"original", timestamp=50)
+
+    # The seed has to be older than the transaction that prewrites over it, and
+    # the TSO hands out a counter starting at 1 - not a wall clock - so the
+    # timestamp has to come from it rather than from a literal.
+    seed_ts = tso_client.get_timestamp()
+    set_cmd = leader._state_machine.serialize_command(CommandType.SET, key=key1, value=b"original", timestamp=seed_ts)
     leader.propose(set_cmd)
-    
+
     leader_info2 = shard_cluster.get_leader_for_key(key2)
     assert leader_info2 is not None
     _, leader2 = leader_info2
-    
-    set_cmd2 = leader2._state_machine.serialize_command(CommandType.SET, key=key2, value=b"original_b", timestamp=50)
+
+    set_cmd2 = leader2._state_machine.serialize_command(CommandType.SET, key=key2, value=b"original_b", timestamp=seed_ts)
     leader2.propose(set_cmd2)
     
     time.sleep(0.5)
@@ -172,17 +176,38 @@ def test_cross_shard_rollback():
     txn_id, start_ts = coordinator.begin()
     coordinator.add_write(txn_id, key1, b"new_value_a")
     coordinator.add_write(txn_id, key2, b"new_value_b")
-    
+
     shard_id_1, shard_id_2 = shard_ids(shard_cluster, key1, key2)
     assert_spans_two_shards(coordinator, txn_id, shard_id_1, shard_id_2)
 
     print(f"{key1!r} -> shard {shard_id_1}, {key2!r} -> shard {shard_id_2}")
 
-    rollback_success = coordinator.rollback(txn_id)
-    assert rollback_success, "Rollback should succeed"
-    
-    time.sleep(0.5)
-    
+    # Prewrite, then stop: this is the state a coordinator that died between the
+    # two halves leaves behind, and the only state where a rollback has anything
+    # to undo.  Rolling back a PENDING transaction touches no shard at all, so the
+    # assertions below would hold against a rollback that did nothing.
+    assert coordinator.prewrite(txn_id), "Prewrite should succeed"
+    assert coordinator.get_transaction(txn_id).status == TxnStatus.PREWRITTEN
+
+    wait_until(lambda: lock_on(shard_cluster, key1) is not None,
+               message=f"shard {shard_id_1} never held a lock for {key1!r}")
+    wait_until(lambda: lock_on(shard_cluster, key2) is not None,
+               message=f"shard {shard_id_2} never held a lock for {key2!r}")
+
+    for key in (key1, key2):
+        leader = shard_cluster.get_leader_for_key(key)[1]
+        locked = leader.get(key)
+        assert not locked.success and locked.error_code == ErrorCode.ERR_LOCKED, (
+            f"a reader should see {key!r} as locked, got {locked.error_msg}"
+        )
+
+    assert coordinator.rollback(txn_id), "Rollback should succeed"
+
+    wait_until(lambda: lock_on(shard_cluster, key1) is None,
+               message=f"shard {shard_id_1} kept the lock for {key1!r}")
+    wait_until(lambda: lock_on(shard_cluster, key2) is None,
+               message=f"shard {shard_id_2} kept the lock for {key2!r}")
+
     leader_info = shard_cluster.get_leader_for_key(key1)
     _, leader = leader_info
     result1 = leader.get(key1)
