@@ -37,10 +37,14 @@ class _FakeCluster:
     still exercise every branch of the publishing logic.
     """
 
-    def __init__(self, ranges, nodes=(1, 2, 3), addresses=None):
+    def __init__(self, ranges, nodes=(1, 2, 3), addresses=None, possible=None):
         self._ranges = dict(ranges)
         self._nodes = list(nodes)
         self._addresses = dict(addresses or {})
+        #: The extra range maps this cluster could have published - the one a split it
+        #: is in the middle of will produce.  Absent is the ordinary cluster, which has
+        #: only the map it routes by.
+        self._possible = [dict(entry) for entry in (possible or [])]
         self.leaders = {}
 
     def range_map(self):
@@ -57,6 +61,9 @@ class _FakeCluster:
 
     def shard_leader(self, shard_id):
         return self.leaders.get(shard_id)
+
+    def possible_ranges(self):
+        return [self.range_map()] + [dict(entry) for entry in self._possible]
 
 
 def _started_metadata():
@@ -145,6 +152,34 @@ def test_a_restart_publishing_the_same_ranges_is_not_a_disagreement():
         assert publisher.error is None
         assert publisher.leaders() == {0: (1, 2), 1: (1, 2)}
         assert client.table(refresh=True).shard(1).leader_id == 1
+    finally:
+        metadata.shutdown()
+
+
+def test_a_table_holding_the_ranges_of_our_own_split_is_ours():
+    """A split can reach the group before the publisher's first pass reaches it.
+
+    The cluster is then routing by the map it started with while the table holds the two
+    ranges its own split created - and the second map is not a stranger's keyspace.  A
+    publisher that stopped here would leave a range in the table with no replica set and
+    no leader: a range every client routes to and nobody answers for.
+    """
+    metadata = _started_metadata()
+    try:
+        client = wait_for_metadata_client(metadata)
+        before = {0: (b"", b"\xff")}
+        after = {0: (b"", b"n"), 1: (b"n", b"\xff")}
+        assert client.init_routes(before).success
+        assert client.split_shard(0, b"n", 1, [2, 3], {2: "127.0.0.1:50052"}).success
+
+        cluster = _FakeCluster(before, possible=[after])
+        cluster.leaders = {0: (1, 3)}
+        publisher = MetadataPublisher(metadata.get_client(), cluster, poll_interval=0.05)
+        publisher.publish_once()
+
+        assert publisher.error is None, "our own split is not somebody else's keyspace"
+        assert sorted(client.table(refresh=True).routes()) == [0, 1]
+        assert publisher.leaders() == {0: (1, 3)}, "the shard it still leads is published"
     finally:
         metadata.shutdown()
 

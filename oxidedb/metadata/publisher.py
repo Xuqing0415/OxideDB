@@ -35,7 +35,9 @@ class MetadataPublisher:
 
     ``shard_cluster`` is used through five methods - ``range_map``, ``shard_ids``,
     ``shard_replica_ids``, ``shard_addresses`` and ``shard_leader`` - which is the whole
-    of what the table needs to know about a cluster.
+    of what the table needs to know about a cluster.  A cluster that can also say which
+    range maps are its own, ``possible_ranges``, is asked that before this thread
+    concludes that the table belongs to somebody else.
     """
 
     def __init__(self, client: MetadataClient, shard_cluster,
@@ -109,14 +111,30 @@ class MetadataPublisher:
             return  # the group is still electing; the next pass tries again
 
         # The command was refused as a command, which for this one means the table has
-        # ranges already.  If they are ours the cluster has simply restarted; if they
-        # are not, this cluster is not the one that owns this keyspace.
+        # ranges already.  Our own cluster is the likely author of them - a restarted
+        # cluster re-proposing the ranges it came up with, or a split that reached the
+        # group before this thread got round to its first pass - and a table this cluster
+        # wrote is not a table to stop over.  Anything else is somebody else's keyspace.
         table = self._client.table(refresh=True)
-        if table.routes() == ranges:
+        if self._is_our_own(table.routes()):
             self._routes_published = True
             return
         self.error = (f"the metadata table already holds different ranges "
                       f"{table.routes()!r}; refusing to overwrite them with {ranges!r}")
+
+    def _is_our_own(self, routes) -> bool:
+        """Whether ``routes`` is a placement this cluster could have published itself.
+
+        Asked of the cluster rather than guessed at: a cluster in the middle of a split
+        has two range maps - the one its servers route by and the one the table gets once
+        the split lands - and the second one, which is what a restarted cluster finds in
+        the table, is not a stranger's.  A cluster that cannot answer the question is
+        taken at the single map it does have.
+        """
+        possible = getattr(self._cluster, "possible_ranges", None)
+        if possible is None:
+            return routes == self._cluster.range_map()
+        return routes in possible()
 
     def _publish_nodes(self, shard_id: int) -> None:
         if shard_id in self._nodes_published:
