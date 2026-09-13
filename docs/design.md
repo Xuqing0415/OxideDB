@@ -152,11 +152,21 @@ point: the decision is *derived from the keyspace* instead of remembered.
 
 **Why locks carry a TTL.**  A coordinator that dies *before* the primary commit
 leaves locks that nobody is going to resolve.  `lock_time` is what stops those
-keys from being blocked forever: after 5 seconds a lock no longer blocks readers
-(`MVCCStateMachine.get`), and `LockCleaner` re-derives the outcome from the
-primary key - committed if the primary has a write record for that `start_ts`,
-locked if it is still fresh, aborted otherwise.  The TTL is a trigger for asking
-the question, not the answer itself.
+keys from being blocked forever: after `DEFAULT_LOCK_TTL` - 5 seconds, an argument
+to the cleaner - a lock no longer blocks readers (`MVCCStateMachine.get`), and
+`LockCleaner` re-derives the outcome from the primary key: committed if the
+primary has a write record for that `start_ts`, locked if it is still fresh,
+aborted otherwise.  The TTL is a trigger for asking the question, not the answer
+itself.
+
+The cleaner is started by the cluster (`ShardedRaftCluster.start` and
+`start_network`) rather than by whoever calls them, because a cluster without one
+refuses every read of every lock a dead coordinator left, and locks do not expire
+on their own.  The scan interval (30 s) and the TTL are both arguments, and
+`lock_cleaner_interval=None` leaves it off for a test that wants to watch a lock
+stay unresolved.  What it does is the derivation above, not a special case: the
+answer is in the primary key's write record, so it does not matter that the
+coordinator that asked the question is gone.
 
 **Why secondary commits are asynchronous.**  Commit latency does not grow with the
 number of shards: the client waits for the primary only.  The price is that a

@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 105 tests, roughly three minutes
+pytest tests -q             # 107 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -90,7 +90,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   committed.  Locks live in the engine rather than in memory, so a restarted
   replica still holds the intents it wrote before the crash; they carry a TTL
   and `LockCleaner` resolves abandoned ones by consulting the primary key's
-  state.
+  state.  The cluster starts that cleaner itself - 30 s scan interval, 5 s TTL,
+  both arguments to `start`/`start_network` - because a cleaner only tests ever
+  started is a cleaner nobody runs.
 * **Timestamps** — a `TSO` Raft group hands out monotonic timestamps in batches;
   clients cache a batch to avoid a round trip per transaction.
 * **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
@@ -189,7 +191,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-105 tests.  `tests/test_durability.py` covers the correctness properties that
+107 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -205,6 +207,10 @@ that a transaction sees its own prewrite while a snapshot taken before it still
 cannot.  A third one reads two keys that live in different shards, changes one of
 them in between, and asserts both reads come out of the one snapshot - a torn read
 across two Raft groups is the failure it is there to catch.
+`tests/test_lock_cleaner_wiring.py` starts a cluster and lets the cluster's own
+cleaner resolve a lock whose coordinator never came back; the same lock is left
+alone when the cleaner is switched off, which is what makes the first test evidence
+rather than coincidence.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
