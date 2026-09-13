@@ -8,6 +8,12 @@ from ..raft.node import MemoryRaftNode, NodeState
 from ..raft.state_machine import CommandType, ApplyResult, ErrorCode
 from ..shard.router import locate
 from ..tso.tso import TSOClient
+from .lock_resolver import DEFAULT_LOCK_TTL, LockResolver
+
+#: How many times a snapshot read resolves a lock and tries again.  One pass is
+#: enough in the ordinary case; the spare attempts cover a second lock arriving
+#: between the resolution and the retry.
+LOCK_RESOLUTION_ATTEMPTS = 3
 
 
 class TxnStatus(Enum):
@@ -33,9 +39,11 @@ class Transaction:
 
 
 class TransactionCoordinator:
-    def __init__(self, tso_client: TSOClient, shard_server):
+    def __init__(self, tso_client: TSOClient, shard_server,
+                 lock_ttl: float = DEFAULT_LOCK_TTL):
         self._tso_client = tso_client
         self._shard_server = shard_server
+        self._resolver = LockResolver(shard_server, lock_ttl=lock_ttl)
         self._transactions: Dict[int, Transaction] = {}
         self._txn_id_counter = 0
         self._lock = threading.RLock()
@@ -110,10 +118,12 @@ class TransactionCoordinator:
         between.  A key this transaction has already prewritten reads back the
         value it wrote.
 
-        A key with a lock *older* than this transaction's start_ts raises: that
-        lock may belong to a committed transaction whose version this snapshot
-        should contain, and deciding which way it went needs the lock-resolution
-        protocol, which is not here yet.
+        A key with a lock *older* than this transaction's start_ts may be holding
+        the version this snapshot is entitled to, and the answer is not in the
+        lock: it is in the primary key's write record.  So the lock goes to the
+        resolver - rolled forward if that transaction committed, cleared if it did
+        not - and the read is retried.  While the transaction is still live there
+        is nothing to be had from it, and the read says so instead of blocking.
         """
         with self._lock:
             txn = self._transactions.get(txn_id)
@@ -126,13 +136,30 @@ class TransactionCoordinator:
         if leader is None:
             raise RuntimeError(f"No leader for shard {shard_id}")
 
-        result = leader.get(key, start_ts)
-        if result.error_code == ErrorCode.ERR_LOCKED:
-            raise RuntimeError(f"Key {key!r} is locked by an older transaction")
+        for _ in range(LOCK_RESOLUTION_ATTEMPTS):
+            result = leader.get(key, start_ts)
+            if result.error_code != ErrorCode.ERR_LOCKED:
+                break
+            if not self.resolve_lock(key):
+                raise RuntimeError(f"Key {key!r} is locked by a live transaction")
+        else:
+            raise RuntimeError(
+                f"Key {key!r} is still locked after {LOCK_RESOLUTION_ATTEMPTS} attempts")
+
         if not result.success:
             raise RuntimeError(f"Read failed: {result.error_msg}")
 
         return result.value
+
+    def resolve_lock(self, key: bytes) -> bool:
+        """Settle the lock on ``key`` by asking the primary key what happened.
+
+        True once the lock is gone - rolled forward if the transaction committed,
+        cleared if it did not.  False while the transaction is still in flight, or
+        while its shard has no leader; either way the caller should come back
+        rather than read a lock as if it were a decision.
+        """
+        return self._resolver.resolve_lock(key)
 
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
         with self._lock:

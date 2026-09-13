@@ -44,6 +44,14 @@ class SmartClient:
         raise last_error
     
     def get(self, key: bytes) -> Optional[bytes]:
+        """Read the newest committed value of ``key``.
+
+        A lock in the way is a question rather than an error: it goes to the
+        coordinator's resolver, which rolls it forward if the transaction that left
+        it committed and clears it if it did not, and then the read is retried.
+        Only a lock whose transaction is still live is raised - and the backoff in
+        ``_retry_with_backoff`` is what makes that retry useful instead of a spin.
+        """
         def _do_get():
             leader = self._get_shard_leader(key)
             if leader is None:
@@ -51,19 +59,26 @@ class SmartClient:
             
             result = leader.get(key)
             
+            if result.error_code == ErrorCode.ERR_LOCKED:
+                if not self._coordinator.resolve_lock(key):
+                    raise RuntimeError(f"Key {key!r} is locked by a live transaction")
+                result = leader.get(key)
+            
             if result.error_code == ErrorCode.ERR_NOT_LEADER:
                 self._refresh_leader_cache()
                 raise RuntimeError(f"Not leader, refreshing cache")
-            
-            if result.error_code == ErrorCode.ERR_LOCKED:
-                raise RuntimeError(f"Key is locked")
             
             return result.value
         
         return self._retry_with_backoff(_do_get)
     
     def read(self, txn_id: int, key: bytes) -> Optional[bytes]:
-        """Read ``key`` at the transaction's start timestamp, not at the newest one."""
+        """Read ``key`` at the transaction's start timestamp, not at the newest one.
+
+        A lock older than that snapshot is resolved by the coordinator rather than
+        raised, so a reader is not blocked by a transaction that has already
+        decided.
+        """
         return self._coordinator.read(txn_id, key)
 
     def begin(self) -> int:

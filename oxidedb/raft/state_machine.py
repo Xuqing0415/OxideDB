@@ -253,6 +253,12 @@ class MVCCStateMachine(StateMachine):
         would let a concurrent writer defeat the snapshot.  A lock whose start_ts
         *is* this snapshot is the reader's own write intent, and the value it holds
         is the one that transaction wrote.
+
+        A lock that does block is reported, not judged.  Whether the transaction that
+        left it committed is not in the lock - it is in the primary key's write record
+        - and releasing the lock goes through the Raft log, so deciding it here would
+        be a guess and a divergence.  `LockResolver` asks the question, and applies
+        the TTL.
         """
         lock = self._storage.get_newest_lock(key)
         if lock is not None:
@@ -262,26 +268,11 @@ class MVCCStateMachine(StateMachine):
                 return ReadResult.success(lock["value"])
 
             if timestamp is None or lock_ts < timestamp:
-                lock_time = lock.get("lock_time", time.time())
-                if time.time() - lock_time < 5:
-                    return ReadResult.locked()
-
-                self._try_clean_expired_lock(key, lock)
+                return ReadResult.locked()
 
         read_timestamp = self._last_applied_timestamp if timestamp is None else timestamp
         value = self._storage.get(key, read_timestamp)
         return ReadResult.success(value)
-    
-    def _try_clean_expired_lock(self, key: bytes, lock: Dict[str, Any]):
-        """Deliberately a no-op: a read-path must not mutate replicated state.
-
-        Locks live in the replicated state machine, so releasing one has to go
-        through the Raft log (``CommandType.CLEAN_LOCK``); deleting it here
-        would let this replica silently diverge from the others.  The background
-        ``LockCleaner`` owns that decision.  The TTL check in :meth:`get` only
-        means "stop blocking readers on a lock nobody is going to finish".
-        """
-        pass
     
     def scan(self, start_key: bytes, end_key: bytes) -> List[Tuple[bytes, bytes]]:
         return self._storage.scan(start_key, end_key, self._last_applied_timestamp)
