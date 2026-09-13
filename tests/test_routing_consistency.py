@@ -4,7 +4,9 @@ There used to be two: ``shard/router.py`` hashed the key with md5 while
 ``shard_server.py`` looked it up in a range map, so the client-side router and
 the server disagreed about which shard owned a key.  Every path now goes through
 ``oxidedb.shard.router.locate``, and this test keeps it that way: the moment a
-second rule appears, one of the assertions below disagrees.
+second rule appears, one of the assertions below disagrees.  Uniformity has to
+be checked rather than assumed: the lock cleaner kept its own copy of the range
+loop until it was pointed at ``locate`` too.
 """
 
 import random
@@ -12,6 +14,7 @@ import random
 from oxidedb.raft.shard_server import ShardedRaftCluster, ShardServer
 from oxidedb.shard.router import ShardRouter, default_range_map, locate
 from oxidedb.transaction.coordinator import TransactionCoordinator
+from oxidedb.transaction.lock_cleaner import LockCleaner
 
 
 def _keys():
@@ -42,30 +45,33 @@ def _routers(range_map, num_shards):
     server.set_range_map(range_map)
     router = ShardRouter(num_shards=num_shards, range_map=range_map)
     coordinator = TransactionCoordinator(tso_client=None, shard_server=cluster)
-    return router, server, coordinator
+    cleaner = LockCleaner(cluster)
+    return router, server, coordinator, cleaner
 
 
 def test_every_router_agrees_on_the_default_map():
     range_map = default_range_map(2)
-    router, server, coordinator = _routers(range_map, num_shards=2)
+    router, server, coordinator, cleaner = _routers(range_map, num_shards=2)
 
     for key in _keys():
         expected = locate(range_map, key)
         assert router.get_shard_id(key) == expected, key
         assert server._get_shard_id(key) == expected, key
         assert coordinator._get_shard_id(key) == expected, key
+        assert cleaner._get_shard_id(key) == expected, key
 
 
 def test_every_router_agrees_after_a_split():
     # What split_shard produces: one wide shard 0 and a new shard 1.
     range_map = {0: (b"", b"n"), 1: (b"n", b"\xff")}
-    router, server, coordinator = _routers(range_map, num_shards=2)
+    router, server, coordinator, cleaner = _routers(range_map, num_shards=2)
 
     for key in _keys():
         expected = locate(range_map, key)
         assert router.get_shard_id(key) == expected, key
         assert server._get_shard_id(key) == expected, key
         assert coordinator._get_shard_id(key) == expected, key
+        assert cleaner._get_shard_id(key) == expected, key
 
 
 def test_router_follows_a_new_range_map():
