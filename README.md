@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 131 tests, roughly three minutes
+pytest tests -q             # 137 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -113,9 +113,11 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   The cluster publishes it through `metadata/publisher.py`: the ranges once, each
   shard's replica set and addresses once, and a leader report whenever a shard's leader
   or its term moves, so a client that reads the table can route without being told.
-  What is still missing is the other end of that join - no client refreshes its cache
-  from the table - and a split moves none of the rows it cuts off, so routing is still
-  not usable end to end; see Known gaps.
+  Clients route by it too (`metadata/cache.py`): one read of the table instead of a
+  lookup per key, read again when a shard refuses a request or when the node the table
+  names has stopped leading.  What is still missing is a split, which changes the range
+  map without moving the rows it cuts off, so routing is still not usable end to end;
+  see Known gaps.
 
 ## Storage engines (plan E)
 
@@ -209,7 +211,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-131 tests.  `tests/test_durability.py` covers the correctness properties that
+137 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -264,6 +266,17 @@ The publisher's own rules are pinned without a cluster: it writes when something
 and not on a timer, so the table's version stands still across polls; a restart that
 re-proposes the same ranges is not a disagreement; and a table holding different
 ranges is refused rather than overwritten.
+`tests/test_client_routing.py` is the other end of that join.  A client with a table
+routes by it and never looks at the cluster's own nodes - the test turns that into a
+failure rather than a convention - and a transaction reads and writes by the same
+placement, because a client that read by the table and wrote by scanning the cluster
+would be two clients wearing one name.  The two ways the cache is kept honest are
+pinned with fakes: a lookup that finds the node the table names has stopped leading
+reads the table again, while a table that names nobody is left alone - the shard having
+no leader is a fact about the shard, not staleness in the table - and a shard that
+refuses a read sends the client back for the new answer.  The last test is all real:
+a three-node cluster, a live metadata group, and a leader whose node is shut down
+while the client holds a table naming it.  The read still returns what was committed.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
 snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
 the read set validated the second commit is refused and one doctor stays on call;
@@ -364,16 +377,21 @@ Honest list of what is *not* done, roughly in priority order.
   too: `ShardedRaftCluster` starts a `MetadataPublisher` that publishes the ranges once,
   each shard's replica set and addresses once, and a leader report whenever a shard's
   leader or its term moves, so the table names the node that actually won the election -
-  and stops rather than overwrite a table holding a different range map.  What is still
-  missing is the other end: no client refreshes its cache from the table, so as shipped
-  a client still cannot find a shard end to end.  Beyond that, a split has to move the
-  rows it cuts off before the table may say they belong to a new shard; `split_shard`
-  changes the range map without moving anything, and stamps the rows it does move with a
-  wall-clock timestamp while the TSO hands out a counter starting at 1 - those rows are
-  then newer than every start timestamp a client can be given, so every prewrite
-  against them is refused as a write conflict.  The cross-shard test also drives the
-  coordinator directly rather than through a client, so no hop of it crosses a process
-  boundary.
+  and stops rather than overwrite a table holding a different range map.  A client reads
+  that table and routes by it (`metadata/cache.py`), reading it again when a shard
+  refuses a request or when the node it names has stopped leading.  What that client
+  cannot do is reach a shard it does not already hold a handle on: it resolves the node
+  the table names to an object in its own process, which makes it a client *inside* the
+  cluster, and the hop across a process boundary is what the unimplemented gRPC client
+  service would be.  The lock resolver - the other thing in the transaction path that
+  looks for a leader - still scans the cluster's own nodes.  Beyond that, a split has to
+  move the rows it cuts off before the table may say they belong to a new shard;
+  `split_shard` changes the range map without moving anything, and stamps the rows it
+  does move with a wall-clock timestamp while the TSO hands out a counter starting at
+  1 - those rows are then newer than every start timestamp a client can be given, so
+  every prewrite against them is refused as a write conflict.  The cross-shard test
+  also drives the coordinator directly rather than through a client, so no hop of it
+  crosses a process boundary.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
@@ -392,7 +410,7 @@ oxidedb/
   transaction/   2PC coordinator, local transactions, lock cleaner, retrying client
   tso/           timestamp oracle on its own Raft group
   metadata/      shard map - ranges, placement, leaders - on its own Raft group,
-                 and the publisher that keeps it in step with the cluster
+                 its publisher, and the client-side cache of what it says
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
   client/        gRPC client SDK (server side not implemented)

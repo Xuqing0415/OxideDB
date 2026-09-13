@@ -57,9 +57,14 @@ class Transaction:
 class TransactionCoordinator:
     def __init__(self, tso_client: TSOClient, shard_server,
                  lock_ttl: float = DEFAULT_LOCK_TTL,
-                 validate_reads: bool = True):
+                 validate_reads: bool = True,
+                 router=None):
         self._tso_client = tso_client
         self._shard_server = shard_server
+        #: The client's routing table, when it has one.  Every leader this
+        #: coordinator looks up goes through it, so a transaction reads and writes
+        #: by one placement rather than by two.
+        self._router = router
         self._resolver = LockResolver(shard_server, lock_ttl=lock_ttl)
         self._validate_reads = validate_reads
         #: Held across read-set validation and the primary commit.  See commit().
@@ -73,6 +78,9 @@ class TransactionCoordinator:
         return locate(self._shard_server._range_map, key)
     
     def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
+        if self._router is not None:
+            return self._router.leader_for_shard(shard_id)
+
         for server in self._shard_server._shard_servers.values():
             node = server.get_shard_node(shard_id)
             if node and node.state == NodeState.LEADER:

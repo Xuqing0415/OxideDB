@@ -1,5 +1,5 @@
-# EXPERIMENTAL: the routing table is published, but no client refreshes from it and
-# split does not move data, do not use
+# EXPERIMENTAL: sharding is frozen - a split changes the range map without moving the
+# rows it cuts off, do not use
 import time
 from typing import Dict, List, Optional, Callable, Tuple
 from ..metadata.publisher import DEFAULT_PUBLISH_INTERVAL, MetadataPublisher

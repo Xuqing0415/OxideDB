@@ -9,22 +9,45 @@ from .coordinator import SerializationError, TransactionCoordinator
 
 
 class SmartClient:
-    def __init__(self, tso_client: TSOClient, shard_cluster):
+    def __init__(self, tso_client: TSOClient, shard_cluster, router=None):
         self._tso_client = tso_client
         self._shard_cluster = shard_cluster
-        self._coordinator = TransactionCoordinator(tso_client, shard_cluster)
+        #: Where this client thinks the shards are, when it has a table to ask.
+        #: "None" is a client of a cluster that publishes nowhere - an in-process
+        #: test - and it looks at the cluster's own nodes instead.  Everything the
+        #: client routes, commit included, goes through the same cache: a client
+        #: that read by the table and wrote by scanning the cluster would be two
+        #: clients wearing one name.
+        self._router = router
+        self._coordinator = TransactionCoordinator(tso_client, shard_cluster, router=router)
         self._retry_backoff_base = 0.01
         self._retry_max_backoff = 0.1
         self._retry_max_attempts = 3
     
     def _get_shard_leader(self, key: bytes) -> Optional[MemoryRaftNode]:
+        """The node this client thinks should answer for ``key``.
+
+        With a metadata service it routes by the table - the placement the cluster
+        published, and the only one a client that is not inside the cluster could
+        have.  Looking at the cluster's own nodes is the fallback for a client of a
+        cluster that publishes nowhere, which is what an in-process test is.
+        """
+        if self._router is not None:
+            return self._router.leader_for_key(key)
         result = self._shard_cluster.get_leader_for_key(key)
         if result is not None:
             return result[1]
         return None
     
     def _refresh_leader_cache(self):
-        pass
+        """Read the routing table again, after a shard said this client was wrong.
+
+        A cached table is a decision, so it is not refreshed on a timer: going back
+        to the metadata group is the cost the cache exists to avoid, and a shard
+        refusing a read is the evidence that paying it is now the cheaper thing.
+        """
+        if self._router is not None:
+            self._router.refresh()
     
     def _retry_with_backoff(self, func, *args, **kwargs):
         last_error = None

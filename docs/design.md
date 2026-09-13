@@ -418,6 +418,16 @@ when it was read - not that it is still current.  A stale cached table routes a 
 shard that will refuse it, which is a retry; a guessed table routes it somewhere nothing
 checks.
 
+**How the cache is kept honest.**  There are two ways back to the table and no third.  A
+lookup that finds the node the table names has stopped leading reads the table again -
+the one staleness a cache can see for itself, and the one an election produces - and a
+shard that refuses a request because this client reached a node that is no longer its
+leader sends the client back for the new answer.  A table that names nobody is not a
+reason to read it again: that is the table saying the shard has no leader, and reading
+it again would learn the same thing for the price of a round trip.  Nothing is refreshed
+on a timer, because the table is on the hot path and a fetch per key is the cost the
+cache exists to avoid.
+
 **What is not covered.**  The publishing half of the join is in place: the cluster starts a
 `MetadataPublisher`, which proposes the ranges once, each shard's replica set and addresses
 once, and a leader report only when the leader or its term moves.  That restraint is the
@@ -426,10 +436,13 @@ cache to refresh, so a pass that found nothing has to say nothing, and the publi
 compares before it proposes rather than rewriting the table on a timer.  A refused report
 is normal, because two reports racing is what terms are for; a table that holds
 *different* ranges is not, and the publisher stops with the disagreement attached rather
-than overwrite a keyspace belonging to another cluster.  What is still missing is the
-other end of the join: no client refreshes its cache from the table yet, so the cached
-table described above is written but not driven.  A split is not a command here either,
-and it cannot be one yet: the table may only say that a range belongs to a new shard after
-the rows in it have moved, so that command arrives with the migration that moves them.  A
-table that could be told about a split before the data moved would be a faster way to lose
-data, not a feature.
+than overwrite a keyspace belonging to another cluster.  Both ends of the join are in
+place.  What this client still is not is a client on the far side of a socket: it
+resolves the node the table names to an object it already holds, so it is a client
+inside the cluster, and dialling the address the table publishes is what the
+unimplemented client service would be.  The lock resolver - the other thing in the
+transaction path that looks for a leader - still scans the cluster's own nodes.  A split
+is not a command here either, and it cannot be one yet: the table may only say that a
+range belongs to a new shard after the rows in it have moved, so that command arrives
+with the migration that moves them.  A table that could be told about a split before the
+data moved would be a faster way to lose data, not a feature.
