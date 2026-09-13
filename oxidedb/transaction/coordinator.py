@@ -143,7 +143,10 @@ class TransactionCoordinator:
         lock: it is in the primary key's write record.  So the lock goes to the
         resolver - rolled forward if that transaction committed, cleared if it did
         not - and the read is retried.  While the transaction is still live there
-        is nothing to be had from it, and the read says so instead of blocking.
+        is nothing to be had from it *yet*, and the read waits it out instead of
+        reporting it: the wait is bounded by the lock's remaining TTL, which is
+        the moment ``PrimaryStatus`` stops calling the transaction live.  Only a
+        lock that outlives its TTL - one the shard could not settle - is raised.
 
         The key is remembered as read.  Whatever the caller decides from it, the
         decision is only valid while this snapshot is: commit() checks every read
@@ -164,8 +167,9 @@ class TransactionCoordinator:
             result = leader.get(key, start_ts)
             if result.error_code != ErrorCode.ERR_LOCKED:
                 break
-            if not self.resolve_lock(key):
-                raise RuntimeError(f"Key {key!r} is locked by a live transaction")
+            if not self._resolver.await_resolution(key):
+                raise RuntimeError(
+                    f"Key {key!r} outlived its lock TTL: the shard could not settle it")
         else:
             raise RuntimeError(
                 f"Key {key!r} is still locked after {LOCK_RESOLUTION_ATTEMPTS} attempts")
@@ -187,6 +191,16 @@ class TransactionCoordinator:
         rather than read a lock as if it were a decision.
         """
         return self._resolver.resolve_lock(key)
+
+    def await_lock(self, key: bytes) -> bool:
+        """Wait out a live lock on ``key``.  True once the lock is gone.
+
+        ``resolve_lock`` gives up while the transaction that left the lock may
+        still commit.  That is honest but it is not an answer a reader can use, so
+        this waits for the state to end - see ``LockResolver.await_resolution`` -
+        and a reader is stopped only by a lock nothing can settle.
+        """
+        return self._resolver.await_resolution(key)
 
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
         with self._lock:

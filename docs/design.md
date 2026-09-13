@@ -289,14 +289,26 @@ the key from a reader that could have seen the version the lock holds:
   does not say which way it went, so the read asks the primary key's write record
   (`LockResolver`): committed means the lock is rolled forward into the version
   this snapshot was owed, nothing there means the lock is cleared, and either way
-  the read is retried.  A lock whose transaction is still inside its TTL is left
-  alone - nothing has been decided, so there is no answer to be had - and only then
-  does the read report `ERR_LOCKED`.  A reader is never stopped by a transaction
-  that has already decided.
+  the read is retried.  While the transaction is still inside its TTL nothing has
+  been decided and there is no answer to be had *yet* - which is not the same as no
+  answer at all, so the read waits that out instead of reporting it.  The wait is the
+  lock's own remaining lifetime, because that is exactly the moment `primary_status`
+  stops calling the transaction live; a reader gives up only on a lock that outlives
+  its TTL, which means the shard could not settle it.  A reader is never stopped by a
+  transaction that has already decided, and never waits longer than the transaction
+  could have been given.
 
 `LockResolver` is the same code the cleaner sweeps with (section 3), deliberately:
 a reader tripping over a lock and a cleaner hunting for abandoned ones are asking
 the same question, and a second implementation of it would be a second answer.
+
+Waiting is the same arithmetic as the decision, so it lives in the same place too.
+`remaining_ttl` is the comparison `primary_status` uses to tell "in flight" from
+"nobody is coming", in the open, and `await_resolution` is the loop over it: ask,
+sleep a poll interval, ask again.  The poll interval is the latency a reader pays for
+a commit that lands while it waits, and the deadline is the lock's remaining TTL plus
+one round trip - so a lock that the shard cannot settle (no leader to ask) ends in an
+error after a bounded wait rather than in a hang.
 
 One limit is worth naming here: `scan` was not given the parameter, so range reads are
 still newest-only.  What makes the rest of it serializable is section 6 - the reads are

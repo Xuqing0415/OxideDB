@@ -54,8 +54,10 @@ class SmartClient:
         A lock in the way is a question rather than an error: it goes to the
         coordinator's resolver, which rolls it forward if the transaction that left
         it committed and clears it if it did not, and then the read is retried.
-        Only a lock whose transaction is still live is raised - and the backoff in
-        ``_retry_with_backoff`` is what makes that retry useful instead of a spin.
+        A transaction that is still live is waited out first, up to that lock's
+        remaining TTL; only a lock that outlives its TTL, which means the shard
+        could not settle it, is raised - and the backoff in ``_retry_with_backoff``
+        is what makes that retry useful instead of a spin.
         """
         def _do_get():
             leader = self._get_shard_leader(key)
@@ -65,8 +67,9 @@ class SmartClient:
             result = leader.get(key)
             
             if result.error_code == ErrorCode.ERR_LOCKED:
-                if not self._coordinator.resolve_lock(key):
-                    raise RuntimeError(f"Key {key!r} is locked by a live transaction")
+                if not self._coordinator.await_lock(key):
+                    raise RuntimeError(
+                        f"Key {key!r} outlived its lock TTL: the shard could not settle it")
                 result = leader.get(key)
             
             if result.error_code == ErrorCode.ERR_NOT_LEADER:

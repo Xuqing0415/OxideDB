@@ -33,6 +33,15 @@ from ..shard.router import locate
 #: primary key's write record.
 DEFAULT_LOCK_TTL = 5.0
 
+#: How long a waiter sleeps between asking the primary key what happened.  The
+#: answer changes the moment the coordinator commits, so this is the latency a
+#: reader pays for a commit that lands while it is waiting.
+LOCK_WAIT_POLL_INTERVAL = 0.05
+
+#: Slack allowed past a lock's TTL before a waiter gives up.  The TTL is the moment
+#: the lock stops counting as in flight; settling it takes a Raft round trip.
+LOCK_WAIT_SETTLE_MARGIN = 0.1
+
 
 class PrimaryStatus(Enum):
     """What the primary key's shard says about a transaction."""
@@ -83,7 +92,7 @@ class LockResolver:
 
         lock = storage.get_newest_lock(primary_key)
         if lock is not None and lock["start_ts"] == start_ts:
-            if time.time() - lock.get("lock_time", 0) < self._lock_ttl:
+            if self.remaining_ttl(lock) > 0:
                 return PrimaryStatus.PENDING
 
         return PrimaryStatus.ABORTED
@@ -99,6 +108,15 @@ class LockResolver:
             return write_record["commit_ts"]
 
         return None
+
+    def remaining_ttl(self, lock: Dict[str, Any]) -> float:
+        """How long ``lock`` may still be the lock of a live transaction.
+
+        The arithmetic ``primary_status`` separates PENDING from ABORTED with, in
+        the open - a caller that wants to wait for the answer has to know when the
+        question can first be answered at all.  Zero once the TTL has passed.
+        """
+        return max(0.0, self._lock_ttl - (time.time() - lock.get("lock_time", 0.0)))
 
     def resolve_lock(self, key: bytes, lock: Optional[Dict[str, Any]] = None) -> bool:
         """Settle the lock on ``key``.  True once it is gone.
@@ -125,6 +143,35 @@ class LockResolver:
             return self._settle(key, start_ts, CommandType.ROLLBACK)
 
         return False
+
+    def await_resolution(self, key: bytes, lock: Optional[Dict[str, Any]] = None) -> bool:
+        """Settle the lock on ``key``, waiting out a transaction that is still live.
+
+        ``resolve_lock`` answers at once, and "the coordinator may still commit" is
+        a true answer a reader cannot use.  It has a shelf life, though: at the
+        lock's TTL the transaction stops counting as in flight and the same
+        question answers ABORTED instead.  Waiting until then is what turns a live
+        lock into a finished read rather than an error, and the wait is bounded by
+        the lock's own remaining lifetime - a reader never waits longer than the
+        transaction could have been given.
+
+        True once the lock is gone - rolled forward if the transaction committed
+        during the wait, cleared if it did not.  False if it is still there after
+        its TTL, which means the shard could not settle it: no leader, not a
+        transaction that is still live.
+        """
+        if lock is None:
+            lock = self.lock_on(key)
+        if lock is None:
+            return True
+
+        deadline = time.monotonic() + self.remaining_ttl(lock) + LOCK_WAIT_SETTLE_MARGIN
+        while True:
+            if self.resolve_lock(key):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(LOCK_WAIT_POLL_INTERVAL)
 
     def _settle(self, key: bytes, start_ts: int, command_type: bytes, **kwargs) -> bool:
         leader = self._get_shard_leader(self._get_shard_id(key))

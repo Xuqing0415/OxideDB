@@ -83,9 +83,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   timestamp `t` sees a consistent snapshot and an old transaction keeps seeing
   the data it started with.  The read path takes that timestamp (`node.get(key,
   ts)`, `coordinator.read(txn_id, key)`); a read with no timestamp still means the
-  newest version, which is what a linearizable read wants.  A lock in the way is
-  reported rather than waited out, and the reader resolves it - see Transactions.
-  Deletes are tombstones, not erasures.
+  newest version, which is what a linearizable read wants.  A lock in the way is a
+  question rather than an error: the reader resolves it - see Transactions.  Deletes
+  are tombstones, not erasures.
 * **Transactions** — Percolator-style 2PC: `prewrite` locks each key, the
   primary key's commit decides the transaction, then the secondary keys are
   committed.  Locks live in the engine rather than in memory, so a restarted
@@ -94,8 +94,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   state.  The cluster starts that cleaner itself - 30 s scan interval, 5 s TTL,
   both arguments to `start`/`start_network` - because a cleaner only tests ever
   started is a cleaner nobody runs.  A reader that trips over such a lock resolves
-  it on the spot with the same code the cleaner uses, and retries, so only a
-  transaction that is still live stops a read.
+  it on the spot with the same code the cleaner uses, and retries; a transaction
+  that is still live is waited out up to the lock's remaining TTL first, so only a
+  lock that outlives its TTL - one the shard could not settle - stops a read.
 * **Isolation** — snapshot reads plus a read set validated at commit: a transaction
   remembers every key it read and is refused if any of them was committed over
   since its snapshot.  That is what stops write skew - two doctors who each check
@@ -282,8 +283,9 @@ Honest list of what is *not* done, roughly in priority order.
   but the gRPC client path is scaffolding (below), and `scan` has no timestamp
   parameter, so a range read is always the newest version.  A key whose lock is
   *older* than the snapshot is resolved by asking the primary key's write record and
-  then rolled forward or cleared; what is missing is waiting, so a reader that meets
-  a lock whose transaction is still live raises and has to come back.
+  then rolled forward or cleared, and a lock whose transaction is still live is waited
+  out up to the lock's remaining TTL - a reader is stopped only by a lock that outlives
+  its TTL, which means the shard could not settle it.
 * **Serializable isolation is validated, not SSI.**  A transaction is refused when any
   key it read was committed over after its snapshot.  That prevents write skew, but it
   also refuses read-write overlaps that a conflict graph would allow, so it aborts more

@@ -5,20 +5,23 @@ lock may belong to a transaction that already committed, and its version is part
 the snapshot the reader is entitled to, but the lock itself does not say which way it
 went.  Percolator's answer is that the lock is not the decision - the primary key's
 write record is - so a reader can ask that question and finish the read: roll the lock
-forward if the transaction committed, clear it if it did not, and only give up while
-the transaction is still live.
+forward if the transaction committed, clear it if it did not, and wait out a
+transaction that is still live rather than reporting it, because even that state has an
+end: the lock's TTL.  Only a lock that outlives its TTL - one nobody can settle - is
+reported.
 
 The stranded lock these tests use is the one a coordinator leaves behind when it dies
 between the primary commit and the secondary commits, which is the case the lock
 protocol exists for.
 """
 
+import threading
 import time
 
 import pytest
 
 from _ports import free_addresses
-from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
+from _wait import wait_for_keys_leader, wait_for_tso_client
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ErrorCode
 from oxidedb.shard.router import locate
@@ -47,6 +50,22 @@ def _two_shard_cluster():
     return tso_cluster, shard_cluster
 
 
+def _commit_primary(shard_cluster, tso_client, primary, start_ts):
+    """Commit one key the way the coordinator commits a primary key.
+
+    ``coordinator.commit`` is prewrite *and* commit, so a transaction suspended
+    between the two halves - which is exactly where a stranded lock comes from - is
+    finished with the command the coordinator would have sent: the primary key's
+    commit.  Returns the timestamp it committed at.
+    """
+    commit_ts = tso_client.get_timestamp()
+    leader = shard_cluster.get_leader_for_key(primary)[1]
+    command = leader._state_machine.serialize_command(
+        CommandType.COMMIT, key=primary, start_ts=start_ts, commit_ts=commit_ts)
+    assert leader.propose(command).success, "the primary commit has to succeed"
+    return commit_ts
+
+
 def _die_after_the_primary_commit(shard_cluster, tso_client, coordinator, primary, secondary):
     """Prewrite both keys, commit only the primary, and walk away.
 
@@ -59,11 +78,7 @@ def _die_after_the_primary_commit(shard_cluster, tso_client, coordinator, primar
     coordinator.add_write(writer, secondary, b"b1")
     assert coordinator.prewrite(writer), "the prewrite has to lock both keys"
 
-    commit_ts = tso_client.get_timestamp()
-    leader = shard_cluster.get_leader_for_key(primary)[1]
-    command = leader._state_machine.serialize_command(
-        CommandType.COMMIT, key=primary, start_ts=start_ts, commit_ts=commit_ts)
-    assert leader.propose(command).success, "the primary commit has to succeed"
+    commit_ts = _commit_primary(shard_cluster, tso_client, primary, start_ts)
 
     stranded = shard_cluster.get_leader_for_key(secondary)[1]._state_machine.get_lock_status(secondary)
     assert stranded is not None, "the secondary key has to still be locked"
@@ -124,26 +139,99 @@ def test_a_snapshot_read_clears_a_lock_that_never_committed():
     reader, reader_start = coordinator.begin()
     assert dead_start < reader_start, "the lock has to be older than this snapshot"
 
-    # Inside the TTL the transaction may still commit, so there is no answer to be
-    # had and the read says so instead of blocking.
-    with pytest.raises(RuntimeError, match="live transaction"):
-        coordinator.read(reader, KEY_A)
-
-    # Past it, the lock is cleared and the snapshot is answered from the version
-    # that was there before it.
-    def readable():
-        try:
-            return coordinator.read(reader, KEY_A)
-        except RuntimeError:
-            return None
-
-    assert wait_until(readable, message="the abandoned lock was never resolved") == b"original"
+    # Nobody ever committed, so inside the TTL there is no answer to be had *yet*:
+    # the read waits the lock out instead of reporting it, and answers once the TTL
+    # has passed and the lock stops counting as in flight.  The wait shows up as
+    # time - a read that returned at once would have read through the lock - and the
+    # answer comes from the version that was there before it.
+    waited_from = time.monotonic()
+    assert coordinator.read(reader, KEY_A) == b"original"
+    assert time.monotonic() - waited_from >= 0.04, "the read has to wait the TTL out"
     assert _lock_status(shard_cluster, KEY_A) is None, "the lock has to be gone"
 
     coordinator.shutdown()
     shard_cluster.shutdown()
     tso_cluster.shutdown()
     print("Abandoned lock rollback test passed!")
+
+
+def test_a_client_read_waits_for_a_live_lock_and_then_sees_the_commit():
+    """A live lock delays a read; it does not fail it.
+
+    The reader is inside the wait - it has not returned, and it cannot have read
+    through the lock - when the writer commits, well inside the five second TTL.
+    The value it ends up with can only have come from going back and looking after
+    the lock was settled: waiting the TTL out would have *cleared* the lock instead
+    of rolling the commit forward, and the old behaviour reported an error without
+    looking again at all.
+    """
+    tso_cluster, shard_cluster = _two_shard_cluster()
+    wait_for_keys_leader(shard_cluster, [KEY_A])
+    tso_client = wait_for_tso_client(tso_cluster)
+    coordinator = TransactionCoordinator(tso_client, shard_cluster)
+
+    put_ts = tso_client.get_timestamp()
+    leader = shard_cluster.get_leader_for_key(KEY_A)[1]
+    command = leader._state_machine.serialize_command(
+        CommandType.SET, key=KEY_A, value=b"before", timestamp=put_ts)
+    assert leader.propose(command).success
+
+    writer, writer_start = coordinator.begin()
+    coordinator.add_write(writer, KEY_A, b"after")
+    assert coordinator.prewrite(writer), "the prewrite has to lock the key"
+
+    client = SmartClient(tso_client, shard_cluster)
+    results = []
+    reader_thread = threading.Thread(
+        target=lambda: results.append(client.get(KEY_A)), daemon=True)
+    reader_thread.start()
+    try:
+        time.sleep(0.1)
+        assert results == [], "the read has to still be waiting on the lock"
+        assert _lock_status(shard_cluster, KEY_A) is not None, "nothing settled the lock"
+        _commit_primary(shard_cluster, tso_client, KEY_A, writer_start)
+    finally:
+        reader_thread.join(timeout=5)
+
+    assert not reader_thread.is_alive(), "the read has to come back on its own"
+    assert results == [b"after"], "the read has to retry once the lock is settled"
+    assert _lock_status(shard_cluster, KEY_A) is None, "the lock has to be gone"
+
+    coordinator.shutdown()
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Live lock wait test passed!")
+
+
+def test_a_lock_that_cannot_be_settled_is_reported():
+    """Running out of wait is an error, not a quiet answer.
+
+    The one lock a reader gives up on is one nobody can settle - no leader for the
+    primary key's shard, so there is no write record to ask about.  Then it has to
+    say so rather than answer with the version the lock is hiding.  Reaching that
+    state for real means losing the shard's leader, which is another test's
+    subject, so the resolver is stubbed to answer the way it would when it cannot.
+    """
+    tso_cluster, shard_cluster = _two_shard_cluster()
+    wait_for_keys_leader(shard_cluster, [KEY_A])
+    tso_client = wait_for_tso_client(tso_cluster)
+    coordinator = TransactionCoordinator(tso_client, shard_cluster)
+
+    writer, _ = coordinator.begin()
+    coordinator.add_write(writer, KEY_A, b"never")
+    assert coordinator.prewrite(writer), "the prewrite has to lock the key"
+
+    reader, _ = coordinator.begin()
+    coordinator._resolver.await_resolution = lambda key, lock=None: False
+
+    with pytest.raises(RuntimeError, match="could not settle it"):
+        coordinator.read(reader, KEY_A)
+    assert _lock_status(shard_cluster, KEY_A) is not None, "nothing settled the lock"
+
+    coordinator.shutdown()
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Unsettleable lock test passed!")
 
 
 def test_the_client_read_resolves_a_stranded_lock():
