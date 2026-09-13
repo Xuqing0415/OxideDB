@@ -23,6 +23,17 @@ class TxnStatus(Enum):
     ABORTED = "aborted"
 
 
+class SerializationError(RuntimeError):
+    """A commit that read-set validation refused.
+
+    The transaction read a version that somebody else had already superseded by the
+    time it tried to commit, so the snapshot it made its decisions from is gone.
+    Nothing it wrote survives - committing it would leave effects that no serial
+    order can explain - and the only correct response is to run the work again on a
+    fresh snapshot.  ``SmartClient.run`` is that retry.
+    """
+
+
 class Transaction:
     def __init__(self, txn_id: int, start_ts: int):
         self.txn_id = txn_id
@@ -31,6 +42,11 @@ class Transaction:
         self.keys: List[Tuple[bytes, bytes]] = []
         self.primary_key: Optional[bytes] = None
         self.status = TxnStatus.PENDING
+        #: Every key this transaction read, for the validation at commit.  The
+        #: timestamp it read them at is the transaction's own start_ts.
+        self.read_set: set = set()
+        #: Why the transaction was aborted, when the reason is worth saying.
+        self.abort_reason: Optional[str] = None
     
     def add_key(self, key: bytes, value: bytes):
         self.keys.append((key, value))
@@ -40,10 +56,14 @@ class Transaction:
 
 class TransactionCoordinator:
     def __init__(self, tso_client: TSOClient, shard_server,
-                 lock_ttl: float = DEFAULT_LOCK_TTL):
+                 lock_ttl: float = DEFAULT_LOCK_TTL,
+                 validate_reads: bool = True):
         self._tso_client = tso_client
         self._shard_server = shard_server
         self._resolver = LockResolver(shard_server, lock_ttl=lock_ttl)
+        self._validate_reads = validate_reads
+        #: Held across read-set validation and the primary commit.  See commit().
+        self._commit_lock = threading.Lock()
         self._transactions: Dict[int, Transaction] = {}
         self._txn_id_counter = 0
         self._lock = threading.RLock()
@@ -124,6 +144,10 @@ class TransactionCoordinator:
         resolver - rolled forward if that transaction committed, cleared if it did
         not - and the read is retried.  While the transaction is still live there
         is nothing to be had from it, and the read says so instead of blocking.
+
+        The key is remembered as read.  Whatever the caller decides from it, the
+        decision is only valid while this snapshot is: commit() checks every read
+        key for a version committed after start_ts and aborts if it finds one.
         """
         with self._lock:
             txn = self._transactions.get(txn_id)
@@ -148,6 +172,9 @@ class TransactionCoordinator:
 
         if not result.success:
             raise RuntimeError(f"Read failed: {result.error_msg}")
+
+        with self._lock:
+            txn.read_set.add(key)
 
         return result.value
 
@@ -183,35 +210,77 @@ class TransactionCoordinator:
         
         with self._lock:
             txn.status = TxnStatus.PREWRITTEN
-        
-        commit_ts = self._tso_client.get_timestamp()
-        
-        with self._lock:
-            txn.commit_ts = commit_ts
-        
-        primary_shard_id = self._get_shard_id(txn.primary_key)
-        primary_leader = self._get_shard_leader(primary_shard_id)
-        
-        if primary_leader is None:
-            self._rollback_all_shards(txn, shard_groups)
+
+        # Validation and the primary commit have to be one step with respect to other
+        # commits.  Two transactions that each read what the other is about to
+        # overwrite would otherwise be able to validate a moment apart and both
+        # commit, which is exactly the write skew the validation exists to stop.  In
+        # this design every commit goes through a coordinator, so one lock here
+        # orders them; two coordinators committing concurrently would need the
+        # conflict graph instead, which is not implemented.
+        with self._commit_lock:
+            conflict = self._validate_read_set(txn) if self._validate_reads else None
+            if conflict is not None:
+                self._rollback_all_shards(txn, shard_groups)
+                with self._lock:
+                    txn.status = TxnStatus.ABORTED
+                    txn.abort_reason = f"read set invalidated: {conflict}"
+                return False, None
+
+            commit_ts = self._tso_client.get_timestamp()
+
             with self._lock:
-                txn.status = TxnStatus.ABORTED
-            return False, None
-        
-        primary_commit_result = self._commit_key(primary_leader, txn.primary_key, txn.start_ts, commit_ts)
-        
-        if not primary_commit_result.success:
-            self._rollback_all_shards(txn, shard_groups)
+                txn.commit_ts = commit_ts
+
+            primary_shard_id = self._get_shard_id(txn.primary_key)
+            primary_leader = self._get_shard_leader(primary_shard_id)
+
+            if primary_leader is None:
+                self._rollback_all_shards(txn, shard_groups)
+                with self._lock:
+                    txn.status = TxnStatus.ABORTED
+                return False, None
+
+            primary_commit_result = self._commit_key(primary_leader, txn.primary_key, txn.start_ts, commit_ts)
+
+            if not primary_commit_result.success:
+                self._rollback_all_shards(txn, shard_groups)
+                with self._lock:
+                    txn.status = TxnStatus.ABORTED
+                return False, None
+
             with self._lock:
-                txn.status = TxnStatus.ABORTED
-            return False, None
-        
-        with self._lock:
-            txn.status = TxnStatus.COMMITTED
-        
+                txn.status = TxnStatus.COMMITTED
+
         self._commit_secondary_shards(txn, shard_groups, commit_ts)
-        
+
         return True, commit_ts
+
+    def _validate_read_set(self, txn: Transaction) -> Optional[str]:
+        """Why this transaction's reads are stale, or None if they are not.
+
+        A transaction decides from the versions its snapshot showed it.  If any key
+        it read has since had a version committed - which can only have been by
+        somebody else, since this transaction has not committed yet - then that
+        decision was made from data that has left the serial order, and committing
+        would leave an effect no serial order explains.  The classic shape of that is
+        two doctors who each check the other is on call, then each go off call.
+
+        A shard with no leader is treated as stale rather than as clean: not being
+        able to check is not the same as checking and finding nothing.
+        """
+        for key in sorted(txn.read_set):
+            shard_id = self._get_shard_id(key)
+            leader = self._get_shard_leader(shard_id)
+            if leader is None:
+                return f"no leader for shard {shard_id}, holding {key!r}"
+
+            write_record = leader._state_machine._storage.get_latest_write(key)
+            if write_record is not None and write_record["commit_ts"] > txn.start_ts:
+                return (f"{key!r} was committed at {write_record['commit_ts']}, "
+                        f"after this transaction started at {txn.start_ts}")
+
+        return None
     
     def _group_keys_by_shard(self, txn: Transaction) -> Dict[int, List[Tuple[bytes, bytes]]]:
         shard_groups = {}
