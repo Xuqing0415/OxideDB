@@ -151,22 +151,30 @@ anyone, not just by the coordinator that made the decision.  That is the whole
 point: the decision is *derived from the keyspace* instead of remembered.
 
 **Why locks carry a TTL.**  A coordinator that dies *before* the primary commit
-leaves locks that nobody is going to resolve.  `lock_time` is what stops those
-keys from being blocked forever: after `DEFAULT_LOCK_TTL` - 5 seconds, an argument
-to the cleaner - a lock no longer blocks readers (`MVCCStateMachine.get`), and
-`LockCleaner` re-derives the outcome from the primary key: committed if the
-primary has a write record for that `start_ts`, locked if it is still fresh,
-aborted otherwise.  The TTL is a trigger for asking the question, not the answer
-itself.
+leaves locks that nobody is going to resolve.  `lock_time` is what stops those keys
+from being blocked forever: past `DEFAULT_LOCK_TTL` - 5 seconds, an argument to the
+resolver - the transaction counts as dead, committed if the primary has a write
+record for that `start_ts` and aborted otherwise.  The TTL is a trigger for asking
+the question, not the answer itself.
 
-The cleaner is started by the cluster (`ShardedRaftCluster.start` and
-`start_network`) rather than by whoever calls them, because a cluster without one
-refuses every read of every lock a dead coordinator left, and locks do not expire
-on their own.  The scan interval (30 s) and the TTL are both arguments, and
-`lock_cleaner_interval=None` leaves it off for a test that wants to watch a lock
-stay unresolved.  What it does is the derivation above, not a special case: the
-answer is in the primary key's write record, so it does not matter that the
-coordinator that asked the question is gone.
+The TTL lives only there, which took a correction.  `MVCCStateMachine.get` used to
+stop reporting a lock as an obstacle once it was five seconds old and answer with the
+newest applied version.  That is fine when the transaction died, and wrong when it
+committed with only the secondary commit missing: the newest applied version is then
+older than one that is already committed, so the read would go backwards for a
+transaction it should have seen.  Expiry is a policy, and the state machine is not
+where policies live - it now reports the lock however old it is, and the caller asks.
+
+That derivation is `LockResolver`, and it has two callers.  A reader that trips
+over a lock uses it to finish its read (section 5).  The `LockCleaner` uses it to
+sweep for locks whose coordinator is not coming back, and the cluster starts that
+cleaner itself (`ShardedRaftCluster.start` and `start_network`) rather than leaving
+it to whoever calls them: nothing guarantees that somebody will read the key a dead
+coordinator locked, and a lock nothing reads is a lock nothing resolves.  The scan
+interval (30 s) and the TTL are both arguments, and `lock_cleaner_interval=None`
+leaves it off for a test that wants to watch a lock stay unresolved.  Two callers,
+one question, one answer - which is the point: the answer is in the primary key's
+write record, so it does not matter that the coordinator that asked is gone.
 
 **Why secondary commits are asynchronous.**  Commit latency does not grow with the
 number of shards: the client waits for the primary only.  The price is that a
@@ -277,10 +285,18 @@ the key from a reader that could have seen the version the lock holds:
   Blocking here would let any concurrent writer stall a reader that is not
   looking at its key.
 * `lock.start_ts < read_ts`: the writer may have committed at or below this
-  snapshot, and then the version to return is the one the lock holds.  Deciding
-  that needs the primary key's write record, so the read reports `ERR_LOCKED`
-  rather than guessing.  Lock resolution is the missing piece (README, Known
-  gaps).
+  snapshot, and then the version to return is the one the lock holds.  The lock
+  does not say which way it went, so the read asks the primary key's write record
+  (`LockResolver`): committed means the lock is rolled forward into the version
+  this snapshot was owed, nothing there means the lock is cleared, and either way
+  the read is retried.  A lock whose transaction is still inside its TTL is left
+  alone - nothing has been decided, so there is no answer to be had - and only then
+  does the read report `ERR_LOCKED`.  A reader is never stopped by a transaction
+  that has already decided.
+
+`LockResolver` is the same code the cleaner sweeps with (section 3), deliberately:
+a reader tripping over a lock and a cleaner hunting for abandoned ones are asking
+the same question, and a second implementation of it would be a second answer.
 
 Two limits are worth naming.  `scan` was not given the parameter, so range reads
 are still newest-only.  And none of this is serializable: reads are not recorded

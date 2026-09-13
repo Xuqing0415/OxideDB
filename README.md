@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 107 tests, roughly three minutes
+pytest tests -q             # 111 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -83,8 +83,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   timestamp `t` sees a consistent snapshot and an old transaction keeps seeing
   the data it started with.  The read path takes that timestamp (`node.get(key,
   ts)`, `coordinator.read(txn_id, key)`); a read with no timestamp still means the
-  newest version, which is what a linearizable read wants.  Deletes are
-  tombstones, not erasures.
+  newest version, which is what a linearizable read wants.  A lock in the way is
+  reported rather than waited out, and the reader resolves it - see Transactions.
+  Deletes are tombstones, not erasures.
 * **Transactions** — Percolator-style 2PC: `prewrite` locks each key, the
   primary key's commit decides the transaction, then the secondary keys are
   committed.  Locks live in the engine rather than in memory, so a restarted
@@ -92,7 +93,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   and `LockCleaner` resolves abandoned ones by consulting the primary key's
   state.  The cluster starts that cleaner itself - 30 s scan interval, 5 s TTL,
   both arguments to `start`/`start_network` - because a cleaner only tests ever
-  started is a cleaner nobody runs.
+  started is a cleaner nobody runs.  A reader that trips over such a lock resolves
+  it on the spot with the same code the cleaner uses, and retries, so only a
+  transaction that is still live stops a read.
 * **Timestamps** — a `TSO` Raft group hands out monotonic timestamps in batches;
   clients cache a batch to avoid a round trip per transaction.
 * **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
@@ -191,7 +194,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-107 tests.  `tests/test_durability.py` covers the correctness properties that
+111 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -211,6 +214,16 @@ across two Raft groups is the failure it is there to catch.
 cleaner resolve a lock whose coordinator never came back; the same lock is left
 alone when the cleaner is switched off, which is what makes the first test evidence
 rather than coincidence.
+`tests/test_lock_resolution.py` reads a key whose lock was left behind by a
+coordinator that died between its primary commit and its secondary commits: the read
+asks the primary key what happened, rolls the lock forward, and returns the committed
+value that used to be an error.  A second test covers the other answer - a lock from a
+transaction that never committed is cleared, but only after its TTL, because inside it
+the coordinator may still be about to commit.  A third does the same recovery through
+`SmartClient`, which is the call a user makes.  A fourth pins the layer below: a lock
+past any TTL is still reported as an obstacle, because expiry is the resolver's policy
+and the state machine deciding it would answer with a version older than one that is
+already committed.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
@@ -253,8 +266,9 @@ Honest list of what is *not* done, roughly in priority order.
   all.**  `coordinator.read(txn_id, key)` reads at the transaction's `start_ts`,
   but the gRPC client path is scaffolding (below), and `scan` has no timestamp
   parameter, so a range read is always the newest version.  A key whose lock is
-  *older* than the snapshot raises instead of being resolved: deciding which way
-  that lock went needs the lock-resolution protocol, which is not written.  A
+  *older* than the snapshot is resolved by asking the primary key's write record and
+  then rolled forward or cleared; what is missing is waiting, so a reader that meets
+  a lock whose transaction is still live raises and has to come back.  A
   transaction also keeps no read set, so nothing detects a write skew - what is
   implemented is snapshot reads plus Percolator's write conflict check, not
   serializable snapshot isolation.
