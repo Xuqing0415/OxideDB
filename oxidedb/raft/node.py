@@ -994,7 +994,17 @@ class MemoryRaftNode:
         
         return ApplyResult.success()
 
-    def get(self, key: bytes) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
+        """Read ``key``, at ``timestamp`` if one is given and at the newest version
+        otherwise.
+
+        The ReadIndex handshake is done either way, and it is what makes the
+        timestamp safe to use: a snapshot read at ``start_ts`` needs every commit
+        up to ``start_ts`` to be applied here, and the quorum check puts this
+        replica at least as far as everything committed before the read began -
+        which is at or past ``start_ts``, since the TSO issued that timestamp
+        before this call.
+        """
         with self._lock:
             if self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
@@ -1049,7 +1059,7 @@ class MemoryRaftNode:
             if self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
             
-            return self._state_machine.get(key)
+            return self._state_machine.get(key, timestamp)
 
     def scan(self, start_key: bytes, end_key: bytes) -> List[tuple]:
         with self._lock:

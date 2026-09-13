@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..raft.node import MemoryRaftNode, NodeState
-from ..raft.state_machine import CommandType, ApplyResult
+from ..raft.state_machine import CommandType, ApplyResult, ErrorCode
 from ..shard.router import locate
 from ..tso.tso import TSOClient
 
@@ -100,6 +100,39 @@ class TransactionCoordinator:
             txn.status = TxnStatus.PREWRITTEN
 
         return True
+
+    def read(self, txn_id: int, key: bytes) -> Optional[bytes]:
+        """Read ``key`` at this transaction's start timestamp.
+
+        A snapshot read, not a fresh one: whichever version was committed before
+        the transaction started, so repeating it later in the same transaction
+        returns the same bytes even if someone else commits a newer version in
+        between.  A key this transaction has already prewritten reads back the
+        value it wrote.
+
+        A key with a lock *older* than this transaction's start_ts raises: that
+        lock may belong to a committed transaction whose version this snapshot
+        should contain, and deciding which way it went needs the lock-resolution
+        protocol, which is not here yet.
+        """
+        with self._lock:
+            txn = self._transactions.get(txn_id)
+            if txn is None:
+                raise RuntimeError(f"Transaction {txn_id} not found")
+            start_ts = txn.start_ts
+
+        shard_id = self._get_shard_id(key)
+        leader = self._get_shard_leader(shard_id)
+        if leader is None:
+            raise RuntimeError(f"No leader for shard {shard_id}")
+
+        result = leader.get(key, start_ts)
+        if result.error_code == ErrorCode.ERR_LOCKED:
+            raise RuntimeError(f"Key {key!r} is locked by an older transaction")
+        if not result.success:
+            raise RuntimeError(f"Read failed: {result.error_msg}")
+
+        return result.value
 
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
         with self._lock:

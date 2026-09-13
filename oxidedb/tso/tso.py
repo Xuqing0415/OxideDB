@@ -45,7 +45,7 @@ class TSOSMStateMachine(StateMachine):
         cmd_type_value = cmd_type.value if hasattr(cmd_type, 'value') else cmd_type
         return msgpack.packb({"type": cmd_type_value, **kwargs})
     
-    def get(self, key: bytes) -> Optional[bytes]:
+    def get(self, key: bytes, timestamp: Optional[int] = None) -> Optional[bytes]:
         return None
     
     def scan(self, start_key: bytes, end_key: bytes) -> list:

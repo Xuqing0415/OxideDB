@@ -71,7 +71,7 @@ class StateMachine(ABC):
         pass
 
     @abstractmethod
-    def get(self, key: bytes) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
         pass
 
     @abstractmethod
@@ -238,16 +238,38 @@ class MVCCStateMachine(StateMachine):
 
         return ApplyResult.success()
     
-    def get(self, key: bytes) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
+        """Read ``key`` at ``timestamp``, or at the newest version when it is None.
+
+        None is what a linearizable read wants: the freshest version this replica
+        has applied.  A transaction passes its own ``start_ts`` instead, and then
+        the read is a snapshot read - the version that was committed before the
+        transaction started, the same one every time it is repeated.
+
+        Which locks block a read depends on the timestamp, for the same reason.  A
+        lock only hides the key from a reader that could have seen the version the
+        lock holds, so a lock taken by a transaction that started *after* this
+        snapshot is ignored: it cannot have committed into it, and blocking on it
+        would let a concurrent writer defeat the snapshot.  A lock whose start_ts
+        *is* this snapshot is the reader's own write intent, and the value it holds
+        is the one that transaction wrote.
+        """
         lock = self._storage.get_newest_lock(key)
         if lock is not None:
-            lock_time = lock.get("lock_time", time.time())
-            if time.time() - lock_time < 5:
-                return ReadResult.locked()
-            
-            self._try_clean_expired_lock(key, lock)
-        
-        value = self._storage.get(key, self._last_applied_timestamp)
+            lock_ts = lock["start_ts"]
+
+            if timestamp is not None and lock_ts == timestamp:
+                return ReadResult.success(lock["value"])
+
+            if timestamp is None or lock_ts < timestamp:
+                lock_time = lock.get("lock_time", time.time())
+                if time.time() - lock_time < 5:
+                    return ReadResult.locked()
+
+                self._try_clean_expired_lock(key, lock)
+
+        read_timestamp = self._last_applied_timestamp if timestamp is None else timestamp
+        value = self._storage.get(key, read_timestamp)
         return ReadResult.success(value)
     
     def _try_clean_expired_lock(self, key: bytes, lock: Dict[str, Any]):

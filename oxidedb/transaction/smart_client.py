@@ -62,6 +62,10 @@ class SmartClient:
         
         return self._retry_with_backoff(_do_get)
     
+    def read(self, txn_id: int, key: bytes) -> Optional[bytes]:
+        """Read ``key`` at the transaction's start timestamp, not at the newest one."""
+        return self._coordinator.read(txn_id, key)
+
     def begin(self) -> int:
         txn_id, _ = self._coordinator.begin()
         return txn_id
