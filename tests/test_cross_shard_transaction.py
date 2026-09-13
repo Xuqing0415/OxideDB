@@ -278,6 +278,54 @@ def test_coordinator_begin():
     print("Coordinator begin test passed!")
 
 
+def test_prewrite_refused_by_one_shard_leaves_no_lock():
+    """A prewrite one shard refuses must not leave a lock on the other.
+
+    Shard 0 accepts the lock and shard 1 refuses it, so the transaction is
+    aborted - and the shard that already holds a lock has to be told to drop it,
+    or the key stays unreadable for as long as that lock lives.  The lock the
+    rollback must *not* touch is the other transaction's, on the refusing shard.
+    """
+    tso_cluster, shard_cluster = two_shard_cluster()
+
+    key1 = b"key0"      # first byte 0x6b -> shard 0
+    key2 = b"\x80key1"  # first byte 0x80 -> shard 1
+    wait_for_keys_leader(shard_cluster, [key1, key2])
+    tso_client = wait_for_tso_client(tso_cluster)
+
+    coordinator = TransactionCoordinator(tso_client, shard_cluster)
+
+    # Someone else holds the lock on key2, so shard 1 will refuse our prewrite.
+    # Its start_ts comes from the TSO too, so it cannot collide with ours - a
+    # literal 1 is the first timestamp the TSO hands out, and a rollback carrying
+    # that same start_ts releases the other transaction's lock as if it were ours.
+    other_leader = shard_cluster.get_leader_for_key(key2)[1]
+    other_ts = tso_client.get_timestamp()
+    conflict = other_leader._state_machine.serialize_command(
+        CommandType.PREWRITE, key=key2, value=b"someone else", start_ts=other_ts,
+        primary_key=key2)
+    assert other_leader.propose(conflict).success, "the conflicting lock did not take"
+
+    txn_id, start_ts = coordinator.begin()
+    coordinator.add_write(txn_id, key1, b"value_a")
+    coordinator.add_write(txn_id, key2, b"value_b")
+
+    assert not coordinator.prewrite(txn_id), "prewrite should fail: key2 is locked"
+
+    wait_until(lambda: lock_on(shard_cluster, key1) is None,
+               message="shard 0 kept the lock for a transaction that was aborted")
+
+    survivor = lock_on(shard_cluster, key2)
+    assert survivor is not None and survivor["start_ts"] == other_ts, (
+        "the rollback touched the other transaction's lock"
+    )
+
+    coordinator.shutdown()
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Cross-shard prewrite refusal test passed!")
+
+
 def test_prewrite_without_a_leader_for_one_shard_leaves_no_lock():
     """If one shard has no leader, no shard may be written to at all.
 
@@ -328,5 +376,7 @@ if __name__ == "__main__":
     test_cross_shard_prewrite()
     print("\n" + "="*60 + "\n")
     test_cross_shard_rollback()
+    print("\n" + "="*60 + "\n")
+    test_prewrite_refused_by_one_shard_leaves_no_lock()
     print("\n" + "="*60 + "\n")
     test_prewrite_without_a_leader_for_one_shard_leaves_no_lock()

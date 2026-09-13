@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 100 tests, roughly three minutes
+pytest tests -q             # 102 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -186,7 +186,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-100 tests.  `tests/test_durability.py` covers the correctness properties that
+102 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -194,7 +194,9 @@ ReadIndex quorum.  `tests/test_routing_consistency.py` pins the one routing rule
 the shard server, the transaction coordinator and the client router are asserted
 to put the same key in the same shard, on the default range map and on a
 post-split one.  `tests/test_cross_shard_transaction.py` commits two keys that
-land in different shards, which it did not used to do - see Known gaps.
+land in different shards, which it did not used to do, and covers the two ways a
+cross-shard prewrite fails: one shard refusing the lock, and one shard with no
+leader at all.
 `tests/test_snapshot.py` covers snapshots and log compaction in process: the
 storage round trip behind them, what a snapshot has to contain
 (MVCC history and unresolved locks included), a restart that rebuilds from the
@@ -264,10 +266,12 @@ Honest list of what is *not* done, roughly in priority order.
   cannot find a shard end to end.  Making it real needs a separate metadata Raft
   group, a routing table and a shard migration protocol, which is a project of its
   own rather than a patch here.  The code is kept as evidence that the layout was
-  explored.  Two gaps inside the part that does run: the cross-shard test drives
-  the coordinator directly rather than through a client, and its rollback case
-  cannot fail as written, because `rollback()` returns early for a PENDING
-  transaction without touching a shard.
+  explored.  One gap inside the part that does run: the cross-shard test drives
+  the coordinator directly rather than through a client, so no hop of it crosses a
+  process boundary.  Another is waiting in `split_shard`, which stamps the rows it
+  moves with a wall-clock timestamp while the TSO hands out a counter starting at
+  1 - the moved rows are then newer than every start timestamp a client can be
+  given, so every prewrite against them is refused as a write conflict.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
