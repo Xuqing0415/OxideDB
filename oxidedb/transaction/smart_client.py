@@ -1,6 +1,5 @@
 import time
 import random
-import hashlib
 from typing import Optional, Tuple, Dict, Any
 
 from ..raft.node import MemoryRaftNode, NodeState

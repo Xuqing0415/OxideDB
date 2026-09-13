@@ -1,12 +1,12 @@
 import threading
 import time
-import hashlib
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..raft.node import MemoryRaftNode, NodeState
 from ..raft.state_machine import CommandType, ApplyResult
+from ..shard.router import locate
 from ..tso.tso import TSOClient
 
 
@@ -42,11 +42,7 @@ class TransactionCoordinator:
         self._executor = ThreadPoolExecutor(max_workers=10)
     
     def _get_shard_id(self, key: bytes) -> int:
-        range_map = self._shard_server._range_map
-        for shard_id, (start, end) in range_map.items():
-            if start <= key < end:
-                return shard_id
-        return 0
+        return locate(self._shard_server._range_map, key)
     
     def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
         for server in self._shard_server._shard_servers.values():

@@ -1,7 +1,7 @@
 # EXPERIMENTAL: routing not wired to a metadata service, do not use
-import hashlib
 import time
 from typing import Dict, List, Optional, Callable
+from ..shard.router import default_range_map, locate
 from .node import MemoryRaftNode, RaftCluster, NodeState
 from .state_machine import StateMachine, CommandType, ApplyResult
 from .storage import RaftStorage, JSONFileStorage
@@ -21,10 +21,7 @@ class ShardServer:
         self._range_map = range_map
     
     def _get_shard_id(self, key: bytes) -> int:
-        for shard_id, (start, end) in self._range_map.items():
-            if start <= key < end:
-                return shard_id
-        return 0
+        return locate(self._range_map, key)
     
     def _get_shard_port(self, shard_id: int) -> int:
         return self._base_port + shard_id * 100 + self._node_id
@@ -138,17 +135,7 @@ class ShardedRaftCluster:
         self._range_map: Dict[int, tuple] = self._create_default_range_map()
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
-        range_map = {}
-        if self._num_shards <= 1:
-            range_map[0] = (b'', b'\xff')
-            return range_map
-        
-        chunk = 256 // self._num_shards
-        for i in range(self._num_shards):
-            start = bytes([i * chunk])
-            end = bytes([(i + 1) * chunk]) if i < self._num_shards - 1 else b'\xff'
-            range_map[i] = (start, end)
-        return range_map
+        return default_range_map(self._num_shards)
     
     def update_range_map(self, range_map: Dict[int, tuple]):
         self._range_map = range_map
