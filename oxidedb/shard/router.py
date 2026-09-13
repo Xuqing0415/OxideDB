@@ -1,5 +1,5 @@
-# EXPERIMENTAL: sharding is frozen - a split changes the range map without moving the
-# rows it cuts off, do not use
+# EXPERIMENTAL: sharding is frozen - a split moves rows without publishing the new
+# range map, do not use
 """The one routing rule in the codebase.
 
 Every component that needs to know which shard owns a key - the shard server,

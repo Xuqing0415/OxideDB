@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 137 tests, roughly three minutes
+pytest tests -q             # 139 tests, roughly three minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -115,9 +115,10 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   or its term moves, so a client that reads the table can route without being told.
   Clients route by it too (`metadata/cache.py`): one read of the table instead of a
   lookup per key, read again when a shard refuses a request or when the node the table
-  names has stopped leading.  What is still missing is a split, which changes the range
-  map without moving the rows it cuts off, so routing is still not usable end to end;
-  see Known gaps.
+  names has stopped leading.  What is still missing is a split: `split_shard` moves the
+  rows into the new shard's group and re-ranges the servers locally, but nothing tells
+  the table, so a client that routes by it keeps reading the shard they came from; see
+  Known gaps.
 
 ## Storage engines (plan E)
 
@@ -211,15 +212,23 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-137 tests.  `tests/test_durability.py` covers the correctness properties that
+139 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
 ReadIndex quorum.  `tests/test_routing_consistency.py` pins the one routing rule:
 the shard server, the transaction coordinator and the client router are asserted
 to put the same key in the same shard, on the default range map and on a
-post-split one.  `tests/test_cross_shard_transaction.py` commits two keys that
-land in different shards, which it did not used to do, and covers the two ways a
+post-split one.  `tests/test_shard_split.py` drives a split of its own: a row written
+through a transaction, a split above it, and then that row read from the shard which
+now owns it - at the timestamp it was committed at, at the newest one, and written
+again - because a move has to preserve the version the row already was (a copy
+stamped with the moment of the move is newer than any timestamp the TSO will ever
+hand out, so the row is there and unreadable at once) and carry its write record with
+it.  A second test holds a lock in the range and asserts that the split refuses rather
+than move a row under a commit that has not been applied.
+`tests/test_cross_shard_transaction.py` commits two keys that land in different shards,
+which it did not used to do, and covers the two ways a
 cross-shard prewrite fails: one shard refusing the lock, and one shard with no
 leader at all.  `tests/test_snapshot_read.py` reads a key at a timestamp older
 than its newest version and gets the older one, and through the coordinator checks
@@ -384,14 +393,17 @@ Honest list of what is *not* done, roughly in priority order.
   the table names to an object in its own process, which makes it a client *inside* the
   cluster, and the hop across a process boundary is what the unimplemented gRPC client
   service would be.  The lock resolver - the other thing in the transaction path that
-  looks for a leader - still scans the cluster's own nodes.  Beyond that, a split has to
-  move the rows it cuts off before the table may say they belong to a new shard;
-  `split_shard` changes the range map without moving anything, and stamps the rows it
-  does move with a wall-clock timestamp while the TSO hands out a counter starting at
-  1 - those rows are then newer than every start timestamp a client can be given, so
-  every prewrite against them is refused as a write conflict.  The cross-shard test
-  also drives the coordinator directly rather than through a client, so no hop of it
-  crosses a process boundary.
+  looks for a leader - still scans the cluster's own nodes.  Beyond that, two things are
+  missing from a split.  It does not tell the table: `split_shard` copies the newest
+  committed version of each row into the new shard's group and updates every server's
+  range map locally, but nothing publishes the new ranges, so a client routing by the
+  table keeps reading the shard the rows came from.  And it does not coordinate with a
+  write: it refuses while a transaction holds a lock in the range, because that lock
+  may be a commit that has not been applied, but one that resolved to the old shard
+  just before the range moved still lands there and the copy ends up behind by it.  The
+  old copies are left in the old shard, and there is no migration and no follower
+  reads.  The cross-shard test also drives the coordinator directly rather than through
+  a client, so no hop of it crosses a process boundary.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.

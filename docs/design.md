@@ -442,7 +442,10 @@ resolves the node the table names to an object it already holds, so it is a clie
 inside the cluster, and dialling the address the table publishes is what the
 unimplemented client service would be.  The lock resolver - the other thing in the
 transaction path that looks for a leader - still scans the cluster's own nodes.  A split
-is not a command here either, and it cannot be one yet: the table may only say that a
-range belongs to a new shard after the rows in it have moved, so that command arrives
-with the migration that moves them.  A table that could be told about a split before the
-data moved would be a faster way to lose data, not a feature.
+is not a command here either, and `split_shard` is the reason: it copies the rows into
+the new shard's group and *then* re-ranges the servers locally, which is the reverse of
+the order this section argues for, and it never tells the table - so a client routing by
+the table keeps reading the shard the rows came from.  The command cannot arrive before
+the migration does: the table may only say that a range belongs to a new shard after
+the rows in it have moved.  A table that could be told about a split before the data
+moved would be a faster way to lose data, not a feature.

@@ -1,5 +1,5 @@
-# EXPERIMENTAL: sharding is frozen - a split changes the range map without moving the
-# rows it cuts off, do not use
+# EXPERIMENTAL: sharding is frozen - a split moves rows without publishing the new
+# range map, do not use
 import time
 from typing import Dict, List, Optional, Callable, Tuple
 from ..metadata.publisher import DEFAULT_PUBLISH_INTERVAL, MetadataPublisher
@@ -312,7 +312,16 @@ class ShardedRaftCluster:
         
         _, leader = leader_info
         
-        scan_result = leader._state_machine.scan(start, end)
+        # Committed state, and not while a transaction is in flight over the range.
+        # A lock in there may be a commit that has not been applied yet, and a copy
+        # taken without it would be a write lost at the moment the row moved, so the
+        # split refuses rather than race the coordinator that is making it.
+        state_machine = leader._state_machine
+        storage = state_machine._storage
+        if any(start <= key < end for key, _ in storage.iter_locks()):
+            return False
+
+        scan_result = storage.scan(start, end, state_machine._last_applied_timestamp)
         
         self._num_shards += 1
         new_shard_id = self._num_shards - 1
@@ -342,25 +351,47 @@ class ShardedRaftCluster:
         time.sleep(1)
         
         for key, value in scan_result:
-            if split_key <= key:
-                leader_info = self.get_leader_for_key(key)
-                if leader_info is not None:
-                    _, new_leader = leader_info
-                    command = new_leader._state_machine.serialize_command(
-                        CommandType.SET,
-                        key=key,
-                        value=value,
-                        timestamp=self._get_next_timestamp(),
-                    )
-                    new_leader.propose(command)
+            if key < split_key:
+                continue  # this row stays where it is
+
+            target = self.get_leader_for_key(key)
+            if target is not None:
+                _, new_leader = target
+                self._move_row(leader, new_leader, key, value)
         
         time.sleep(0.5)
         
         return True
-    
-    def _get_next_timestamp(self) -> int:
-        import time
-        return int(time.time() * 1000000)
+
+    def _move_row(self, source_leader: MemoryRaftNode, target_leader: MemoryRaftNode,
+                  key: bytes, value: bytes) -> None:
+        """Copy one row into the new shard *as the version it already is*.
+
+        The row keeps the timestamp it was committed at, and the write record of
+        the transaction that committed it.  A copy stamped with the moment of the
+        move - which is what a wall clock gives you, and what this used to do - is
+        the newest thing that has ever happened to that key: a snapshot read at
+        any timestamp a client can hold does not see it, and every prewrite
+        against it is refused as a write conflict, because the copy is newer than
+        the start timestamp the TSO has just handed out.  Moving a row is not a
+        write to the key, and a shard that answers for the row differently from
+        the shard it came from is a shard the row cannot be moved to.
+        """
+        storage = source_leader._state_machine._storage
+        version = storage.get_latest_version(key)
+        if version is None:
+            return
+
+        record = storage.get_latest_write(key)
+        command = target_leader._state_machine.serialize_command(
+            CommandType.SET,
+            key=key,
+            value=value,
+            timestamp=version.timestamp,
+            start_ts=(record["start_ts"] if record is not None
+                      and record["commit_ts"] == version.timestamp else None),
+        )
+        target_leader.propose(command)
     
     def shutdown(self):
         # Before the servers: the cleaner proposes entries onto shard leaders, so

@@ -167,6 +167,12 @@ class MVCCStateMachine(StateMachine):
         value = cmd.get("value")
         timestamp = cmd.get("timestamp", self._last_applied_timestamp + 1)
         self._storage.set(key, value, timestamp)
+        # A row moved here by a split is not a new write: it carries the write
+        # record of the transaction that committed it, so a read-set validation on
+        # this shard reads the same history the shard it came from reads.
+        start_ts = cmd.get("start_ts")
+        if start_ts is not None:
+            self._storage.write_write_record(key, start_ts, timestamp)
         if timestamp > self._last_applied_timestamp:
             self._last_applied_timestamp = timestamp
         return ApplyResult.success()
