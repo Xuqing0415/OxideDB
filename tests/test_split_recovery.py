@@ -120,6 +120,11 @@ def test_a_split_that_died_before_the_proposal_is_finished_on_the_next_start(
     try:
         _write_rows(cluster)
         client = wait_for_metadata_client(metadata)
+        # The assertion below is that the table has not been told about the *split*, so
+        # it has to have been told about the range the split starts from first: the
+        # publisher's first pass is its own round trip, and on a loaded machine it has
+        # not always happened by the time the rows are in.
+        _wait_for_the_table_to_know_the_shard(client)
 
         def died_before_the_table_was_told(self, pending):
             raise RuntimeError("the process died with the rows copied and nowhere told")

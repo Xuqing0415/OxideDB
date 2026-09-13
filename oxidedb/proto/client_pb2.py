@@ -24,35 +24,43 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0c\x63lient.proto\x12\x0eoxidedb.client\"\x19\n\nGetRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\"+\n\x0bGetResponse\x12\r\n\x05value\x18\x01 \x01(\x0c\x12\r\n\x05\x66ound\x18\x02 \x01(\x08\"(\n\nSetRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\x12\r\n\x05value\x18\x02 \x01(\x0c\"\x1e\n\x0bSetResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x1c\n\rDeleteRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\"!\n\x0e\x44\x65leteResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"1\n\x0bScanRequest\x12\x11\n\tstart_key\x18\x01 \x01(\x0c\x12\x0f\n\x07\x65nd_key\x18\x02 \x01(\x0c\"=\n\x0cScanResponse\x12-\n\x07\x65ntries\x18\x01 \x03(\x0b\x32\x1c.oxidedb.client.KeyValuePair\"*\n\x0cKeyValuePair\x12\x0b\n\x03key\x18\x01 \x01(\x0c\x12\r\n\x05value\x18\x02 \x01(\x0c\"\xbb\x01\n\rErrorResponse\x12\x35\n\x04\x63ode\x18\x01 \x01(\x0e\x32\'.oxidedb.client.ErrorResponse.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x16\n\x0eleader_address\x18\x03 \x01(\t\"J\n\tErrorCode\x12\x06\n\x02OK\x10\x00\x12\x0e\n\nNOT_LEADER\x10\x01\x12\x11\n\rKEY_NOT_FOUND\x10\x02\x12\x12\n\x0eINTERNAL_ERROR\x10\x03\x32\x9b\x02\n\rClientService\x12>\n\x03Get\x12\x1a.oxidedb.client.GetRequest\x1a\x1b.oxidedb.client.GetResponse\x12>\n\x03Set\x12\x1a.oxidedb.client.SetRequest\x1a\x1b.oxidedb.client.SetResponse\x12G\n\x06\x44\x65lete\x12\x1d.oxidedb.client.DeleteRequest\x1a\x1e.oxidedb.client.DeleteResponse\x12\x41\n\x04Scan\x12\x1b.oxidedb.client.ScanRequest\x1a\x1c.oxidedb.client.ScanResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0c\x63lient.proto\x12\x0eoxidedb.client\"?\n\nGetRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\x12\x16\n\ttimestamp\x18\x02 \x01(\x03H\x00\x88\x01\x01\x42\x0c\n\n_timestamp\"\x9b\x01\n\x0bGetResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x12\n\x05value\x18\x04 \x01(\x0cH\x01\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x08\n\x06_value\"W\n\x0bScanRequest\x12\x11\n\tstart_key\x18\x01 \x01(\x0c\x12\x0f\n\x07\x65nd_key\x18\x02 \x01(\x0c\x12\x16\n\ttimestamp\x18\x03 \x01(\x03H\x00\x88\x01\x01\x42\x0c\n\n_timestamp\"*\n\x0cKeyValuePair\x12\x0b\n\x03key\x18\x01 \x01(\x0c\x12\r\n\x05value\x18\x02 \x01(\x0c\"\xd5\x01\n\x0cScanResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12-\n\x07\x65ntries\x18\x04 \x03(\x0b\x32\x1c.oxidedb.client.KeyValuePair\x12\x17\n\nlocked_key\x18\x05 \x01(\x0cH\x01\x88\x01\x01\x42\x11\n\x0f_leader_addressB\r\n\x0b_locked_key\"!\n\x0eProposeRequest\x12\x0f\n\x07\x63ommand\x18\x01 \x01(\x0c\"\xc9\x01\n\x0fProposeResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x0c\n\x04term\x18\x04 \x01(\x03\x12\x12\n\x05index\x18\x05 \x01(\x03H\x01\x88\x01\x01\x12\x11\n\x04\x64\x61ta\x18\x06 \x01(\x0cH\x02\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x08\n\x06_indexB\x07\n\x05_data\"\x1d\n\x0eGetLockRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\"r\n\nLockRecord\x12\x0b\n\x03key\x18\x01 \x01(\x0c\x12\x10\n\x08start_ts\x18\x02 \x01(\x03\x12\x0e\n\x06status\x18\x03 \x01(\x0c\x12\x13\n\x0bprimary_key\x18\x04 \x01(\x0c\x12\x11\n\tlock_time\x18\x05 \x01(\x01\x12\r\n\x05value\x18\x06 \x01(\x0c\"\xb9\x01\n\x0fGetLockResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12-\n\x04lock\x18\x04 \x01(\x0b\x32\x1a.oxidedb.client.LockRecordH\x01\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x07\n\x05_lock\"$\n\x15GetWriteRecordRequest\x12\x0b\n\x03key\x18\x01 \x01(\x0c\"\xd2\x01\n\x16GetWriteRecordResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x15\n\x08start_ts\x18\x04 \x01(\x03H\x01\x88\x01\x01\x12\x16\n\tcommit_ts\x18\x05 \x01(\x03H\x02\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x0b\n\t_start_tsB\x0c\n\n_commit_ts\"\x1a\n\x18\x46ollowerReadIndexRequest\"\x9f\x01\n\x19\x46ollowerReadIndexResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.client.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x12\n\nread_index\x18\x04 \x01(\x03\x42\x11\n\x0f_leader_address*<\n\tErrorCode\x12\x06\n\x02OK\x10\x00\x12\x0e\n\nNOT_LEADER\x10\x01\x12\n\n\x06LOCKED\x10\x02\x12\x0b\n\x07REFUSED\x10\x03\x32\xf5\x03\n\rClientService\x12>\n\x03Get\x12\x1a.oxidedb.client.GetRequest\x1a\x1b.oxidedb.client.GetResponse\x12\x41\n\x04Scan\x12\x1b.oxidedb.client.ScanRequest\x1a\x1c.oxidedb.client.ScanResponse\x12J\n\x07Propose\x12\x1e.oxidedb.client.ProposeRequest\x1a\x1f.oxidedb.client.ProposeResponse\x12J\n\x07GetLock\x12\x1e.oxidedb.client.GetLockRequest\x1a\x1f.oxidedb.client.GetLockResponse\x12_\n\x0eGetWriteRecord\x12%.oxidedb.client.GetWriteRecordRequest\x1a&.oxidedb.client.GetWriteRecordResponse\x12h\n\x11\x46ollowerReadIndex\x12(.oxidedb.client.FollowerReadIndexRequest\x1a).oxidedb.client.FollowerReadIndexResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'client_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
+  _globals['_ERRORCODE']._serialized_start=1619
+  _globals['_ERRORCODE']._serialized_end=1679
   _globals['_GETREQUEST']._serialized_start=32
-  _globals['_GETREQUEST']._serialized_end=57
-  _globals['_GETRESPONSE']._serialized_start=59
-  _globals['_GETRESPONSE']._serialized_end=102
-  _globals['_SETREQUEST']._serialized_start=104
-  _globals['_SETREQUEST']._serialized_end=144
-  _globals['_SETRESPONSE']._serialized_start=146
-  _globals['_SETRESPONSE']._serialized_end=176
-  _globals['_DELETEREQUEST']._serialized_start=178
-  _globals['_DELETEREQUEST']._serialized_end=206
-  _globals['_DELETERESPONSE']._serialized_start=208
-  _globals['_DELETERESPONSE']._serialized_end=241
-  _globals['_SCANREQUEST']._serialized_start=243
-  _globals['_SCANREQUEST']._serialized_end=292
-  _globals['_SCANRESPONSE']._serialized_start=294
-  _globals['_SCANRESPONSE']._serialized_end=355
-  _globals['_KEYVALUEPAIR']._serialized_start=357
-  _globals['_KEYVALUEPAIR']._serialized_end=399
-  _globals['_ERRORRESPONSE']._serialized_start=402
-  _globals['_ERRORRESPONSE']._serialized_end=589
-  _globals['_ERRORRESPONSE_ERRORCODE']._serialized_start=515
-  _globals['_ERRORRESPONSE_ERRORCODE']._serialized_end=589
-  _globals['_CLIENTSERVICE']._serialized_start=592
-  _globals['_CLIENTSERVICE']._serialized_end=875
+  _globals['_GETREQUEST']._serialized_end=95
+  _globals['_GETRESPONSE']._serialized_start=98
+  _globals['_GETRESPONSE']._serialized_end=253
+  _globals['_SCANREQUEST']._serialized_start=255
+  _globals['_SCANREQUEST']._serialized_end=342
+  _globals['_KEYVALUEPAIR']._serialized_start=344
+  _globals['_KEYVALUEPAIR']._serialized_end=386
+  _globals['_SCANRESPONSE']._serialized_start=389
+  _globals['_SCANRESPONSE']._serialized_end=602
+  _globals['_PROPOSEREQUEST']._serialized_start=604
+  _globals['_PROPOSEREQUEST']._serialized_end=637
+  _globals['_PROPOSERESPONSE']._serialized_start=640
+  _globals['_PROPOSERESPONSE']._serialized_end=841
+  _globals['_GETLOCKREQUEST']._serialized_start=843
+  _globals['_GETLOCKREQUEST']._serialized_end=872
+  _globals['_LOCKRECORD']._serialized_start=874
+  _globals['_LOCKRECORD']._serialized_end=988
+  _globals['_GETLOCKRESPONSE']._serialized_start=991
+  _globals['_GETLOCKRESPONSE']._serialized_end=1176
+  _globals['_GETWRITERECORDREQUEST']._serialized_start=1178
+  _globals['_GETWRITERECORDREQUEST']._serialized_end=1214
+  _globals['_GETWRITERECORDRESPONSE']._serialized_start=1217
+  _globals['_GETWRITERECORDRESPONSE']._serialized_end=1427
+  _globals['_FOLLOWERREADINDEXREQUEST']._serialized_start=1429
+  _globals['_FOLLOWERREADINDEXREQUEST']._serialized_end=1455
+  _globals['_FOLLOWERREADINDEXRESPONSE']._serialized_start=1458
+  _globals['_FOLLOWERREADINDEXRESPONSE']._serialized_end=1617
+  _globals['_CLIENTSERVICE']._serialized_start=1682
+  _globals['_CLIENTSERVICE']._serialized_end=2183
 # @@protoc_insertion_point(module_scope)

@@ -39,20 +39,30 @@ class ClientServiceStub:
                 request_serializer=client__pb2.GetRequest.SerializeToString,
                 response_deserializer=client__pb2.GetResponse.FromString,
                 _registered_method=True)
-        self.Set = channel.unary_unary(
-                '/oxidedb.client.ClientService/Set',
-                request_serializer=client__pb2.SetRequest.SerializeToString,
-                response_deserializer=client__pb2.SetResponse.FromString,
-                _registered_method=True)
-        self.Delete = channel.unary_unary(
-                '/oxidedb.client.ClientService/Delete',
-                request_serializer=client__pb2.DeleteRequest.SerializeToString,
-                response_deserializer=client__pb2.DeleteResponse.FromString,
-                _registered_method=True)
         self.Scan = channel.unary_unary(
                 '/oxidedb.client.ClientService/Scan',
                 request_serializer=client__pb2.ScanRequest.SerializeToString,
                 response_deserializer=client__pb2.ScanResponse.FromString,
+                _registered_method=True)
+        self.Propose = channel.unary_unary(
+                '/oxidedb.client.ClientService/Propose',
+                request_serializer=client__pb2.ProposeRequest.SerializeToString,
+                response_deserializer=client__pb2.ProposeResponse.FromString,
+                _registered_method=True)
+        self.GetLock = channel.unary_unary(
+                '/oxidedb.client.ClientService/GetLock',
+                request_serializer=client__pb2.GetLockRequest.SerializeToString,
+                response_deserializer=client__pb2.GetLockResponse.FromString,
+                _registered_method=True)
+        self.GetWriteRecord = channel.unary_unary(
+                '/oxidedb.client.ClientService/GetWriteRecord',
+                request_serializer=client__pb2.GetWriteRecordRequest.SerializeToString,
+                response_deserializer=client__pb2.GetWriteRecordResponse.FromString,
+                _registered_method=True)
+        self.FollowerReadIndex = channel.unary_unary(
+                '/oxidedb.client.ClientService/FollowerReadIndex',
+                request_serializer=client__pb2.FollowerReadIndexRequest.SerializeToString,
+                response_deserializer=client__pb2.FollowerReadIndexResponse.FromString,
                 _registered_method=True)
 
 
@@ -65,19 +75,31 @@ class ClientServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def Set(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Delete(self, request, context):
-        """Missing associated documentation comment in .proto file."""
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def Scan(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Propose(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetLock(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetWriteRecord(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FollowerReadIndex(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -91,20 +113,30 @@ def add_ClientServiceServicer_to_server(servicer, server):
                     request_deserializer=client__pb2.GetRequest.FromString,
                     response_serializer=client__pb2.GetResponse.SerializeToString,
             ),
-            'Set': grpc.unary_unary_rpc_method_handler(
-                    servicer.Set,
-                    request_deserializer=client__pb2.SetRequest.FromString,
-                    response_serializer=client__pb2.SetResponse.SerializeToString,
-            ),
-            'Delete': grpc.unary_unary_rpc_method_handler(
-                    servicer.Delete,
-                    request_deserializer=client__pb2.DeleteRequest.FromString,
-                    response_serializer=client__pb2.DeleteResponse.SerializeToString,
-            ),
             'Scan': grpc.unary_unary_rpc_method_handler(
                     servicer.Scan,
                     request_deserializer=client__pb2.ScanRequest.FromString,
                     response_serializer=client__pb2.ScanResponse.SerializeToString,
+            ),
+            'Propose': grpc.unary_unary_rpc_method_handler(
+                    servicer.Propose,
+                    request_deserializer=client__pb2.ProposeRequest.FromString,
+                    response_serializer=client__pb2.ProposeResponse.SerializeToString,
+            ),
+            'GetLock': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetLock,
+                    request_deserializer=client__pb2.GetLockRequest.FromString,
+                    response_serializer=client__pb2.GetLockResponse.SerializeToString,
+            ),
+            'GetWriteRecord': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetWriteRecord,
+                    request_deserializer=client__pb2.GetWriteRecordRequest.FromString,
+                    response_serializer=client__pb2.GetWriteRecordResponse.SerializeToString,
+            ),
+            'FollowerReadIndex': grpc.unary_unary_rpc_method_handler(
+                    servicer.FollowerReadIndex,
+                    request_deserializer=client__pb2.FollowerReadIndexRequest.FromString,
+                    response_serializer=client__pb2.FollowerReadIndexResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -145,60 +177,6 @@ class ClientService:
             _registered_method=True)
 
     @staticmethod
-    def Set(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/oxidedb.client.ClientService/Set',
-            client__pb2.SetRequest.SerializeToString,
-            client__pb2.SetResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def Delete(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/oxidedb.client.ClientService/Delete',
-            client__pb2.DeleteRequest.SerializeToString,
-            client__pb2.DeleteResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
     def Scan(request,
             target,
             options=(),
@@ -215,6 +193,114 @@ class ClientService:
             '/oxidedb.client.ClientService/Scan',
             client__pb2.ScanRequest.SerializeToString,
             client__pb2.ScanResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Propose(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/oxidedb.client.ClientService/Propose',
+            client__pb2.ProposeRequest.SerializeToString,
+            client__pb2.ProposeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetLock(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/oxidedb.client.ClientService/GetLock',
+            client__pb2.GetLockRequest.SerializeToString,
+            client__pb2.GetLockResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetWriteRecord(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/oxidedb.client.ClientService/GetWriteRecord',
+            client__pb2.GetWriteRecordRequest.SerializeToString,
+            client__pb2.GetWriteRecordResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FollowerReadIndex(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/oxidedb.client.ClientService/FollowerReadIndex',
+            client__pb2.FollowerReadIndexRequest.SerializeToString,
+            client__pb2.FollowerReadIndexResponse.FromString,
             options,
             channel_credentials,
             insecure,

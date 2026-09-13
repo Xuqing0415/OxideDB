@@ -2,39 +2,59 @@ syntax = "proto3";
 
 package oxidedb.client;
 
+// What a client may ask one node, one primitive at a time.
+//
+// The commands here are the *node's*, not a transaction's.  A prewrite, a commit and
+// a rollback all arrive as Propose calls carrying command bytes the client built,
+// because the Percolator coordinator is client-side: it decides which key is primary,
+// when the commit point is reached and what a stranded lock means.  A service with a
+// Prewrite of its own would be one that had to know a transaction exists, and could
+// not be told where its primary key lives.
+//
+// Every response carries the same two things.  error_code is what happened as a
+// business fact - the four cases a caller reacts to differently - and it is the only
+// place a *legitimate* failure lives.  Transport failures (connection refused, a
+// deadline, an unparseable message) stay in the gRPC status, so that a caller can
+// tell "ask the leader instead" from "the wire is down": the first is a retry and the
+// second is not.  leader_address is set for NOT_LEADER and unset otherwise, so a
+// client sent to a node that has stopped leading can follow it without asking the
+// metadata group - whose answer is only as fresh as the publisher's last poll.
+
+enum ErrorCode {
+    OK = 0;
+    // This node does not lead the shard.  leader_address says where to try next, and
+    // the call may well succeed there.
+    NOT_LEADER = 1;
+    // A lock is in the way.  Retrying the same call will not help: the caller has to
+    // find out what became of the transaction that left it - GetLock, then the primary
+    // key's write record - which is what the lock resolver does.
+    LOCKED = 2;
+    // The shard answered, and the answer was no: a write conflicting with a newer
+    // version, a command that does not apply, a range that will not be scanned.  The
+    // detail is in message, and retrying the same call will not help either.
+    REFUSED = 3;
+}
+
 message GetRequest {
     bytes key = 1;
+    // The snapshot to read at.  Unset reads the newest version; a transaction passes
+    // its own start_ts and must see exactly the snapshot it started with.
+    optional int64 timestamp = 2;
 }
 
 message GetResponse {
-    bytes value = 1;
-    bool found = 2;
-}
-
-message SetRequest {
-    bytes key = 1;
-    bytes value = 2;
-}
-
-message SetResponse {
-    bool success = 1;
-}
-
-message DeleteRequest {
-    bytes key = 1;
-}
-
-message DeleteResponse {
-    bool success = 1;
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // Unset when the key has no version at that snapshot, which is a successful read of
+    // a key that is not there rather than a failure.
+    optional bytes value = 4;
 }
 
 message ScanRequest {
     bytes start_key = 1;
     bytes end_key = 2;
-}
-
-message ScanResponse {
-    repeated KeyValuePair entries = 1;
+    optional int64 timestamp = 3;
 }
 
 message KeyValuePair {
@@ -42,21 +62,104 @@ message KeyValuePair {
     bytes value = 2;
 }
 
-message ErrorResponse {
-    enum ErrorCode {
-        OK = 0;
-        NOT_LEADER = 1;
-        KEY_NOT_FOUND = 2;
-        INTERNAL_ERROR = 3;
-    }
-    ErrorCode code = 1;
+message ScanResponse {
+    ErrorCode error_code = 1;
     string message = 2;
-    string leader_address = 3;
+    optional string leader_address = 3;
+    repeated KeyValuePair entries = 4;
+    // For LOCKED: the key whose lock stopped the range.  A range read that quietly
+    // dropped that key would be indistinguishable from one that found nothing, which
+    // is why the local scan raises instead of answering - the key is what the caller
+    // needs to resolve it.
+    optional bytes locked_key = 5;
+}
+
+message ProposeRequest {
+    // The command as the state machine serialised it.  The client builds it, because
+    // the client is the side that knows a transaction is being committed; the node
+    // appends the bytes and hands them to its state machine as they are.
+    bytes command = 1;
+}
+
+message ProposeResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // The term the node was leading at when it answered, so a client can tell that the
+    // leader it was talking to has since been superseded.
+    int64 term = 4;
+    // Where the entry landed in the log.  It is the index a read has to have applied
+    // before the write it is waiting for can be seen, and it is unset when nothing was
+    // appended.
+    optional int64 index = 5;
+    // What the state machine answered, for the commands that answer with something.
+    optional bytes data = 6;
+}
+
+message GetLockRequest {
+    bytes key = 1;
+}
+
+// A lock record, field for field: what MVCCStorage.get_newest_lock returns, with
+// nothing added and nothing tidied.  lock_time is the moment the lock was taken, which
+// is what the TTL is measured from - the remaining TTL is a subtraction the caller
+// does, because it is the caller's clock that decides whether a lock has expired.
+message LockRecord {
+    bytes key = 1;
+    int64 start_ts = 2;
+    // LockStatus: b"LOCKED", b"COMMITTED" or b"ABORTED".  A lock that has been rolled
+    // forward or back is kept until a reader has seen it, which is why the status is
+    // part of the record rather than a presence bit.
+    bytes status = 3;
+    // The key whose fate decides this transaction's - the primary the coordinator
+    // wrote first.  Resolving a lock means asking about this key, not this one.
+    bytes primary_key = 4;
+    double lock_time = 5;
+    bytes value = 6;
+}
+
+message GetLockResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // Unset when the key is not locked, which is an answer and not a failure.
+    optional LockRecord lock = 4;
+}
+
+message GetWriteRecordRequest {
+    bytes key = 1;
+}
+
+message GetWriteRecordResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // The write record of the newest committed version: which transaction wrote it and
+    // when it was published.  Unset when the key has no committed version at all, which
+    // is how a reader tells a lock whose transaction never committed from one that did,
+    // without being able to see the row.
+    optional int64 start_ts = 4;
+    optional int64 commit_ts = 5;
+}
+
+message FollowerReadIndexRequest {
+}
+
+message FollowerReadIndexResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // The commit index the leader had confirmed when it answered.  A follower that has
+    // applied up to here can answer a read that is linearizable as of the request, which
+    // is the whole reason to ask rather than read locally and hope.
+    int64 read_index = 4;
 }
 
 service ClientService {
     rpc Get(GetRequest) returns (GetResponse);
-    rpc Set(SetRequest) returns (SetResponse);
-    rpc Delete(DeleteRequest) returns (DeleteResponse);
     rpc Scan(ScanRequest) returns (ScanResponse);
+    rpc Propose(ProposeRequest) returns (ProposeResponse);
+    rpc GetLock(GetLockRequest) returns (GetLockResponse);
+    rpc GetWriteRecord(GetWriteRecordRequest) returns (GetWriteRecordResponse);
+    rpc FollowerReadIndex(FollowerReadIndexRequest) returns (FollowerReadIndexResponse);
 }

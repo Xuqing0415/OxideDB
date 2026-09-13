@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 163 tests, roughly five minutes
+pytest tests -q             # 173 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -214,7 +214,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-163 tests.  `tests/test_durability.py` covers the correctness properties that
+173 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -347,6 +347,15 @@ proposal waited for is still there afterwards, a rejected one included.
 `tests/test_cli.py` runs the command line front end as a subprocess: the default
 in-memory mode starts empty every time, `--data-dir` persists, and `get` reports a
 missing key with exit code 1.
+`tests/test_client_proto.py` pins the wire contract before anything speaks it, and it
+is the one file here with no business logic in it: six node-level methods and no
+transaction among them, because a `Prewrite` RPC would put the primary-key choice on
+the server and a `Set` would put the timestamp there; an `error_code` of exactly the
+four cases a caller reacts to differently, so transport failures stay in the gRPC
+status; a leader hint that is present for `NOT_LEADER` and absent otherwise; and the
+difference between a field that is unset and one that is empty, which is the reason
+those fields are `optional` - a key with an empty value and a key with no version are
+different answers.
 
 Three environment notes:
 
@@ -414,9 +423,13 @@ Honest list of what is *not* done, roughly in priority order.
   matters.
 * **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
-* **The gRPC client path is scaffolding.**  `proto/client.proto` defines
-  `ClientService` but nothing implements it server-side, so `OxideDBClient`
-  cannot be used yet.  The CLI drives a local `Database`, not a cluster.
+* **The gRPC client path is scaffolding.**  `proto/client.proto` now defines what a
+  client may ask a node - six node-level primitives, with a four-value `error_code` and
+  a leader hint - but nothing implements it server-side and no client speaks it yet.
+  The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
+  `Set` cannot be answered correctly by a server, because the timestamp a write carries
+  has to come from the client's own TSO batch for a transaction's prewrite and commit to
+  line up.  The CLI drives a local `Database`, not a cluster.
 * **Sharding is experimental and frozen - do not use it.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
@@ -477,11 +490,11 @@ oxidedb/
                  its publisher, and the client-side cache of what it says
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
-  client/        gRPC client SDK (server side not implemented)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
 docs/            design notes and posts
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   blog/          the ReadIndex story: a read path that passed every test while wrong
-proto/           gRPC service definitions
+proto/           gRPC service definitions: raft.proto, and client.proto's six
+                 node-level primitives (no implementation on either side yet)
 tests/           pytest suite
