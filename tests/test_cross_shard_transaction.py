@@ -1,10 +1,11 @@
 import time
-from _ports import allocate_port
+from _ports import allocate_port, free_addresses
+from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
 from oxidedb.raft.shard_server import ShardedRaftCluster
-from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
+from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ErrorCode
 from oxidedb.shard.router import locate
 from oxidedb.tso.tso import TSOCluster, TSOClient
-from oxidedb.transaction.coordinator import TransactionCoordinator
+from oxidedb.transaction.coordinator import TransactionCoordinator, TxnStatus
 
 
 def get_free_port():
@@ -31,6 +32,27 @@ def assert_spans_two_shards(coordinator, txn_id, shard_id_1, shard_id_2):
         "Commit path grouped the keys into shard(s) %s; it would touch one Raft group"
         % sorted(groups)
     )
+
+
+def lock_on(cluster, key):
+    """The newest lock a shard leader holds for ``key``, or None."""
+    leader_info = cluster.get_leader_for_key(key)
+    assert leader_info is not None, f"no shard leader for {key!r}"
+    _, leader = leader_info
+    return leader._state_machine._storage.get_newest_lock(key)
+
+
+def two_shard_cluster():
+    """A TSO group and a two-shard cluster, both started but not yet settled."""
+    tso_cluster = TSOCluster(num_nodes=3)
+    tso_cluster.start(free_addresses())
+
+    shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
+    shard_cluster.start_network(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        peer_addresses=free_addresses(num_shards=2),
+    )
+    return tso_cluster, shard_cluster
 
 
 def test_cross_shard_prewrite():
@@ -231,9 +253,55 @@ def test_coordinator_begin():
     print("Coordinator begin test passed!")
 
 
+def test_prewrite_without_a_leader_for_one_shard_leaves_no_lock():
+    """If one shard has no leader, no shard may be written to at all.
+
+    This is the leak the coordinator used to have: it locked the shards whose
+    leader it could find, then met a shard without one and returned False without
+    telling the first shard to undo anything.  The lock left behind is
+    indistinguishable from a live transaction, so the key stops being readable -
+    there is nothing for a reader to wait for and nothing to roll forward.
+    """
+    tso_cluster, shard_cluster = two_shard_cluster()
+
+    key1 = b"key0"      # first byte 0x6b -> shard 0
+    key2 = b"\x80key1"  # first byte 0x80 -> shard 1
+    wait_for_keys_leader(shard_cluster, [key1, key2])
+    tso_client = wait_for_tso_client(tso_cluster)
+
+    coordinator = TransactionCoordinator(tso_client, shard_cluster)
+
+    # Stop every replica of shard 1, so the group cannot elect a leader.
+    for server in shard_cluster._shard_servers.values():
+        node = server.get_shard_node(1)
+        if node is not None:
+            node.shutdown()
+    assert shard_cluster.get_leader_for_key(key2) is None, "shard 1 still has a leader"
+    assert coordinator._get_shard_leader(1) is None
+
+    txn_id, start_ts = coordinator.begin()
+    # key1 first on purpose: shard 0 is the shard that used to be written to
+    # before the coordinator noticed that shard 1 had no leader.
+    coordinator.add_write(txn_id, key1, b"value_a")
+    coordinator.add_write(txn_id, key2, b"value_b")
+
+    assert not coordinator.prewrite(txn_id), "prewrite should fail: shard 1 has no leader"
+
+    assert lock_on(shard_cluster, key1) is None, (
+        "shard 0 was written to even though the prewrite could not reach shard 1"
+    )
+
+    coordinator.shutdown()
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Cross-shard prewrite without a leader test passed!")
+
+
 if __name__ == "__main__":
     test_coordinator_begin()
     print("\n" + "="*60 + "\n")
     test_cross_shard_prewrite()
     print("\n" + "="*60 + "\n")
     test_cross_shard_rollback()
+    print("\n" + "="*60 + "\n")
+    test_prewrite_without_a_leader_for_one_shard_leaves_no_lock()

@@ -163,14 +163,21 @@ class TransactionCoordinator:
         return shard_groups
     
     def _prewrite_all_shards(self, txn: Transaction, shard_groups: Dict[int, List[Tuple[bytes, bytes]]]) -> bool:
-        futures = {}
-        
-        for shard_id, keys in shard_groups.items():
+        # Every leader is resolved before any shard is touched.  Writing to the
+        # shards that do have a leader and only then meeting one that does not
+        # leaves locks behind for a transaction that is about to be aborted, and a
+        # reader that meets one of those locks cannot tell it apart from a live
+        # transaction - there is nothing to wait for and nothing to roll forward.
+        leaders = {}
+        for shard_id in shard_groups:
             leader = self._get_shard_leader(shard_id)
             if leader is None:
                 return False
-            
-            future = self._executor.submit(self._prewrite_shard, leader, txn, keys)
+            leaders[shard_id] = leader
+
+        futures = {}
+        for shard_id, keys in shard_groups.items():
+            future = self._executor.submit(self._prewrite_shard, leaders[shard_id], txn, keys)
             futures[future] = shard_id
         
         results = {}
