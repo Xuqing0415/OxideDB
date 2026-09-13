@@ -1,11 +1,11 @@
 import time
 import random
-from typing import Optional, Tuple, Dict, Any
+from typing import Callable, Optional, Tuple, Dict, Any
 
 from ..raft.node import MemoryRaftNode, NodeState
 from ..raft.state_machine import ReadResult, ErrorCode
 from ..tso.tso import TSOClient
-from .coordinator import TransactionCoordinator
+from .coordinator import SerializationError, TransactionCoordinator
 
 
 class SmartClient:
@@ -32,6 +32,11 @@ class SmartClient:
             try:
                 result = func(*args, **kwargs)
                 return result
+            except SerializationError:
+                # Running the same transaction again cannot help: the snapshot it
+                # decided from is gone.  Only running the *work* again can, and that
+                # is run()'s job, not this loop's.
+                raise
             except Exception as e:
                 last_error = e
                 if attempt < self._retry_max_attempts - 1:
@@ -89,21 +94,61 @@ class SmartClient:
         self._coordinator.add_write(txn_id, key, value)
     
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
+        """Commit, or report that it could not be committed.
+
+        A transaction aborted by read-set validation raises ``SerializationError``
+        instead of returning False: it is retryable, and only by running the work
+        again, so it must not look like the other failures.  ``run`` catches it.
+        """
         def _do_commit():
             success, commit_ts = self._coordinator.commit(txn_id)
-            
+
             if not success:
                 txn = self._coordinator.get_transaction(txn_id)
+                if txn is not None and txn.abort_reason is not None:
+                    raise SerializationError(f"Commit aborted: {txn.abort_reason}")
                 if txn is not None:
                     raise RuntimeError(f"Commit failed: {txn.status}")
                 raise RuntimeError("Commit failed")
-            
+
             return success, commit_ts
-        
+
         try:
             return self._retry_with_backoff(_do_commit)
+        except SerializationError:
+            raise
         except RuntimeError:
             return False, None
+
+    def run(self, work: Callable[[int], None], attempts: int = 3) -> bool:
+        """Run ``work`` in a transaction, and run it again if the commit is refused.
+
+        ``work(txn_id)`` reads and writes through this client.  A commit refused by
+        read-set validation means the snapshot the work made its decisions from is
+        gone, so the decisions themselves have to be made again - which is the only
+        thing that can make them right, and why this cannot be a retry of the
+        commit.  A fresh transaction gets a fresh start_ts, so the work sees the
+        commits that invalidated it.
+
+        Returns whether the work committed.  A commit that failed for any other
+        reason is not retried; if every attempt was refused, the last
+        ``SerializationError`` is raised.
+        """
+        last_error = None
+        for _ in range(attempts):
+            txn_id = self.begin()
+            work(txn_id)
+            try:
+                if self.commit(txn_id)[0]:
+                    return True
+            except SerializationError as error:
+                # Nothing the aborted attempt wrote survives, so running the same
+                # work again is safe by construction.
+                last_error = error
+                continue
+            return False
+
+        raise last_error
     
     def rollback(self, txn_id: int) -> bool:
         return self._coordinator.rollback(txn_id)
