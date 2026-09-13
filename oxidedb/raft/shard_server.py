@@ -2,7 +2,8 @@
 import time
 from typing import Dict, List, Optional, Callable
 from ..shard.router import default_range_map, locate
-from ..transaction.lock_cleaner import DEFAULT_LOCK_TTL, LockCleaner
+from ..transaction.lock_cleaner import LockCleaner
+from ..transaction.lock_resolver import DEFAULT_LOCK_TTL
 
 #: How often the cluster's own lock cleaner looks for abandoned locks, in seconds.
 DEFAULT_LOCK_CLEANER_INTERVAL = 30.0

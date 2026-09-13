@@ -1,14 +1,19 @@
+"""The background sweep for locks whose coordinator is not coming back.
+
+A lock is only recoverable because the decision lives in the primary key's write
+record, which is what ``lock_resolver`` implements.  This class is the part that
+decides *when* to ask, not what the answer is: it walks the leaders it can see, and
+for every lock older than the TTL hands it to the resolver - which rolls it forward,
+clears it, or leaves it alone because the transaction is still live.
+"""
+
 import threading
 import time
-from typing import Dict, Optional, Callable
-from ..raft.node import MemoryRaftNode, NodeState
-from ..raft.state_machine import CommandType, LockStatus
-from ..shard.router import locate
+from typing import Optional
 
-#: How long a lock has to sit untouched before the cleaner asks what happened to
-#: the transaction that left it.  This is the trigger for the question, not the
-#: answer: the answer comes from the primary key's write record.
-DEFAULT_LOCK_TTL = 5.0
+from ..raft.node import NodeState
+from ..raft.state_machine import LockStatus
+from .lock_resolver import DEFAULT_LOCK_TTL, LockResolver
 
 
 class LockCleaner:
@@ -17,120 +22,57 @@ class LockCleaner:
         self._shard_cluster = shard_cluster
         self._poll_interval = poll_interval
         self._lock_ttl = lock_ttl
+        self._resolver = LockResolver(shard_cluster, lock_ttl=lock_ttl)
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
-    
-    def _get_shard_id(self, key: bytes) -> int:
-        return locate(self._shard_cluster._range_map, key)
-    
-    def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
-        for server in self._shard_cluster._shard_servers.values():
-            node = server.get_shard_node(shard_id)
-            if node and node.state == NodeState.LEADER:
-                return node
-        return None
-    
-    def _get_primary_status(self, primary_key: bytes, start_ts: int) -> str:
-        primary_shard_id = self._get_shard_id(primary_key)
-        leader = self._get_shard_leader(primary_shard_id)
-        
-        if leader is None:
-            return "UNKNOWN"
-        
-        write_record = leader._state_machine._storage.get_latest_write(primary_key)
-        if write_record is not None and write_record["start_ts"] == start_ts:
-            return "COMMITTED"
-        
-        lock = leader._state_machine.get_lock_status(primary_key)
-        if lock is not None and lock["start_ts"] == start_ts:
-            lock_time = lock.get("lock_time", 0)
-            if time.time() - lock_time < self._lock_ttl:
-                return "LOCKED"
-        
-        return "ABORTED"
-    
-    def _clean_expired_locks(self):
+
+    def _expired_locks(self):
+        """Every lock a leader holds that is older than the TTL.
+
+        Collected before any is resolved, because resolving one writes to the same
+        state machine ``iter_locks`` just read from.
+        """
+        expired = []
         for server in self._shard_cluster._shard_servers.values():
             for shard_id in range(server._num_shards):
                 node = server.get_shard_node(shard_id)
                 if node is None or node.state != NodeState.LEADER:
                     continue
-                
-                state_machine = node._state_machine
-                locks_to_clean = []
-                
-                for key, lock in state_machine._storage.iter_locks():
-                    status = lock.get('status')
-                    if status != LockStatus.LOCKED:
+
+                for key, lock in node._state_machine._storage.iter_locks():
+                    if lock.get("status") != LockStatus.LOCKED:
                         continue
-                    
-                    lock_time = lock.get("lock_time", 0)
-                    if time.time() - lock_time >= self._lock_ttl:
-                        locks_to_clean.append((key, lock))
-                
-                for key, lock in locks_to_clean:
-                    self._process_expired_lock(node, key, lock)
-    
-    def _process_expired_lock(self, leader: MemoryRaftNode, key: bytes, lock: Dict):
-        primary_key = lock["primary_key"]
-        start_ts = lock["start_ts"]
-        
-        status = self._get_primary_status(primary_key, start_ts)
-        
-        if status == "COMMITTED":
-            commit_ts = self._get_commit_ts(primary_key, start_ts)
-            if commit_ts is not None:
-                commit_cmd = leader._state_machine.serialize_command(
-                    CommandType.COMMIT,
-                    key=key,
-                    start_ts=start_ts,
-                    commit_ts=commit_ts,
-                )
-                leader.propose(commit_cmd)
-        
-        elif status == "ABORTED":
-            rollback_cmd = leader._state_machine.serialize_command(
-                CommandType.ROLLBACK,
-                key=key,
-                start_ts=start_ts,
-            )
-            leader.propose(rollback_cmd)
-    
-    def _get_commit_ts(self, primary_key: bytes, start_ts: int) -> Optional[int]:
-        primary_shard_id = self._get_shard_id(primary_key)
-        leader = self._get_shard_leader(primary_shard_id)
-        
-        if leader is None:
-            return None
-        
-        write_record = leader._state_machine._storage.get_latest_write(primary_key)
-        if write_record is not None and write_record["start_ts"] == start_ts:
-            return write_record["commit_ts"]
-        
-        return None
-    
+                    if time.time() - lock.get("lock_time", 0) >= self._lock_ttl:
+                        expired.append((key, lock))
+
+        return expired
+
+    def _clean_expired_locks(self):
+        for key, lock in self._expired_locks():
+            self._resolver.resolve_lock(key, lock)
+
     def start(self):
         with self._lock:
             if self._running:
                 return
             self._running = True
-        
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-    
+
     def _run(self):
         while self._running:
             try:
                 self._clean_expired_locks()
             except Exception:
                 pass
-            
+
             time.sleep(self._poll_interval)
-    
+
     def stop(self):
         with self._lock:
             self._running = False
-        
+
         if self._thread is not None:
             self._thread.join(timeout=5)
