@@ -96,6 +96,18 @@ class NodeClient(Protocol):
         """
 
 
+class NodeUnreachable(RuntimeError):
+    """A node that did not answer at all.
+
+    Not a refusal and not a wrong answer: nothing came back.  A refusal is something a
+    shard says, and a caller can act on it - ask the leader, resolve the lock, give up -
+    while this is the absence of anything to ask.  It is what a caller meets when the node
+    it was sent to is gone, which is the case a routing table that still names it has not
+    caught up with, and it is a named error rather than a gRPC one so that the layer which
+    decides what to do about it does not have to know what the wire is made of.
+    """
+
+
 class LocalNodeClient:
     """The node in this process, behind those six calls.
 
@@ -147,8 +159,27 @@ class NodeClientFactory(Protocol):
     and every caller already has a path for a shard it cannot reach.
     """
 
-    def get_client(self, shard_id: int, node_id: int) -> Optional[NodeClient]:
-        """The client for ``node_id`` in ``shard_id``'s group, or None."""
+    def get_client(self, shard_id: int, node_id: int,
+                   address: Optional[str] = None) -> Optional[NodeClient]:
+        """The client for ``node_id`` in ``shard_id``'s group, or None.
+
+        ``address`` is where the caller believes that node serves that shard, for the
+        factories that cannot work it out themselves: a handle in this process needs no
+        address, and one that has to open a connection has nowhere else to get one.  A
+        factory that is handed an address it can use remembers it for the pair, so that
+        ``forget_client`` - which is given the pair, because that is what a caller has -
+        can find the handle again.
+        """
+
+    def get_client_at(self, shard_id: int, address: str) -> Optional[NodeClient]:
+        """The client for whatever node answers ``address`` for ``shard_id``, or None.
+
+        How a leader hint is followed: a refusal that knows where the leader is names an
+        address, not a node id, because an address is the one thing a caller can act on
+        without a table to look a node id up in.  None is the honest answer for a factory
+        whose handles are objects in this process: nothing here answers at an address, and
+        the caller falls back to the table, which is the only other thing it can do.
+        """
 
     def forget_client(self, shard_id: int, node_id: int) -> None:
         """Drop the client for that node, if one is being kept.
@@ -176,7 +207,11 @@ class LocalNodeClientFactory:
         self._lock = threading.Lock()
         self._clients: Dict[Tuple[int, int], LocalNodeClient] = {}
 
-    def get_client(self, shard_id: int, node_id: int) -> Optional[NodeClient]:
+    def get_client(self, shard_id: int, node_id: int,
+                   address: Optional[str] = None) -> Optional[NodeClient]:
+        # The address is ignored, and deliberately: the node this factory hands out is an
+        # object it reached through the cluster it was built over, and an address is a
+        # fact about a wire this process is not on.
         with self._lock:
             client = self._clients.get((shard_id, node_id))
         if client is not None:
@@ -194,6 +229,15 @@ class LocalNodeClientFactory:
             # is dropped.  That costs a wrapper nobody holds, and it keeps a caller
             # from ever being handed two clients for one node.
             return self._clients.setdefault((shard_id, node_id), LocalNodeClient(node))
+
+    def get_client_at(self, shard_id: int, address: str) -> Optional[NodeClient]:
+        """None: nothing in this process answers at an address.
+
+        A hint is a wire fact, and a caller holding the cluster does not need one - it can
+        see for itself which node leads.  Answering None here is what makes a hinted retry
+        fall back to the table, which is the only other answer there is.
+        """
+        return None
 
     def forget_client(self, shard_id: int, node_id: int) -> None:
         """Drop the wrapper for that node, if it was built.

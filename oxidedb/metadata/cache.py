@@ -87,6 +87,17 @@ class RoutingCache:
             return None
         return cls(cluster, client)
 
+    @property
+    def factory(self) -> NodeClientFactory:
+        """How this cache reaches a node the table names.
+
+        Read by the client-side lookups that route by this table (``ShardLeaders``), so
+        that one client does not end up with two ways of reaching a shard: a lookup that
+        defaulted to the cluster's own nodes while the table named an address would be a
+        client whose reads and writes went to different places.
+        """
+        return self._factory
+
     def table(self) -> RoutingTable:
         """The cached table, read from the group the first time.
 
@@ -184,8 +195,15 @@ class RoutingCache:
         return self.leader_for_shard(placement.shard_id)
 
     def _client_for(self, shard_id: int) -> Optional[NodeClient]:
-        """The factory's client for the node the table names for ``shard_id``."""
+        """The factory's client for the node the table names for ``shard_id``.
+
+        The address comes from the same placement, because the table is where it is: a
+        factory that has to open a connection has nowhere else to learn one, and a caller
+        that went looking for it in the cluster would be reading placement no client
+        outside the cluster could have.
+        """
         placement = self.table().shard(shard_id)
         if placement is None or placement.leader_id is None:
             return None
-        return self._factory.get_client(shard_id, placement.leader_id)
+        return self._factory.get_client(shard_id, placement.leader_id,
+                                        placement.leader_address())
