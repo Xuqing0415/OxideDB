@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package oxidedb.groups;
+
+// What a client may ask the two groups that are not a shard: the one holding the routing
+// table, and the one handing out timestamps.
+//
+// They are one file because they are one kind of thing.  Neither holds a keyspace a caller
+// can address - the table is a single document that is read whole, and the timestamp group
+// is a counter - and both are Raft groups with one leader, so both answer the way a shard
+// answers: this node is the leader, or it is not and it says where the leader is.  A client
+// therefore needs a seed address rather than a directory service: it asks the seed, follows
+// a refusal to the leader, and walks its seeds in turn when that leader has moved on.
+//
+// The records here are the ones the groups already keep, field for field - ShardPlacement
+// in oxidedb/metadata/service.py, and the allocate command's answer in oxidedb/tso/tso.py.
+// Nothing is a tidier version of them: a second shape for the same facts is a second place
+// for them to be right or wrong.
+
+enum ErrorCode {
+    OK = 0;
+    // This node does not lead the group.  leader_address says where to try next, and the
+    // call may well succeed there.
+    NOT_LEADER = 1;
+    // Never sent by either of these groups - neither of them has locks to be blocked by -
+    // and here so that the four answers mean one thing in this file and in client.proto,
+    // and a client can read the error_code of any response with one piece of code.
+    LOCKED = 2;
+    // The group answered, and the answer was no: no table installed yet, no quorum to
+    // read a linearizable one from, a batch that could not be allocated.  The detail is
+    // in message, and retrying the same call will not help.
+    REFUSED = 3;
+}
+
+// One shard, as the routing table describes it.
+message ShardRecord {
+    uint64 shard_id = 1;
+    // The half-open range this shard owns: start_key <= key < end_key, by the same rule
+    // the shard itself routes by (shard/router.py).  A key outside every range goes to
+    // shard 0, which is what makes the first and last range cover the keyspace.
+    bytes start_key = 2;
+    bytes end_key = 3;
+    // The nodes of the Raft group serving this shard, and where each of them listens.  A
+    // client about to send an RPC needs the address; the id is what a leader report names.
+    repeated uint64 nodes = 4;
+    map<uint64, string> addresses = 5;
+    // The node that last reported leading this shard, and the term it claimed.  Unset
+    // until a node has reported one - a table read before the first report names no
+    // leader, which is an answer and not a failure.
+    optional uint64 leader_id = 6;
+    uint64 leader_term = 7;
+    // Where that leader can be reached, when both of the two facts above are known: the
+    // same value ShardPlacement.leader_address() answers.  Unset for a shard whose leader
+    // has not published an address yet.
+    optional string leader_address = 8;
+}
+
+message ListShardsRequest {
+}
+
+message ListShardsResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // The whole table.  There is no per-key question to ask: the table is small and it is
+    // one document, so a client reads all of it and keeps it until its version moves.
+    repeated ShardRecord shards = 4;
+    // The version the table is at.  It moves only when the table does, which is how a
+    // client tells "the same table again" from "the table changed" without comparing
+    // records field by field.
+    uint64 version = 5;
+}
+
+message GetTimestampRequest {
+}
+
+message GetTimestampResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // One timestamp.  Where the group got it - a batch, most of which is still in hand -
+    // is the server's business and not the caller's.
+    optional int64 timestamp = 4;
+}
+
+message GetTimestampBatchRequest {
+    // How many timestamps the caller wants.  A group hands out ranges because one
+    // proposal for a thousand of them costs what one of them costs.
+    uint64 count = 1;
+}
+
+message GetTimestampBatchResponse {
+    ErrorCode error_code = 1;
+    string message = 2;
+    optional string leader_address = 3;
+    // The range the group allocated, both ends inclusive, exactly as the allocate command
+    // answers it: count timestamps, the first being start_ts.  A caller that wants a
+    // half-open range adds one to end_ts, which is what TSOClient does with it.
+    optional int64 start_ts = 4;
+    optional int64 end_ts = 5;
+}
+
+service MetadataService {
+    rpc ListShards(ListShardsRequest) returns (ListShardsResponse);
+}
+
+service TSOService {
+    rpc GetTimestamp(GetTimestampRequest) returns (GetTimestampResponse);
+    rpc GetTimestampBatch(GetTimestampBatchRequest) returns (GetTimestampBatchResponse);
+}

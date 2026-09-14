@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 226 tests, roughly five minutes
+pytest tests -q             # 234 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -86,8 +86,10 @@ restart is a new node.
 What a node does not serve yet is a *client*: the routing table's group and the
 timestamp group answer their own Raft traffic over the wire and offer no client
 service, so a program outside the cluster can use the six shard primitives and cannot
-yet read the table or take a timestamp - which is what a transaction needs.  See Known
-gaps.
+yet read the table or take a timestamp - which is what a transaction needs.  Their two
+services are written down - `proto/groups.proto`, read whole for the table and asked for
+a range of timestamps - and `tests/test_client_proto.py` pins that contract, but no node
+implements either one yet.  See Known gaps.
 
 ## Architecture
 
@@ -587,6 +589,14 @@ Honest list of what is *not* done, roughly in priority order.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
+* **The generated protobuf bindings are checked in and pinned by nothing.**  The
+  `*_pb2.py` files carry the toolchain that produced them in their header - protobuf
+  7.35.0 and grpcio 1.82.1 - and the `*_pb2_grpc.py` files need one hand edit the
+  generator does not make: `from . import x_pb2`, so that the module is importable as
+  part of the package rather than as a top-level module.  Nothing fails if someone
+  regenerates them with another toolchain until the version stamp is *newer* than the
+  installed runtime, and a diff of a regenerated file is unreadable.  A test that pins the
+  four files' sha256 is owed.
 * **A multi-key commit is atomic only on the Percolator path.**
   `oxidedb/transaction/local.py` - the embedded `Database` and the CLI - has no
   locks and no primary key: it writes every key of a transaction with one shared
@@ -615,6 +625,7 @@ oxidedb/
 docs/            design notes and posts
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   blog/          the ReadIndex story: a read path that passed every test while wrong
-proto/           gRPC service definitions: raft.proto, and client.proto's six
-                 node-level primitives (served by raft/client_servicer.py)
+proto/           gRPC service definitions: raft.proto, client.proto's six node-level
+                 primitives (served by raft/client_servicer.py), and groups.proto's
+                 routing-table and timestamp services (defined, not served yet)
 tests/           pytest suite

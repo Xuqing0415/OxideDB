@@ -19,7 +19,7 @@ no version are different answers.
 
 import pytest
 
-from oxidedb.proto import client_pb2, client_pb2_grpc
+from oxidedb.proto import client_pb2, client_pb2_grpc, groups_pb2, groups_pb2_grpc
 
 
 def _round_trip(message):
@@ -158,3 +158,134 @@ def test_the_servicer_the_generated_code_asks_for_has_all_six():
     for name in ("Get", "Scan", "Propose", "GetLock", "GetWriteRecord",
                  "FollowerReadIndex"):
         assert hasattr(servicer, name), name
+
+class _RecordingChannel:
+    """A channel that writes down what a stub asks it for, and answers nothing.
+
+    Enough to read the wire path of a call: a stub's first act is to hand its path to the
+    channel, and the path is the one thing a client in another language is written against.
+    """
+
+    def __init__(self):
+        self.paths = []
+
+    def unary_unary(self, path, *args, **kwargs):
+        self.paths.append(path)
+        return lambda *args, **kwargs: None
+
+
+def test_the_group_services_are_the_table_and_the_clock():
+    """One method for the routing table, two for the timestamp group.
+
+    The table is read whole, so there is nothing to ask per key; the counter is asked for
+    one timestamp, or for a range of them, which is what makes a batch worth having.
+    """
+    metadata = groups_pb2.DESCRIPTOR.services_by_name["MetadataService"]
+    tso = groups_pb2.DESCRIPTOR.services_by_name["TSOService"]
+
+    assert [method.name for method in metadata.methods] == ["ListShards"]
+    assert [method.name for method in tso.methods] == ["GetTimestamp", "GetTimestampBatch"]
+
+
+def test_a_group_error_code_is_the_same_four_a_shard_uses():
+    """So one piece of client code can read either response.
+
+    These two groups never send LOCKED - neither of them has locks - and the number is
+    still the same one client.proto gives it, because a shared meaning is what lets a
+    caller treat "ask the leader" the same way wherever it is refused.
+    """
+    shard = {value.name: value.number
+             for value in client_pb2.DESCRIPTOR.enum_types_by_name["ErrorCode"].values}
+    group = {value.name: value.number
+             for value in groups_pb2.DESCRIPTOR.enum_types_by_name["ErrorCode"].values}
+
+    assert group == shard
+
+
+def test_a_shard_record_survives_the_wire_field_for_field():
+    """The record the table keeps, as ShardPlacement describes it."""
+    record = groups_pb2.ShardRecord(
+        shard_id=1, start_key=b"\x80", end_key=b"\xff",
+        nodes=[1, 2, 3], addresses={1: "127.0.0.1:8301", 2: "127.0.0.1:8401"},
+        leader_id=2, leader_term=7, leader_address="127.0.0.1:8401")
+    message = groups_pb2.ListShardsResponse(
+        error_code=groups_pb2.OK, shards=[record], version=4)
+
+    parsed = _round_trip(message)
+    assert parsed.error_code == groups_pb2.OK
+    assert parsed.version == 4
+    assert len(parsed.shards) == 1
+
+    entry = parsed.shards[0]
+    assert (entry.shard_id, entry.start_key, entry.end_key) == (1, b"\x80", b"\xff")
+    assert list(entry.nodes) == [1, 2, 3]
+    assert dict(entry.addresses) == {1: "127.0.0.1:8301", 2: "127.0.0.1:8401"}
+    assert (entry.leader_id, entry.leader_term) == (2, 7)
+    assert entry.leader_address == "127.0.0.1:8401"
+
+
+def test_a_shard_whose_leader_has_not_reported_one_says_nothing_rather_than_zero():
+    """Unset, not 0: node 0 does not exist, and a client that read it would try to go there.
+
+    The first time this record is built is before any election has happened, so this is the
+    ordinary case at startup rather than an edge one.
+    """
+    entry = _round_trip(
+        groups_pb2.ListShardsResponse(
+            error_code=groups_pb2.OK,
+            shards=[groups_pb2.ShardRecord(shard_id=0, start_key=b"", end_key=b"\x80")],
+            version=1)).shards[0]
+
+    assert entry.nodes == []
+    assert dict(entry.addresses) == {}
+    assert not entry.HasField("leader_id")
+    assert not entry.HasField("leader_address")
+    assert entry.leader_term == 0, "a term is a number, and no claim is zero"
+
+
+def test_a_timestamp_batch_is_the_inclusive_range_the_group_allocated():
+    """Both ends inclusive, exactly as the allocate command answers it.
+
+    A caller that wants a half-open range adds one to end_ts - which is what TSOClient does
+    - and the count is what says how many timestamps the range holds.
+    """
+    parsed = _round_trip(groups_pb2.GetTimestampBatchResponse(
+        error_code=groups_pb2.OK, start_ts=1000, end_ts=1999))
+    assert (parsed.start_ts, parsed.end_ts) == (1000, 1999)
+
+    refused = _round_trip(groups_pb2.GetTimestampBatchResponse(
+        error_code=groups_pb2.NOT_LEADER, leader_address="127.0.0.1:8401"))
+    assert not refused.HasField("start_ts") and not refused.HasField("end_ts")
+
+
+def test_one_timestamp_is_a_timestamp_and_a_refusal_is_not_a_zero():
+    """Zero is a timestamp the group has not handed out yet, so absence has to be a field."""
+    parsed = _round_trip(groups_pb2.GetTimestampResponse(
+        error_code=groups_pb2.OK, timestamp=41))
+    assert parsed.timestamp == 41
+
+    refused = _round_trip(groups_pb2.GetTimestampResponse(
+        error_code=groups_pb2.REFUSED, message="no quorum"))
+    assert not refused.HasField("timestamp")
+    assert refused.error_code == groups_pb2.REFUSED
+
+
+def test_the_paths_are_the_ones_a_client_in_another_language_would_call():
+    """Nothing speaks these two services yet, so the names are all there is to freeze."""
+    channel = _RecordingChannel()
+    groups_pb2_grpc.MetadataServiceStub(channel)
+    groups_pb2_grpc.TSOServiceStub(channel)
+
+    assert channel.paths == [
+        "/oxidedb.groups.MetadataService/ListShards",
+        "/oxidedb.groups.TSOService/GetTimestamp",
+        "/oxidedb.groups.TSOService/GetTimestampBatch",
+    ]
+
+
+def test_the_servicers_the_generated_code_asks_for_exist():
+    """The names a node will have to implement, so a missing one is a stale build."""
+    for name in ("ListShards",):
+        assert hasattr(groups_pb2_grpc.MetadataServiceServicer, name), name
+    for name in ("GetTimestamp", "GetTimestampBatch"):
+        assert hasattr(groups_pb2_grpc.TSOServiceServicer, name), name
