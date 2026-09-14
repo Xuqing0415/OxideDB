@@ -50,6 +50,10 @@ STATE_COMPARISON = re.compile(r"\.state\s*[!=]=")
 ALLOWED = {
     "raft": "the shard itself: node, state machine, storage, servicer, shard server.  "
             "Everything else on this list is kept out of it",
+    "launcher.py": "the process that builds a shard and its groups, the way RaftCluster and "
+                   "ShardServer do in process: it hands a gRPC server to a node it has just "
+                   "built, and asks the servers it built who leads.  What it asks is the "
+                   "cluster's own question, and no client goes through it",
     "client/node_client.py": "the in-process implementation of the seam.  It delegates to "
                              "the node it was handed and hands nothing back, which is why "
                              "it is the one file that may name the machinery",
