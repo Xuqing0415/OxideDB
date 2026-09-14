@@ -13,8 +13,9 @@ A node runs three kinds of Raft group, and each of them elects on its own:
 * the metadata group, at ``base + 100 * num_shards``, whose table a client routes by;
 * the TSO group, at ``base + 100 * (num_shards + 1)``, which hands out timestamps.
 
-That arithmetic lives in :func:`group_port` and nowhere else, so an address this node
-publishes is one another node derives the same way.
+That arithmetic lives in :func:`ports_for` and nowhere else, so an address this node
+publishes is one another node derives the same way - and a program that runs these nodes,
+rather than being one of them, imports the same function and agrees with them.
 
 Two things a node here does that a node object cannot: it reports its placement to the
 metadata group (``MetadataPublisher``, which is also what installs the starting ranges -
@@ -81,6 +82,73 @@ def group_port(base_port: int, num_shards: int, group: int) -> int:
     return base_port + (num_shards + group) * SHARD_PORT_STRIDE
 
 
+def block_width(num_shards: int) -> int:
+    """How many ports one node's block spans: its shards, then its two groups.
+
+    A program that starts several nodes has to leave this much room between two nodes'
+    base ports.  A block that overlapped the next node's would be two nodes on one port.
+    """
+    return (num_shards + 2) * SHARD_PORT_STRIDE
+
+
+@dataclass(frozen=True)
+class NodePorts:
+    """Every port one node binds, worked out from the one port it is given.
+
+    The shape of a node's block, in the one place it is written down.  A second program
+    that has to find a node it did not start - a test, a script that starts a cluster, a
+    client holding a seed address - gets from :func:`ports_for` the answer the node itself
+    worked out from its own command line.  That is the point: an address two programs
+    derive two ways is an address one of them gets wrong.
+    """
+
+    base: int
+    num_shards: int
+
+    def shard(self, shard_id: int) -> int:
+        """Where shard ``shard_id`` listens, by the arithmetic ``ShardServer`` binds."""
+        return self.base + shard_id * SHARD_PORT_STRIDE
+
+    @property
+    def shards(self) -> List[int]:
+        """Every shard port, in shard id order."""
+        return [self.shard(shard_id) for shard_id in range(self.num_shards)]
+
+    def group(self, group: int) -> int:
+        """Where the metadata group (0) or the TSO group (1) listens."""
+        return group_port(self.base, self.num_shards, group)
+
+    @property
+    def metadata(self) -> int:
+        """Where the group holding the routing table listens."""
+        return self.group(METADATA_GROUP)
+
+    @property
+    def tso(self) -> int:
+        """Where the group handing out timestamps listens."""
+        return self.group(TSO_GROUP)
+
+    @property
+    def width(self) -> int:
+        """How many ports this node's block covers, from its base port upwards."""
+        return block_width(self.num_shards)
+
+    @property
+    def highest(self) -> int:
+        """The last port this node binds, which is the last one that has to be a port."""
+        return self.group(TSO_GROUP)
+
+
+def ports_for(base_port: int, num_shards: int) -> NodePorts:
+    """Every port of the node whose shard 0 is at ``base_port``, serving ``num_shards``.
+
+    A node id is not an argument because no port depends on one: two nodes told the same
+    base port would be two nodes on one port whatever they were called, and a caller that
+    knows a node's addresses already knows its base port.
+    """
+    return NodePorts(base=base_port, num_shards=num_shards)
+
+
 def _address(host: str, port: int) -> str:
     return f"{host}:{port}"
 
@@ -97,6 +165,11 @@ class Peer:
     def address(self) -> str:
         """Where that node's shard 0 listens, which is what its other ports derive from."""
         return _address(self.host, self.port)
+
+    @property
+    def text(self) -> str:
+        """The form :meth:`parse` reads back: ``2@127.0.0.1:8002``."""
+        return f"{self.node_id}@{self.address}"
 
     @classmethod
     def parse(cls, text: str) -> "Peer":
@@ -168,15 +241,16 @@ class ClusterConfig:
     def shard_address(self, shard_id: int, node_id: Optional[int] = None) -> str:
         """Where ``shard_id`` is served, which is where ``ShardServer`` binds it.
 
-        Not :func:`group_port`: a shard is not one of the groups, it is one of the strides
-        above the base port, and this is the arithmetic the shard server itself uses.
+        Not one of :func:`ports_for`'s groups: a shard is not a group, it is one of the
+        strides above the base port, and this is the arithmetic the shard server itself
+        uses to bind it.
         """
         host, base = self._base_of(node_id)
-        return _address(host, base + shard_id * SHARD_PORT_STRIDE)
+        return _address(host, ports_for(base, self.num_shards).shard(shard_id))
 
     def _group_address(self, group: int, node_id: Optional[int]) -> str:
         host, base = self._base_of(node_id)
-        return _address(host, group_port(base, self.num_shards, group))
+        return _address(host, ports_for(base, self.num_shards).group(group))
 
     def metadata_address(self, node_id: Optional[int] = None) -> str:
         return self._group_address(METADATA_GROUP, node_id)
@@ -212,11 +286,11 @@ class ClusterConfig:
                 f"node ids are 1..N with none missing, and this node has {every} - "
                 f"a node that names the wrong peers is a node in a cluster of its own")
 
-        block_end = group_port(self.port, self.num_shards, TSO_GROUP)
-        if self.port < 1 or block_end > 65535:
+        ports = ports_for(self.port, self.num_shards)
+        if self.port < 1 or ports.highest > 65535:
             raise ValueError(
-                f"shard 0 at {self.port} needs the {(self.num_shards + 2) * SHARD_PORT_STRIDE} "
-                f"ports up to {block_end} free, and that is not a port")
+                f"shard 0 at {self.port} needs the {ports.width} ports up to "
+                f"{ports.highest} free, and that is not a port")
 
     # -- what this node would print about itself ----------------------------
 
@@ -283,7 +357,7 @@ class NodeClusterView:
 
         This node's own address is the one its server actually bound; a peer's is derived
         from that peer's base address, because there is no object here to ask.  Both sides
-        of that are :func:`group_port`, so the derived address is the one the peer bound
+        of that are :func:`ports_for`, so the derived address is the one the peer bound
         rather than a second guess at it.
         """
         addresses = {self._config.node_id: self._config.shard_address(shard_id)}

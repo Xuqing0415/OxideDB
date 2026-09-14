@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 217 tests, roughly five minutes
+pytest tests -q             # 226 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -71,6 +71,10 @@ python -m oxidedb.launcher --node-id 2 --port 8001 --data-dir ./node2 \
 
 A node takes a block of ports from the one it is given: shard `s` at `port + 100 * s`,
 the routing table's group above the last shard, and the timestamp group above that.
+That arithmetic is one exported function, `ports_for` in `oxidedb/launcher.py`, and a
+program that starts these nodes - a test, a script - works their ports out by importing it
+rather than by doing the sum again, so the address it waits on is the address that was
+bound.
 It prints `READY <host> <port>` once every port is bound, which is *before* the groups
 have elected - a client's first call may be refused for a moment, and is retried - and
 `STOPPED` once it has stopped, which happens on a `SIGTERM`, a `Ctrl-C`, or the line
@@ -526,8 +530,14 @@ Honest list of what is *not* done, roughly in priority order.
   those two groups answer their own Raft traffic over the wire and serve no client
   service, so a transaction - which needs a `start_ts` and a leader to send it to -
   cannot be run from another process.  The CLI and the examples still hold a local
-  `Database` and take no `--server`, and every test of the wire stands up its servers
-  inside the test process - real sockets, real serialization, but not a second process.
+  `Database` and take no `--server`, though one shard's six primitives can already be
+  used from another process: `tests/_cluster.py` starts real `python -m oxidedb.launcher`
+  processes, waits for their `READY` line rather than for a number of seconds, and stops
+  each one by writing `stop` to its stdin - failing if a node goes without saying
+  `STOPPED` - and `tests/test_client_over_processes.py` writes, reads and range-reads
+  through that socket, including the bytes two objects in one interpreter never have to
+  serialise: a key whose first byte is 0x80, an empty value, a tombstone, a megabyte
+  value.  Everything above one shard is still a test with the cluster in the test process.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
