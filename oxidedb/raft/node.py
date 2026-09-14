@@ -1076,15 +1076,21 @@ class MemoryRaftNode:
             deadline = time.time() + timeout
             while self._commit_index < entry_index:
                 if self._state != NodeState.LEADER or self._current_term != entry_term:
-                    return ApplyResult.failure(2, "Lost leadership")
+                    # A named code and not a bare 2, which is ERR_APPLY_ERROR:
+                    # without the name a client cannot tell a leader it should
+                    # stop asking from a command the machine could not read.
+                    return ApplyResult.failure(
+                        ErrorCode.ERR_LEADERSHIP_LOST, "Lost leadership")
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    return ApplyResult.failure(3, "Proposal timeout")
+                    return ApplyResult.failure(
+                        ErrorCode.ERR_TIMEOUT, "Proposal timeout")
                 self._apply_cond.wait(timeout=remaining)
             
             applied_entry = self._entry_at(entry_index)
             if applied_entry is not None and applied_entry.term != entry_term:
-                return ApplyResult.failure(4, "Entry overwritten")
+                return ApplyResult.failure(
+                    ErrorCode.ERR_ENTRY_OVERWRITTEN, "Entry overwritten")
         
         with self._lock:
             result = self._apply_results.get(entry_index)
