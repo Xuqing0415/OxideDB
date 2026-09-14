@@ -66,35 +66,52 @@ def serialize_command(cmd_type: bytes, **kwargs) -> bytes:
 
 
 class ApplyResult:
-    def __init__(self, success: bool, error_code: Optional[int] = None, error_msg: Optional[str] = None, data: Optional[bytes] = None):
+    def __init__(self, success: bool, error_code: Optional[int] = None, error_msg: Optional[str] = None,
+                 data: Optional[bytes] = None, index: Optional[int] = None,
+                 leader_address: Optional[str] = None):
         self.success = success
         self.error_code = error_code
         self.error_msg = error_msg
         self.data = data
+        #: Where the command landed in the log, when it landed somewhere.  A reader that
+        #: has to see a write has to have applied this index, and only the node knows
+        #: it: the machine knows what it applied and not where it was written down.
+        self.index = index
+        #: Where the leader is, when the node answering is not it and knows who is.  A
+        #: refusal that names nowhere leaves the caller to read the routing table again;
+        #: one that names a shard's leader lets it ask over there instead.  It is empty
+        #: for every node in this process - a caller holding the cluster can see for
+        #: itself - and it is what the wire version of a refusal carries.
+        self.leader_address = leader_address
     
     @staticmethod
-    def success(data: Optional[bytes] = None):
-        return ApplyResult(True, ErrorCode.SUCCESS, data=data)
+    def success(data: Optional[bytes] = None, index: Optional[int] = None):
+        return ApplyResult(True, ErrorCode.SUCCESS, data=data, index=index)
     
     @staticmethod
-    def failure(error_code: int, error_msg: str):
-        return ApplyResult(False, error_code, error_msg)
+    def failure(error_code: int, error_msg: str, leader_address: Optional[str] = None):
+        return ApplyResult(False, error_code, error_msg, leader_address=leader_address)
 
 
 class ReadResult:
-    def __init__(self, success: bool, value: Optional[bytes] = None, error_code: Optional[int] = None, error_msg: Optional[str] = None):
+    def __init__(self, success: bool, value: Optional[bytes] = None, error_code: Optional[int] = None,
+                 error_msg: Optional[str] = None, leader_address: Optional[str] = None):
         self.success = success
         self.value = value
         self.error_code = error_code
         self.error_msg = error_msg
+        #: Where the leader is, when the node answering this read is not it and knows
+        #: who is.  See the same field on :class:`ApplyResult`.
+        self.leader_address = leader_address
     
     @staticmethod
     def success(value: Optional[bytes]):
         return ReadResult(True, value)
     
     @staticmethod
-    def failure(error_code: int, error_msg: str):
-        return ReadResult(False, error_code=error_code, error_msg=error_msg)
+    def failure(error_code: int, error_msg: str, leader_address: Optional[str] = None):
+        return ReadResult(False, error_code=error_code, error_msg=error_msg,
+                          leader_address=leader_address)
     
     @staticmethod
     def locked():
@@ -113,11 +130,15 @@ class ScanRefused(RuntimeError):
     ``ERR_NOT_LEADER``), and an empty list from ``scan`` means the range is empty.
     """
 
-    def __init__(self, error_code: int, error_msg: str, key: Optional[bytes] = None):
+    def __init__(self, error_code: int, error_msg: str, key: Optional[bytes] = None,
+                 leader_address: Optional[str] = None):
         super().__init__(error_msg)
         self.error_code = error_code
         self.error_msg = error_msg
         self.key = key
+        #: Where the leader is, when a node that is not it refused this range read and
+        #: knows who is.  See the same field on :class:`ReadResult`.
+        self.leader_address = leader_address
 
 
 class StateMachine(ABC):

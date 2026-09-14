@@ -113,6 +113,31 @@ class ShardServer:
         """Where this node serves ``shard_id``, or None in process."""
         return self._shard_addresses.get(shard_id)
 
+    def leader_address(self, shard_id: int) -> Optional[str]:
+        """Where this node believes ``shard_id``'s leader can be reached, if it can say.
+
+        Only a node that is not the leader, and that has heard from one, can answer: this
+        node's own address is the one a caller has just been refused at, and a node that
+        thought it led is exactly the node whose belief a caller cannot use.  None
+        everywhere else, which is what leaves a client to read the routing table - and
+        None is the only possible answer for an in-process server, since nothing is
+        listening at an address to send anyone to.
+        """
+        if self._peer_addresses is None:
+            return None
+
+        node = self._shards.get(shard_id)
+        if node is None:
+            return None
+        leader_id = node.leader_id
+        if leader_id is None or leader_id == self._node_id:
+            return None
+
+        base_address = self._peer_addresses.get(leader_id)
+        if base_address is None:
+            return None
+        return self._peer_address(base_address, shard_id)
+
     def start_shards(self, state_machine_factory: Callable[[], StateMachine],
                      storage_factory: Optional[Callable[[int, int], RaftStorage]] = None,
                      peer_addresses: Optional[Dict[int, str]] = None):
@@ -161,8 +186,10 @@ class ShardServer:
         if self._peer_addresses is not None:
             import grpc
             from .raft_servicer import RaftServicer
+            from .client_servicer import ClientServicer
             from .network_client import RaftNetworkClient
             from oxidedb.proto.raft_pb2_grpc import add_RaftServiceServicer_to_server
+            from oxidedb.proto.client_pb2_grpc import add_ClientServiceServicer_to_server
             from concurrent.futures import ThreadPoolExecutor
 
             network_client = RaftNetworkClient({
@@ -187,6 +214,13 @@ class ShardServer:
         if address is not None:
             server = grpc.server(ThreadPoolExecutor(max_workers=10))
             add_RaftServiceServicer_to_server(RaftServicer(node), server)
+            # The client's six primitives on the same port: a shard's address is where
+            # that shard is, and a client sent to one of them should not need a second
+            # address to ask it anything.  The hint a refusal carries is therefore an
+            # address of exactly this kind - another node's shard port.
+            add_ClientServiceServicer_to_server(
+                ClientServicer(node, leader_address=lambda: self.leader_address(shard_id)),
+                server)
             server.add_insecure_port(address)
             server.start()
             self._shard_addresses[shard_id] = address

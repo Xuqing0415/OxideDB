@@ -137,6 +137,11 @@ class MemoryRaftNode:
         self._state = NodeState.FOLLOWER
         self._current_term = 0
         self._voted_for: Optional[int] = None
+        #: Which node this one last heard from as the leader of its group.  Not
+        #: persisted and not an election fact: it is what a follower can tell a client
+        #: that has been refused here, so that the client can ask over there instead of
+        #: reading the routing table again.  See :meth:`leader_id`.
+        self._leader_id: Optional[int] = None
         self._log: List[LogEntry] = []
         
         self._commit_index = 0
@@ -283,6 +288,33 @@ class MemoryRaftNode:
             return self._current_term
 
     @property
+    def leader_id(self) -> Optional[int]:
+        """Which node this one believes leads its group, or None when it cannot say.
+
+        Only ever a report heard from the leader itself: an AppendEntries or an
+        InstallSnapshot for the current term is proof that its sender leads, and nothing
+        else is.  A node that has just campaigned knows nobody, and a node that has just
+        been elected knows itself - which is not a hint, since it is the node the caller
+        is already talking to.
+
+        What it is for is the client sent to a follower: a refusal that also names where
+        the leader is costs one hop to recover from, and one that names nowhere costs a
+        read of the routing table.
+        """
+        with self._lock:
+            return self._leader_id
+
+    def _forget_leader(self) -> None:
+        """Give up the belief that a particular node leads this one's group.
+
+        Called wherever this node steps out of the term it was following - it is a
+        candidate now, or it has seen a term it does not lead.  Whoever it last heard
+        from is no longer evidence about who leads, and a stale answer here is a client
+        sent to a node that has already stopped leading.
+        """
+        self._leader_id = None
+
+    @property
     def commit_index(self) -> int:
         with self._lock:
             return self._commit_index
@@ -363,6 +395,7 @@ class MemoryRaftNode:
                 return
             
             self._state = NodeState.CANDIDATE
+            self._forget_leader()
             self._current_term += 1
             self._voted_for = self._node_id
             self._votes_received = {self._node_id: True}
@@ -448,6 +481,7 @@ class MemoryRaftNode:
                 if response.term > self._current_term:
                     self._current_term = response.term
                     self._state = NodeState.FOLLOWER
+                    self._forget_leader()
                     self._voted_for = None
                     self._votes_received.clear()
                     self._reset_election_timer()
@@ -472,6 +506,9 @@ class MemoryRaftNode:
             
             if len(self._votes_received) >= majority:
                 self._state = NodeState.LEADER
+                # This node leads the group now, and saying so is what keeps it from
+                # answering a client with the address of whoever led the term before.
+                self._leader_id = self._node_id
                 self._votes_received.clear()
                 self._cancel_election_timer()
                 
@@ -604,6 +641,7 @@ class MemoryRaftNode:
                 if response.term > self._current_term:
                     self._current_term = response.term
                     self._state = NodeState.FOLLOWER
+                    self._forget_leader()
                     self._voted_for = None
                     self._cancel_heartbeat()
                     self._reset_election_timer()
@@ -663,6 +701,7 @@ class MemoryRaftNode:
                 if response.term > self._current_term:
                     self._current_term = response.term
                     self._state = NodeState.FOLLOWER
+                    self._forget_leader()
                     self._voted_for = None
                     self._cancel_heartbeat()
                     self._reset_election_timer()
@@ -790,6 +829,7 @@ class MemoryRaftNode:
             if request.term > self._current_term:
                 self._current_term = request.term
                 self._state = NodeState.FOLLOWER
+                self._forget_leader()
                 self._voted_for = None
                 self._votes_received.clear()
                 self._save_meta()
@@ -835,6 +875,12 @@ class MemoryRaftNode:
                 # and the cluster looked like it had never finished electing.
                 self._state = NodeState.FOLLOWER
                 self._votes_received.clear()
+            
+            # Where this node has heard the leader is.  A message for this term from a
+            # leader is the only proof there is of who that is, and hearing it here is
+            # what lets a refusal name an address instead of leaving the client to read
+            # the routing table again.
+            self._leader_id = request.leader_id
             
             self._reset_election_timer()
             
@@ -917,6 +963,12 @@ class MemoryRaftNode:
                 # the proof that the term already has a leader.
                 self._state = NodeState.FOLLOWER
                 self._votes_received.clear()
+            
+            # Where this node has heard the leader is.  A message for this term from a
+            # leader is the only proof there is of who that is, and hearing it here is
+            # what lets a refusal name an address instead of leaving the client to read
+            # the routing table again.
+            self._leader_id = request.leader_id
             
             self._reset_election_timer()
             if term_changed:
@@ -1095,9 +1147,13 @@ class MemoryRaftNode:
         with self._lock:
             result = self._apply_results.get(entry_index)
             if result is not None:
-                return result
+                # The machine's own answer, carrying where it landed.  A caller that has
+                # to wait for its write to become readable is waiting for this index, and
+                # the machine has no idea at what index it was applied.
+                return ApplyResult(result.success, result.error_code, result.error_msg,
+                                   result.data, index=entry_index)
         
-        return ApplyResult.success()
+        return ApplyResult.success(index=entry_index)
 
     def _read_index(self) -> Tuple[Optional[int], Optional[str]]:
         """The commit index a read may be served at, and why not when there is none.
