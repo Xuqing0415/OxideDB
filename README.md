@@ -114,13 +114,15 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   shard's replica set and addresses once, and a leader report whenever a shard's leader
   or its term moves, so a client that reads the table can route without being told.
   Clients route by it too (`metadata/cache.py`): one read of the table instead of a
-  lookup per key, read again when a shard refuses a request or when the node the table
-  names has stopped leading.  `split_shard` is wired end to end: it freezes the range,
+  lookup per key; a shard that refuses a request names where the leader is when it knows,
+  so following an election costs one hop, and a refusal that names nowhere sends the
+  client back to the table.
+  `split_shard` is wired end to end: it freezes the range,
   copies the rows into the new shard's group as the versions they already were, proposes
   the split to the table, and re-ranges the servers locally before thawing the source -
   and a split that dies before its proposal is finished on the next start.  See Known
-  gaps for what is still missing: no migration, no follower reads, and a client that
-  resolves the table's answer to an object in its own process.
+  gaps for what is still missing: no migration, no follower reads, and no way to start
+  a cluster for a client in another process to connect to.
 
 ## Storage engines (plan E)
 
@@ -383,6 +385,16 @@ reaches into is in the same process, which is exactly why one file here is about
 of the code rather than what it answers.  Three of its tests are controls - a source line
 that reaches in is built in memory and the scan has to point at it - because a scan that
 never fails is not evidence of anything.
+`tests/test_client_servicer.py` and `tests/test_remote_node_client.py` are the wire
+itself.  The first drives the servicer through a bare stub - the six primitives, a
+lock and a write record field for field, a range read stopped by a lock, a node that
+has stopped leading refusing in the response rather than in the gRPC status, and a
+hint present when the node has one and absent when it does not - and the second asks
+a client across a wire and a client in this process the same questions, requiring the
+answers to match, refusal codes and leader hints included.  What the hint buys is the
+point of it: a retry follows a refusal straight to the address it names, and the test
+asserts the routing cache was never asked for a new table, because a retry that reads
+the table is a retry that waited for the publisher.
 
 Three environment notes:
 
@@ -407,11 +419,12 @@ Honest list of what is *not* done, roughly in priority order.
   replicas hold TTLs that differ by a few milliseconds and the value is not
   covered by Raft.  Deriving it from the entry itself would make the state
   machine deterministic.
-* **Snapshot reads are reachable from the state machine and the node, not from a
-  client.**  `node.get(key, ts)`, `node.scan(start, end, ts)` and
-  `coordinator.read(txn_id, key)` all take a timestamp, but the gRPC client path is
-  scaffolding (below) and nothing outside the tests passes one, so a user still gets
-  the newest version.  A read whose snapshot is hidden by a lock is resolved by asking
+* **Snapshot reads are reachable from the state machine, the node and a client, but no
+  user-facing entry point passes a timestamp.**  `node.get(key, ts)`,
+  `node.scan(start, end, ts)`, `coordinator.read(txn_id, key)` and the six primitives over
+  a wire all take one, but nothing outside the tests passes one - the CLI and the examples
+  drive a local `Database` - so a user still gets the newest version.  A read whose
+  snapshot is hidden by a lock is resolved by asking
   the primary key's write record and then rolled forward or cleared, and a lock whose
   transaction is still live is waited out up to the lock's remaining TTL - a reader is
   stopped only by a lock that outlives its TTL, which means the shard could not settle
@@ -450,25 +463,33 @@ Honest list of what is *not* done, roughly in priority order.
   matters.
 * **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
-* **The gRPC client path is scaffolding.**  The contract exists - six node-level
-  primitives in `proto/client.proto`, with a four-value `error_code` and a leader hint -
-  and so does the in-process side of it: `oxidedb/client/node_client.py` is the protocol a
-  caller meets a shard through, `LocalNodeClient` implements it over a node in this
-  process, and `LocalNodeClientFactory` is where a caller gets one.  Every caller that is
-  not the shard itself now holds one of those and nothing else: the coordinator, the lock
-  resolver, the SQL executor and the routing cache reach a shard through a `NodeClient`,
-  `client/routing.py` is the one place that turns a placement into a handle - from the
-  routing table when the client has a table, and from the cluster's own leader lookup when
-  it does not, which is the in-process case - and `tests/test_client_boundary.py` is what
+* **A client can reach a shard over the wire, but nothing starts a cluster for a client
+  in another process to reach.**  The contract is six node-level primitives in
+  `proto/client.proto`, with a four-value `error_code` and a leader hint.
+  `oxidedb/client/node_client.py` is the protocol a caller meets a shard through,
+  `LocalNodeClient` implements it over a node in this process and `RemoteNodeClient` over
+  a channel, `raft/client_servicer.py` serves it from the same port a shard's Raft traffic
+  arrives on, and `LocalNodeClientFactory` and `RemoteNodeClientFactory` are where a caller
+  gets one.  Every caller that is not the shard itself now holds one of those and nothing
+  else: the coordinator, the lock resolver, the SQL executor and the routing cache reach a
+  shard through a `NodeClient`, `client/routing.py` is the one place that turns a placement
+  into a handle - from the routing table when the client has a table, taking the address
+  from the same placement as the node id, and from the cluster's own leader lookup when it
+  does not, which is the in-process case - and `tests/test_client_boundary.py` is what
   keeps it that way: no caller outside `raft/` reads a node's `state`, its state machine or
   its storage.
-  What does not exist is the remote side: no servicer answers those six calls, no client
-  speaks them over a channel, `RemoteNodeClient` has no implementation, and an election is
-  followed by reading the table again rather than by reaching a new address, so a client
-  still reaches a shard in its own process.  `RoutingCache.invalidate` is the hook that
-  path will want - the placement is not in doubt when a connection drops, only the way to
-  reach it - and nothing calls it yet, because a handle that is an object in this process
-  does not break.
+  A refusal is what a client acts on.  The node answering it names where the leader is when
+  it has heard from one - `MemoryRaftNode.leader_id` is set from an AppendEntries or an
+  InstallSnapshot for the current term and dropped wherever the node steps out of that term
+  - so following an election costs one hop to a new address instead of a read of the table,
+  and `ShardLeaders` consumes that hint once, for the retry that follows it, leaving the
+  table as the record it is.  A node that does not answer at all is `NodeUnreachable`, which
+  is not a refusal and is retried the same way, because a table that still names a node
+  which is gone is exactly the case it is for.
+  What is missing is the other end: nothing starts a cluster for a client in another
+  process to connect to, so the CLI and the examples hold a local `Database` and never take
+  a `--server`, and every test of the wire stands up its servers inside the test process -
+  real sockets, real serialization, but not a second process.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
@@ -506,15 +527,15 @@ Honest list of what is *not* done, roughly in priority order.
   shard again, copies only what the new shard is missing, and proposes the split.
   What is still missing around it: it does not coordinate with a write that resolved to the
   old shard just before the range moved, so the copy can end up behind such a write; the
-  copies left in the old shard are never reclaimed; nothing chooses split points or moves a
-  shard between nodes, so there is no migration, no automatic splitting and no follower
-  reads - every read goes to the leader; and the client cannot reach a shard it does not
-  already hold a handle on, because it resolves the node the table names to an object in
-  its own process, which makes it a client *inside* the cluster.  The hop across a process
-  boundary is what the unimplemented gRPC client service would be, and the lock resolver -
-  the other thing in the transaction path that looks for a leader - still scans the
-  cluster's own nodes.  The cross-shard test also drives the coordinator directly rather
-  than through a client, so no hop of it crosses a process boundary.
+  copies left in the old shard are never reclaimed; nothing chooses split points or moves
+  a shard between nodes, so there is no migration, no automatic splitting and no follower
+  reads - every read goes to the leader.  A client can reach a shard it was never handed a
+  handle on, by the address the table names for it (`client/remote_node_client.py`), but
+  nothing in the repository starts a cluster for a client in another process to connect
+  to, so the cross-shard test still drives the coordinator through clients built over
+  nodes in its own process.  The lock resolver - the other thing in the transaction path
+  that looks for a leader - takes its client from `ShardLeaders` like everything else,
+  which in a cluster running in this process means the cluster's own nodes.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
@@ -528,7 +549,8 @@ Honest list of what is *not* done, roughly in priority order.
 
 ```
 oxidedb/
-  raft/          consensus: node, state machine, log/meta storage, gRPC servicer, shard server
+  raft/          consensus: node, state machine, log/meta storage, the Raft and client
+                 gRPC servicers, shard server
   storage/       engine abstraction, MVCC, timestamp allocator
   transaction/   2PC coordinator, local transactions, lock cleaner, retrying client
   tso/           timestamp oracle on its own Raft group
@@ -536,15 +558,15 @@ oxidedb/
                  its publisher, and the client-side cache of what it says
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
-  client/        the six primitives a client may ask one node, the in-process
-                 implementation of them, the factory a caller gets one from, and the one
-                 place a placement becomes a handle (`proto/client.proto` is the wire
-                 form)
+  client/        the six primitives a client may ask one node, the in-process and the
+                 wire implementation of them, the factories a caller gets one from, and
+                 the one place a placement becomes a handle (`proto/client.proto` is the
+                 wire form)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
 docs/            design notes and posts
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   blog/          the ReadIndex story: a read path that passed every test while wrong
 proto/           gRPC service definitions: raft.proto, and client.proto's six
-                 node-level primitives (nothing answers them over a wire yet)
+                 node-level primitives (served by raft/client_servicer.py)
 tests/           pytest suite
