@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 204 tests, roughly five minutes
+pytest tests -q             # 217 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -51,6 +51,39 @@ at one command at a time.  `--data-dir` (before the subcommand) keeps the data i
 oxidedb --data-dir ./demo set user:1 alice
 oxidedb --data-dir ./demo get user:1      # alice
 ```
+
+## Running a node
+
+A node of a cluster can be a process of its own:
+
+```
+python -m oxidedb.launcher --node-id 1 --port 8001 --data-dir ./node1
+```
+
+That is a cluster of one: every group the node holds elects itself, and a client can
+write to its shards over the wire.  Three nodes are the same command three times, each
+naming the others by the address their shard 0 listens at:
+
+```
+python -m oxidedb.launcher --node-id 2 --port 8001 --data-dir ./node2 \
+    --peers "1@10.0.0.1:8001,3@10.0.0.3:8001"
+```
+
+A node takes a block of ports from the one it is given: shard `s` at `port + 100 * s`,
+the routing table's group above the last shard, and the timestamp group above that.
+It prints `READY <host> <port>` once every port is bound, which is *before* the groups
+have elected - a client's first call may be refused for a moment, and is retried - and
+`STOPPED` once it has stopped, which happens on a `SIGTERM`, a `Ctrl-C`, or the line
+`stop` on stdin.  The last of those is how a program that started a node stops it on
+Windows, where one process cannot send another a signal.  With `--data-dir` each group
+keeps its log under that directory, so a node restarts as the same node; without one, a
+restart is a new node.
+
+What a node does not serve yet is a *client*: the routing table's group and the
+timestamp group answer their own Raft traffic over the wire and offer no client
+service, so a program outside the cluster can use the six shard primitives and cannot
+yet read the table or take a timestamp - which is what a transaction needs.  See Known
+gaps.
 
 ## Architecture
 
@@ -463,8 +496,8 @@ Honest list of what is *not* done, roughly in priority order.
   matters.
 * **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
-* **A client can reach a shard over the wire, but nothing starts a cluster for a client
-  in another process to reach.**  The contract is six node-level primitives in
+* **A node can be a process, but a client outside one cannot do everything yet.**
+  The contract is six node-level primitives in
   `proto/client.proto`, with a four-value `error_code` and a leader hint.
   `oxidedb/client/node_client.py` is the protocol a caller meets a shard through,
   `LocalNodeClient` implements it over a node in this process and `RemoteNodeClient` over
@@ -486,10 +519,15 @@ Honest list of what is *not* done, roughly in priority order.
   table as the record it is.  A node that does not answer at all is `NodeUnreachable`, which
   is not a refusal and is retried the same way, because a table that still names a node
   which is gone is exactly the case it is for.
-  What is missing is the other end: nothing starts a cluster for a client in another
-  process to connect to, so the CLI and the examples hold a local `Database` and never take
-  a `--server`, and every test of the wire stands up its servers inside the test process -
-  real sockets, real serialization, but not a second process.
+  `oxidedb/launcher.py` is the other end: it runs one node - its shards, the routing
+  table's group and the timestamp group, each on ports of its own - and publishes its
+  placement, so a client in another process can reach a shard and use all six
+  primitives.  What it cannot do yet is read the routing table or take a timestamp:
+  those two groups answer their own Raft traffic over the wire and serve no client
+  service, so a transaction - which needs a `start_ts` and a leader to send it to -
+  cannot be run from another process.  The CLI and the examples still hold a local
+  `Database` and take no `--server`, and every test of the wire stands up its servers
+  inside the test process - real sockets, real serialization, but not a second process.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
