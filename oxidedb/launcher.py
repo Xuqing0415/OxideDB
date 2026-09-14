@@ -10,8 +10,10 @@ A node runs three kinds of Raft group, and each of them elects on its own:
 
 * its shards, at ``base + 100 * shard_id``, served by ``ShardServer`` - the Raft service
   and the client's six primitives on the same port;
-* the metadata group, at ``base + 100 * num_shards``, whose table a client routes by;
-* the TSO group, at ``base + 100 * (num_shards + 1)``, which hands out timestamps.
+* the metadata group, at ``base + 100 * num_shards``, whose table a client routes by -
+  the Raft service and the client's question about the table on the same port;
+* the TSO group, at ``base + 100 * (num_shards + 1)``, which hands out timestamps, on the
+  same terms.
 
 That arithmetic lives in :func:`ports_for` and nowhere else, so an address this node
 publishes is one another node derives the same way - and a program that runs these nodes,
@@ -22,6 +24,13 @@ metadata group (``MetadataPublisher``, which is also what installs the starting 
 the first writer wins and every other node is refused, which is why all of them may try),
 and it sweeps the locks of the shards it leads (``LockCleaner``).  Both are background
 threads, and both are stopped before the groups they talk to are.
+
+Every group answers two kinds of caller, and one server carries both: the Raft traffic its
+own members send it, and the one question a client outside the cluster has - the whole table
+for the metadata group, a run of timestamps for the TSO group.  A member that is not leading
+refuses the way every other service on the wire refuses, naming where the leader is when it
+has heard from one, so a client that asked the wrong node pays one hop instead of walking the
+seeds it was given.
 
 It says what it is doing on stdout, because a process started by another program has to
 be able to say when it is ready: ``READY <host> <port>`` once every port is bound and the
@@ -38,7 +47,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .metadata.publisher import MetadataPublisher
-from .metadata.service import MetadataClient, MetadataStateMachine
+from .metadata.service import MetadataClient, MetadataServicer, MetadataStateMachine
 from .raft.node import MemoryRaftNode, NodeState
 from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_PORT_STRIDE,
                                 ShardServer)
@@ -46,7 +55,7 @@ from .raft.state_machine import MVCCStateMachine, StateMachine
 from .raft.storage import RaftStorage, create_raft_storage
 from .shard.router import RangeMap, default_range_map
 from .transaction.lock_cleaner import LockCleaner
-from .tso.tso import TSOSMStateMachine
+from .tso.tso import TSOSMStateMachine, TSOServicer
 
 DEFAULT_HOST = "127.0.0.1"
 
@@ -442,6 +451,7 @@ class ClusterNode:
              for node_id in voters if node_id != self._config.node_id},
             MetadataStateMachine,
             self._group_storage("metadata"),
+            register=self._serve_metadata_clients,
         )
         self._metadata_client = MetadataClient(self._metadata_leader)
         self._view.set_metadata_client(self._metadata_client)
@@ -460,7 +470,45 @@ class ClusterNode:
              for node_id in voters if node_id != self._config.node_id},
             TSOSMStateMachine,
             self._group_storage("tso"),
+            register=self._serve_tso_clients,
         )
+
+    def _serve_metadata_clients(self, node, server) -> None:
+        """Answer a client's question about the table, on the metadata group's port."""
+        from oxidedb.proto.groups_pb2_grpc import add_MetadataServiceServicer_to_server
+
+        add_MetadataServiceServicer_to_server(
+            MetadataServicer(node,
+                             self._group_leader_address(node, self._config.metadata_address)),
+            server)
+
+    def _serve_tso_clients(self, node, server) -> None:
+        """Answer a client's request for timestamps, on the TSO group's port."""
+        from oxidedb.proto.groups_pb2_grpc import add_TSOServiceServicer_to_server
+
+        add_TSOServiceServicer_to_server(
+            TSOServicer(node,
+                        self._group_leader_address(node, self._config.tso_address)),
+            server)
+
+    def _group_leader_address(self, node,
+                              address_of: Callable[[int], str]) -> Callable[[], Optional[str]]:
+        """Where this node last heard the group's leader is, as an address it can be asked at.
+
+        The same answer a shard's client service gives, and for the same reason: an election
+        underneath a client's call turns a retry into one more RPC at a known address instead
+        of a walk of the seeds the client was given.  ``address_of`` is the group's own
+        arithmetic - one node's port, worked out from that node's base address the way every
+        other node works it out - so the address named is the one that node bound.
+
+        None means this node has heard from nobody, which leaves the client to its other
+        seeds: the honest answer, and better than naming the node the client just left.
+        """
+        def leader_address() -> Optional[str]:
+            leader = node.leader_id
+            return None if leader is None else address_of(leader)
+
+        return leader_address
 
     def _start_shards(self) -> None:
         """Serve every shard this node holds, and every client primitive on that port."""
@@ -501,8 +549,14 @@ class ClusterNode:
 
     def _start_group(self, name: str, address: str, peers: Dict[int, str],
                      state_machine_factory: Callable[[], StateMachine],
-                     storage: RaftStorage) -> MemoryRaftNode:
-        """Run one member of one group, with a server of its own at ``address``."""
+                     storage: RaftStorage, register=None) -> MemoryRaftNode:
+        """Run one member of one group, with a server of its own at ``address``.
+
+        ``register`` is handed the node and the server, and puts whatever else this group
+        answers to a client on that same server.  It is a callback rather than a flag
+        because the two groups' services are not the same service and each is registered
+        from the method that knows which group it is.
+        """
         import grpc
         from concurrent.futures import ThreadPoolExecutor
 
@@ -520,6 +574,8 @@ class ClusterNode:
 
         server = grpc.server(ThreadPoolExecutor(max_workers=10))
         add_RaftServiceServicer_to_server(RaftServicer(node), server)
+        if register is not None:
+            register(node, server)
         server.add_insecure_port(address)
         server.start()
         # The server is handed to the node as well, because ``node.shutdown()`` is what

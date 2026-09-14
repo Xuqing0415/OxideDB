@@ -33,6 +33,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 import msgpack
 
+from ..groups import refusal
+from ..proto import groups_pb2
+from ..proto.groups_pb2_grpc import MetadataServiceServicer
 from ..raft.node import MemoryRaftNode, RaftCluster
 from ..raft.state_machine import ApplyResult, ErrorCode, ReadResult, StateMachine
 from ..shard.router import RangeMap, locate
@@ -534,6 +537,63 @@ class MetadataClient:
             time.sleep(RETRY_BACKOFF * (attempt + 1))
 
         return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, str(last_error))
+
+
+def shard_record(placement: ShardPlacement) -> groups_pb2.ShardRecord:
+    """One placement as the wire names it: field for field, nothing tidied.
+
+    ``leader_address`` is set only when the table knows both halves of it - which node
+    reported leading, and where that node listens - because the message has no way to say
+    "the id without the address": an absent field is the second half missing, and a
+    client that needs an address reads it the way it reads a shard whose leader has not
+    published one yet.
+    """
+    record = groups_pb2.ShardRecord(
+        shard_id=placement.shard_id,
+        start_key=placement.start,
+        end_key=placement.end,
+        nodes=placement.nodes,
+        leader_term=placement.leader_term,
+    )
+    for node_id, address in sorted(placement.addresses.items()):
+        record.addresses[node_id] = address
+    if placement.leader_id is not None:
+        record.leader_id = placement.leader_id
+        address = placement.leader_address()
+        if address:
+            record.leader_address = address
+    return record
+
+
+class MetadataServicer(MetadataServiceServicer):
+    """The table, answered to a client that is not in this process.
+
+    This node does not decide that it is the leader, and does not read its own state to
+    find out: the read goes through the node's own ``get``, which is the ReadIndex path,
+    so a member that cannot reach a quorum refuses here rather than serving the copy it
+    happens to hold.  What that leaves for this file is the translation, and the one
+    thing a refusal carries that a code cannot: where the leader is, when this node has
+    heard from one.  ``leader_address`` is a callable for the reason
+    ``ClientServicer``'s is - elections happen while a servicer lives.
+    """
+
+    def __init__(self, node, leader_address=None):
+        self._node = node
+        self._leader_address = leader_address
+
+    def ListShards(self, request, context):
+        result = self._node.get(TABLE_KEY)
+        if not result.success:
+            return groups_pb2.ListShardsResponse(**refusal(
+                result.error_msg or "the routing table cannot be read",
+                result.error_code, self._leader_address))
+
+        table = _parse_table(msgpack.unpackb(result.value, raw=False))
+        response = groups_pb2.ListShardsResponse(
+            error_code=groups_pb2.OK, version=table.version)
+        response.shards.extend(shard_record(placement)
+                               for placement in table.shards.values())
+        return response
 
 
 class MetadataCluster:

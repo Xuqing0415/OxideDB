@@ -4,11 +4,21 @@ import time
 from enum import Enum
 from typing import Optional
 from ..raft.node import MemoryRaftNode, NodeState
-from ..raft.state_machine import ApplyResult, StateMachine
+from ..groups import refusal
+from ..proto import groups_pb2
+from ..proto.groups_pb2_grpc import TSOServiceServicer
+from ..raft.state_machine import ApplyResult, ErrorCode, StateMachine
 
 
 class TSOCommandType(Enum):
     ALLOCATE = b"allocate"
+
+
+#: How many timestamps one proposal hands out.  A run costs one entry in the group's log
+#: whatever it is worth, so a timestamp is allocated in runs and consumed one at a time:
+#: here by a caller that takes a run and hands the numbers out itself, and below by the
+#: servicer, which answers a client that would rather not hold a run of its own.
+DEFAULT_BATCH_SIZE = 1000
 
 
 class TSOSMStateMachine(StateMachine):
@@ -67,7 +77,8 @@ class TSOSMStateMachine(StateMachine):
 
 
 class TSOClient:
-    def __init__(self, tso_node: MemoryRaftNode, batch_size: int = 1000):
+    def __init__(self, tso_node: MemoryRaftNode,
+                 batch_size: int = DEFAULT_BATCH_SIZE):
         self._tso_node = tso_node
         self._batch_size = batch_size
         self._local_start = 0
@@ -113,6 +124,67 @@ class TSOClient:
         for _ in range(count):
             timestamps.append(self.get_timestamp())
         return timestamps
+
+
+class TSOServicer(TSOServiceServicer):
+    """The group's clock, answered to a client that is not in this process.
+
+    Two calls for one thing, and what differs between them is the size of the run.
+    ``GetTimestamp`` allocates a run of one, so the number it answers with is everything
+    the group handed out for it; ``GetTimestampBatch`` allocates what the caller asked
+    for and answers with both ends of that run.  A caller that reads one number at a time
+    should not be handed a thousand it will not use - which is the reason both calls are
+    in the contract rather than one with a default - and a caller that wants a thousand
+    should not pay a thousand log entries for them.
+
+    Neither call decides that this node leads: the proposal is what answers that, so a
+    node that has stopped leading refuses here the way it refuses anywhere else.
+    """
+
+    def __init__(self, node, leader_address=None):
+        self._node = node
+        self._leader_address = leader_address
+
+    def GetTimestamp(self, request, context):
+        data, refused = self._allocate(1)
+        if refused is not None:
+            return groups_pb2.GetTimestampResponse(**refused)
+        return groups_pb2.GetTimestampResponse(error_code=groups_pb2.OK,
+                                               timestamp=data.get("start_ts", 0))
+
+    def GetTimestampBatch(self, request, context):
+        if request.count < 1:
+            # A run of none is not a range and cannot be answered with one: start_ts
+            # and end_ts would have to name a boundary that does not exist.  Refused
+            # rather than rounded up, because a caller asking for none is a caller that
+            # has lost track of what it is asking for.
+            return groups_pb2.GetTimestampBatchResponse(**refusal(
+                f"a batch is at least one timestamp, and this asks for {request.count}",
+                ErrorCode.ERR_UNKNOWN, None))
+
+        data, refused = self._allocate(int(request.count))
+        if refused is not None:
+            return groups_pb2.GetTimestampBatchResponse(**refused)
+        return groups_pb2.GetTimestampBatchResponse(error_code=groups_pb2.OK,
+                                                    start_ts=data.get("start_ts", 0),
+                                                    end_ts=data.get("end_ts", 0))
+
+    def _allocate(self, count: int):
+        """One run of ``count`` timestamps, or the refusal to answer with instead.
+
+        The run comes back as the allocate command wrote it - both ends inclusive, in
+        msgpack - and is passed on as it is: a servicer that adjusted the numbers would
+        be a second place the group's arithmetic lives, and the one place a client reads
+        them has to agree with the command it came from.
+        """
+        command = self._node._state_machine.serialize_command(
+            TSOCommandType.ALLOCATE, batch_size=count)
+        result = self._node.propose(command)
+        if not result.success:
+            return None, refusal(
+                result.error_msg or "the clock cannot allocate a timestamp",
+                result.error_code, self._leader_address)
+        return msgpack.unpackb(result.data, raw=False) if result.data else {}, None
 
 
 class TSOCluster:

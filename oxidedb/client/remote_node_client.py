@@ -21,22 +21,17 @@ not here.
 """
 
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import grpc
 
 from oxidedb.proto import client_pb2
 from oxidedb.proto.client_pb2_grpc import ClientServiceStub
 
+from ..channels import ChannelPool, DEFAULT_TIMEOUT
 from ..raft.state_machine import ApplyResult, ErrorCode, ReadResult, ScanRefused
 from .node_client import NodeClient, NodeClientFactory, NodeUnreachable
-
-#: How long one call waits before the node is written off.  Long enough to cover an
-#: election happening underneath a request, which is the slow case a client meets in
-#: practice, and short enough that a node which is simply gone does not hold a caller up
-#: for long.  It is a per-call deadline, so a commit that needs several calls is bounded by
-#: several of these rather than by one.
-DEFAULT_TIMEOUT = 4.0
+from .remote_group_client import RemoteMetadataClient, RemoteTSOClient
 
 
 class RemoteNodeClient:
@@ -122,7 +117,14 @@ class RemoteNodeClient:
         return response.read_index, None
 
     def close(self) -> None:
-        """Let the channel go.  A client that has been closed is not usable again."""
+        """Let the channel go.  A client that has been closed is not usable again.
+
+        A handle this client did not open a channel for - one the factory handed out -
+        shares that channel with the factory and with everything else it handed out for the
+        same address, so closing one of those closes it for all of them.  The factory's
+        ``forget_client`` is what drops a handle that has stopped working; this is for the
+        client that opened its own.
+        """
         self._channel.close()
 
     # -- the two things that are not simply a field -------------------------
@@ -156,19 +158,36 @@ class RemoteNodeClientFactory:
     Keyed the way the routing table names a node - a shard and a node id - with the address
     kept alongside, because an address is the only thing a channel can be opened to and the
     only thing a leader hint gives.  The two are remembered together so that a caller that
-    later asks for the pair is handed the same channel, and so that ``forget_client`, which
+    later asks for the pair is handed the same channel, and so that ``forget_client``, which
     is given the pair, can find the handle it is meant to drop.
 
     One channel per address, not per pair: a node serves each shard on a port of its own, so
     an address already identifies a replica, and two callers asking about it are asking about
-    the same thing.
+    the same thing.  The channels themselves are one pool, shared with the two group clients
+    below, because a pool per kind of client would be a place per kind of client to leak a
+    socket from.
+
+    The two groups that are not a shard are reached through this factory as well, and are
+    given seed addresses rather than looked up: a client outside the cluster has nothing to
+    look a group up in - the table names shards, and the clock is placed nowhere - so a
+    caller that knows where the nodes are hands those addresses in, and the clients walk
+    them.  See ``remote_group_client``.
     """
 
-    def __init__(self, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT,
+                 metadata_seeds: Sequence[str] = (),
+                 tso_seeds: Sequence[str] = ()):
         self._timeout = timeout
         self._lock = threading.Lock()
         self._addresses: Dict[Tuple[int, int], str] = {}
         self._clients: Dict[str, RemoteNodeClient] = {}
+        self._channels = ChannelPool()
+        #: Where the routing table's group and the clock listen, from this client's side.
+        #: They are two lists and not one because they are two groups on two sets of ports.
+        self._metadata_seeds = list(metadata_seeds)
+        self._tso_seeds = list(tso_seeds)
+        self._metadata_client: Optional[RemoteMetadataClient] = None
+        self._tso_client: Optional[RemoteTSOClient] = None
 
     def get_client(self, shard_id: int, node_id: int,
                    address: Optional[str] = None) -> Optional[NodeClient]:
@@ -202,25 +221,51 @@ class RemoteNodeClientFactory:
         """
         with self._lock:
             address = self._addresses.get((shard_id, node_id))
-            client = self._clients.pop(address, None) if address is not None else None
+            if address is not None:
+                self._clients.pop(address, None)
 
-        if client is not None:
-            client.close()
+        if address is not None:
+            # The channel goes as well as the handle: it is the thing that stopped working,
+            # and keeping it would hand the same broken channel to the next caller.  The
+            # address stays, so the next ask opens a new one to the same place.
+            self._channels.forget(address)
+
+    # -- the groups that are not a shard ------------------------------------
+
+    def metadata_client(self) -> RemoteMetadataClient:
+        """The routing table's client, built once, over the seeds this factory was given."""
+        with self._lock:
+            if self._metadata_client is None:
+                self._metadata_client = RemoteMetadataClient(
+                    self._metadata_seeds, channels=self._channels, timeout=self._timeout)
+            return self._metadata_client
+
+    def tso_client(self) -> RemoteTSOClient:
+        """The clock's client, built once, over the seeds this factory was given."""
+        with self._lock:
+            if self._tso_client is None:
+                self._tso_client = RemoteTSOClient(
+                    self._tso_seeds, channels=self._channels, timeout=self._timeout)
+            return self._tso_client
 
     def close(self) -> None:
-        """Close every channel this factory opened."""
+        """Close every channel this factory opened.  The handles go with them."""
         with self._lock:
-            clients = list(self._clients.values())
             self._clients.clear()
             self._addresses.clear()
+            self._metadata_client = None
+            self._tso_client = None
 
-        for client in clients:
-            client.close()
+        # One call closes every channel, including the ones the group clients are using:
+        # they share this pool, so a client closed here is closed by the channel going, which
+        # is the same thing that happens to a caller that has stopped using it.
+        self._channels.close()
 
     def _client_for(self, address: str) -> RemoteNodeClient:
         """The handle for ``address``, opened once.  Called with the lock held."""
         client = self._clients.get(address)
         if client is None:
-            client = RemoteNodeClient(address, timeout=self._timeout)
+            client = RemoteNodeClient(address, timeout=self._timeout,
+                                      channel=self._channels.channel(address))
             self._clients[address] = client
         return client

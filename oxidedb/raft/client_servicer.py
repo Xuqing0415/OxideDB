@@ -29,7 +29,7 @@ from oxidedb.proto import client_pb2
 from oxidedb.proto.client_pb2_grpc import ClientServiceServicer
 
 from ..client.node_client import LocalNodeClient
-from .state_machine import ErrorCode, ScanRefused
+from .state_machine import ErrorCode, ScanRefused, is_not_leader
 
 
 class ClientServicer(ClientServiceServicer):
@@ -138,7 +138,7 @@ class ClientServicer(ClientServiceServicer):
         """
         if error_code is None or error_code == ErrorCode.SUCCESS:
             return client_pb2.OK
-        if error_code in (ErrorCode.ERR_NOT_LEADER, ErrorCode.ERR_LEADERSHIP_LOST):
+        if is_not_leader(error_code):
             return client_pb2.NOT_LEADER
         if error_code == ErrorCode.ERR_LOCKED:
             return client_pb2.LOCKED

@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 234 tests, roughly five minutes
+pytest tests -q             # 245 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -83,13 +83,15 @@ Windows, where one process cannot send another a signal.  With `--data-dir` each
 keeps its log under that directory, so a node restarts as the same node; without one, a
 restart is a new node.
 
-What a node does not serve yet is a *client*: the routing table's group and the
-timestamp group answer their own Raft traffic over the wire and offer no client
-service, so a program outside the cluster can use the six shard primitives and cannot
-yet read the table or take a timestamp - which is what a transaction needs.  Their two
-services are written down - `proto/groups.proto`, read whole for the table and asked for
-a range of timestamps - and `tests/test_client_proto.py` pins that contract, but no node
-implements either one yet.  See Known gaps.
+Each of a node's group ports answers two kinds of caller on the one server: the Raft
+traffic its own members send it, and - for the two groups that are not a shard - the one
+question a client outside the cluster has.  `proto/groups.proto` is that contract, pinned
+before anything spoke it by `tests/test_client_proto.py`: the routing table read whole, and
+the clock asked for one timestamp or a run of them.  `oxidedb/client/remote_group_client.py`
+is the client side of it and `MetadataServicer` in `metadata/service.py` and `TSOServicer` in
+`tso/tso.py` serve it, so a program outside the cluster can use the six shard primitives,
+read the table and take a timestamp.  What it cannot do yet is route by the table on its own
+- see Known gaps - and the CLI still drives a local `Database` rather than a cluster.
 
 ## Architecture
 
@@ -434,6 +436,17 @@ answers to match, refusal codes and leader hints included.  What the hint buys i
 point of it: a retry follows a refusal straight to the address it names, and the test
 asserts the routing cache was never asked for a new table, because a retry that reads
 the table is a retry that waited for the publisher.
+`tests/test_group_clients.py` is those same two groups over a real socket, against launcher
+processes rather than objects.  The table arrives whole, with every address in it opened
+rather than compared as a string; a client whose only seed is a member that does not lead
+still reads it, because the refusal it gets names the leader - that refusal is read with a
+bare stub first, so the hint is not taken on faith - and a seed that answers nothing is
+walked past, until the only seed that answers nothing at all is `NodeUnreachable` rather
+than a refusal.  The clock is asked the same way: timestamps that only go up, a run that is
+used up replaced by one above it (the boundary an off-by-one would hand out twice), the
+single-timestamp call allocating exactly one, and a batch of none refused instead of
+rounded up to one.  One node leading every group is where the leader column is checked
+outright, because there it is decided rather than raced.
 
 Three environment notes:
 
@@ -528,11 +541,14 @@ Honest list of what is *not* done, roughly in priority order.
   `oxidedb/launcher.py` is the other end: it runs one node - its shards, the routing
   table's group and the timestamp group, each on ports of its own - and publishes its
   placement, so a client in another process can reach a shard and use all six
-  primitives.  What it cannot do yet is read the routing table or take a timestamp:
-  those two groups answer their own Raft traffic over the wire and serve no client
-  service, so a transaction - which needs a `start_ts` and a leader to send it to -
-  cannot be run from another process.  The CLI and the examples still hold a local
-  `Database` and take no `--server`, though one shard's six primitives can already be
+  primitives, read the routing table and take a timestamp: both groups serve their one
+  client question on their own port - `MetadataServicer` and `TSOServicer`, registered
+  beside the Raft service they already answered - and `client/remote_group_client.py` is
+  the client side of it, walking the seed addresses it was given, following a refusal that
+  names the leader and stepping over an address that answers nothing.  What a client still
+  cannot do is route by the table on its own, for the reason the bullet above gives, and
+  the CLI and the examples still hold a local `Database` and take no `--server`, though one
+  shard's six primitives can already be
   used from another process: `tests/_cluster.py` starts real `python -m oxidedb.launcher`
   processes, waits for their `READY` line rather than for a number of seconds, and stops
   each one by writing `stop` to its stdin - failing if a node goes without saying
@@ -544,6 +560,19 @@ Honest list of what is *not* done, roughly in priority order.
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
   line up.  The CLI drives a local `Database`, not a cluster.
+* **Only the node that leads the metadata group can publish to it.**  A proposal is not
+  forwarded: a member that does not lead the group answers `ERR_NOT_LEADER`, and no RPC
+  carries a command to whoever leads it.  In a cluster of processes that makes
+  `MetadataPublisher` useful on exactly one node - the one that happens to lead the table's
+  group - while the node leading a shard is usually another one.  What it costs is the
+  leader column: a shard led elsewhere is published with its range, its replica set and its
+  addresses and with no leader, so a client that routes by the table finds nobody to ask.
+  The addresses are there, which is what makes the small fix possible - a client could take
+  any replica of the shard and follow the shard's own refusal to its leader, the same hop a
+  leader hint already buys - and the alternative is a write path on the group's port, which
+  is a fifth service to serve and a decision about who may speak to it.
+  `tests/test_group_clients.py` pins what is true now: a leader that *is* named is a real
+  node at an address that answers, and a one-node cluster names itself for every shard.
 * **Sharding is experimental and frozen - do not use it.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
@@ -627,5 +656,6 @@ docs/            design notes and posts
   blog/          the ReadIndex story: a read path that passed every test while wrong
 proto/           gRPC service definitions: raft.proto, client.proto's six node-level
                  primitives (served by raft/client_servicer.py), and groups.proto's
-                 routing-table and timestamp services (defined, not served yet)
+                 routing-table and timestamp services (served by metadata/service.py and
+                 tso/tso.py, asked by client/remote_group_client.py)
 tests/           pytest suite

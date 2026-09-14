@@ -283,6 +283,28 @@ class Cluster:
         """
         return self.node(node_id).config.shard_address(shard_id)
 
+    def metadata_address(self, node_id: int = 1) -> str:
+        """Where ``node_id``'s member of the routing table's group listens."""
+        return self.node(node_id).config.metadata_address()
+
+    def tso_address(self, node_id: int = 1) -> str:
+        """Where ``node_id``'s member of the timestamp group listens."""
+        return self.node(node_id).config.tso_address()
+
+    @property
+    def metadata_seeds(self) -> List[str]:
+        """Every node's table port, in node id order: what a client outside is seeded with.
+
+        All of them rather than one, because no client knows which member leads, and a
+        client that is given one address it cannot use has no way to find another.
+        """
+        return [self.metadata_address(node.node_id) for node in self._nodes]
+
+    @property
+    def tso_seeds(self) -> List[str]:
+        """Every node's timestamp port, in node id order, on the same terms."""
+        return [self.tso_address(node.node_id) for node in self._nodes]
+
     # -- the way out --------------------------------------------------------
 
     def stop(self) -> None:

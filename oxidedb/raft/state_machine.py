@@ -38,6 +38,18 @@ class ErrorCode:
 DATA_COMMANDS = frozenset({CommandType.SET, CommandType.DELETE, CommandType.PREWRITE})
 
 
+def is_not_leader(error_code: Optional[int]) -> bool:
+    """Whether a refusal is the one a caller answers by asking the leader.
+
+    ``ERR_NOT_LEADER`` and ``ERR_LEADERSHIP_LOST`` are one answer from the outside: the node
+    either was not leading, or stopped leading while the call was in flight, and either way
+    the caller's next move is to ask whoever leads now.  Every service that classifies a
+    refusal asks this - the shard's client service and the two group services - so there is
+    one place that decides it rather than one per service.
+    """
+    return error_code in (ErrorCode.ERR_NOT_LEADER, ErrorCode.ERR_LEADERSHIP_LOST)
+
+
 def writes_new_data(command: bytes) -> bool:
     """Whether ``command``, proposed to a shard, adds rows to it.
 
