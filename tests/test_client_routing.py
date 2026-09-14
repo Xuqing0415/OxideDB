@@ -6,12 +6,18 @@ once - one linearizable read instead of a lookup per key - and treats what it re
 decision it can be sent back to revisit, which is what a cached table has to be for the
 cache to be safe rather than merely fast.
 
-Two kinds of staleness, two ways back to the table.  The table can name a node that has
-since stepped down, and the cache can see that for itself because the node itself says
-so; and a shard can refuse a read because the node the client reached is no longer its
-leader, which only the shard knows.  The first is a lookup that reads the table again,
-the second is the client's retry, and a third test is the same leader change with a real
-cluster, a real metadata group and a real node that dies.
+One kind of staleness and one way back to the table.  A cached table can name a node that
+has stopped leading, and the only evidence of that a client can get is the shard refusing
+to answer: the node it reached is the one whose own belief is in question, since a leader
+cut off from its peers goes on answering reads as if nothing had happened.  So the lookup
+hands out the client for the placement the table published and inspects nothing behind it,
+the refusal is what reads the table again, and the last two tests are the same leader
+change with a real cluster, a real metadata group and a real node that dies.
+
+The middle of the file is the mechanism that does the re-reading: ``ShardLeaders``, which
+answers with a client from the table when there is one and from the cluster when there is
+not, and ``ask_shard``, which is the one place that turns a refusal into a second
+question.
 
 The rest of the file pins what "routes by the table" has to mean: a client with a table
 never looks at the cluster's own nodes, and a coordinator reads and writes by the same
@@ -20,14 +26,18 @@ table rather than by a scan of its own.
 
 import time
 
+import pytest
+
 from _ports import free_addresses
 from _wait import (wait_for_keys_leader, wait_for_metadata_client,
                    wait_for_tso_client, wait_until)
+from oxidedb.client import LocalNodeClient, LocalNodeClientFactory, ShardLeaders, ask_shard
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
 from oxidedb.raft.node import NodeState
 from oxidedb.raft.shard_server import ShardedRaftCluster
-from oxidedb.raft.state_machine import ErrorCode, MVCCStateMachine, ReadResult
+from oxidedb.raft.state_machine import (ErrorCode, MVCCStateMachine, ReadResult,
+                                        ScanRefused)
 from oxidedb.transaction.coordinator import TransactionCoordinator
 from oxidedb.transaction.smart_client import SmartClient
 from oxidedb.tso.tso import TSOCluster
@@ -121,24 +131,27 @@ def _single_shard_cluster(nodes):
                          for node_id, node in nodes.items()})
 
 
-# -- the staleness a cache can see for itself ----------------------------------
+# -- what a lookup answers, and what it does not check -------------------------
 
-def test_a_table_that_names_a_node_which_stepped_down_is_read_again():
-    """The one staleness the cache can detect on its own: its leader has gone."""
-    leading = _FakeNode(value=b"v0")
-    taken_over = _FakeNode(value=b"v1")
-    cluster = _single_shard_cluster({1: leading, 2: taken_over})
-    source = _FakeTableSource(_table(1))
-    cache = RoutingCache(cluster, source)
-    assert cache.leader_for_key(KEY_A) is leading, "the table's answer first"
-    assert cache.refreshes == 0, "a table that is right costs nothing"
+def test_a_lookup_hands_out_the_node_the_table_names_without_asking_it():
+    """The cache does not check whether the node it names still leads.
 
-    # Node 1 steps down and node 2 wins the election, and nobody tells this client:
-    # the node the table names is the evidence, and evidence the cache can read.
-    leading.state = NodeState.FOLLOWER
-    source.move_on(_table(2, version=2))
-    assert cache.leader_for_key(KEY_A) is taken_over
-    assert cache.refreshes == 1, "the table was read again exactly once"
+    It used to, and the check was not evidence even when it fired: the node this client
+    reached is the one whose belief is in question, and one that stepped down cleanly is
+    the case where reading it would have been right anyway.  A leader cut off from its
+    peers believes it leads right up until something refuses it, and that refusal is a
+    fact about the shard - which is why it, and not the node's own state, is what sends
+    this client back to the table (the next test).  What a lookup answers with, then, is
+    the client for the placement the table published, as it stands.
+    """
+    stepped_down = _FakeNode(value=b"v0", state=NodeState.FOLLOWER)
+    cluster = _single_shard_cluster({1: stepped_down, 2: _FakeNode(value=b"v1")})
+    cache = RoutingCache(cluster, _FakeTableSource(_table(1)))
+
+    client = cache.leader_for_key(KEY_A)
+
+    assert client is not None and client.get(KEY_A).value == b"v0", "asked as it stands"
+    assert cache.refreshes == 0, "a lookup is not a place to re-read the table"
 
 
 def test_a_table_that_names_nobody_is_read_again_once_the_publisher_could_have_spoken():
@@ -173,7 +186,8 @@ def test_a_shard_that_refuses_a_read_sends_the_client_back_to_the_table():
     source = _FakeTableSource(_table(1))
     router = RoutingCache(cluster, source)
     client = SmartClient(None, cluster, router=router)
-    assert router.leader_for_key(KEY_A) is old, "this client has a table already"
+    assert isinstance(router.leader_for_key(KEY_A), LocalNodeClient)
+    assert router.refreshes == 0, "this client has a table already"
 
     source.move_on(_table(2, version=2))
     assert client.get(KEY_A) == b"v1", "the retry reads what the new leader has"
@@ -194,6 +208,129 @@ def test_a_transaction_routes_by_the_table_and_not_by_the_cluster():
 
     txn_id, _ = coordinator.begin()
     assert coordinator.read(txn_id, KEY_A) == b"v1"
+
+
+# -- the two sources a placement can come from ---------------------------------
+
+class _ClusterThatSaysWhoLeads:
+    """A cluster a client is inside: asked *which node* leads, never handed over itself.
+
+    ``shard_leader`` and ``range_map`` are the whole of what ``ShardLeaders`` uses when
+    there is no table, and both answer in ids - a node id goes to a factory and a client
+    comes back - so nothing above that line ends up holding the node.
+    """
+
+    def __init__(self, shards, range_map=None):
+        self._shards = {node_id: dict(groups) for node_id, groups in shards.items()}
+        self._range_map = dict(range_map or {0: (b"", b"\xff")})
+
+    def get_shard_server(self, node_id):
+        groups = self._shards.get(node_id)
+        return None if groups is None else _FakeServer(groups)
+
+    def shard_leader(self, shard_id):
+        for node_id in sorted(self._shards):
+            if shard_id in self._shards[node_id]:
+                return (node_id, 1)
+        return None
+
+    def range_map(self):
+        return dict(self._range_map)
+
+
+class _FakeScanningNode:
+    """A node that answers a range read with rows, or with the refusal it was built on."""
+
+    def __init__(self, rows=(), refusal=None):
+        self._rows = list(rows)
+        self._refusal = refusal
+
+    def scan(self, start_key, end_key, timestamp=None):
+        if self._refusal is not None:
+            raise self._refusal
+        return list(self._rows)
+
+
+def test_without_a_table_the_cluster_is_asked_which_node_leads():
+    """A client inside a cluster holds no placement: it asks, and gets a client back."""
+    node = _FakeNode(value=b"v1")
+    leaders = ShardLeaders(_ClusterThatSaysWhoLeads({1: {0: node}}))
+
+    client = leaders.leader_for_shard(0)
+
+    assert isinstance(client, LocalNodeClient)
+    assert client.get(KEY_A).value == b"v1"
+    assert leaders.shard_for_key(KEY_A) == 0, "the cluster's ranges, not a table's"
+    assert leaders.leader_for_key(KEY_A) is client, "one handle per node, not one per ask"
+    assert leaders.leader_for_shard(7) is None, "a shard no node in this cluster leads"
+
+
+def test_ask_shard_reads_the_table_again_once_and_gives_up_after_that():
+    """Two refusals in a row are not staleness, so the second one is the answer.
+
+    The first refusal is the thing a cached table cannot know it will get, and it is
+    worth reading the table for.  A refusal that survives that read is the shard's
+    current answer, and asking a third time would only make a wrong answer slower.
+    """
+    always_refusing = _FakeNode(error=ErrorCode.ERR_NOT_LEADER)
+    cluster = _single_shard_cluster({1: always_refusing})
+    router = RoutingCache(cluster, _FakeTableSource(_table(1)))
+    leaders = ShardLeaders(cluster, router=router)
+    asked = []
+
+    answer = ask_shard(leaders, 0,
+                       lambda client: asked.append(client) or client.get(KEY_A))
+
+    assert answer is not None and answer.error_code == ErrorCode.ERR_NOT_LEADER
+    assert len(asked) == 2, "the leader was asked twice, and no more"
+    assert router.refreshes == 1, "with exactly one read of the table in between"
+
+
+def test_ask_shard_leaves_a_refusal_that_is_not_about_leading_alone():
+    """A lock in the way of a range read is not something the table can fix."""
+    locked = _FakeScanningNode(refusal=ScanRefused(ErrorCode.ERR_LOCKED, "locked"))
+    cluster = _single_shard_cluster({1: locked})
+    router = RoutingCache(cluster, _FakeTableSource(_table(1)))
+    leaders = ShardLeaders(cluster, router=router)
+
+    with pytest.raises(ScanRefused):
+        ask_shard(leaders, 0, lambda client: client.scan(b"", b"\xff"))
+
+    assert router.refreshes == 0, "the table had nothing to do with this one"
+
+
+def test_ask_shard_reports_a_range_read_that_never_reached_a_leader():
+    """A scan refuses by raising, so its last refusal is raised rather than returned."""
+    refusing = _FakeScanningNode(
+        refusal=ScanRefused(ErrorCode.ERR_NOT_LEADER, "Not leader"))
+    cluster = _single_shard_cluster({1: refusing})
+    router = RoutingCache(cluster, _FakeTableSource(_table(1)))
+    leaders = ShardLeaders(cluster, router=router)
+
+    with pytest.raises(ScanRefused):
+        ask_shard(leaders, 0, lambda client: client.scan(b"", b"\xff"))
+
+    assert router.refreshes == 1, "the range read went back to the table once too"
+
+
+def test_invalidate_drops_the_handle_for_the_node_the_table_names():
+    """A handle that stopped working is dropped; the placement is left alone."""
+    cluster = _single_shard_cluster({1: _FakeNode(value=b"v1")})
+    factory = LocalNodeClientFactory(cluster)
+    cache = RoutingCache(cluster, _FakeTableSource(_table(1)), factory=factory)
+
+    first = cache.leader_for_shard(0)
+    cache.invalidate(0)
+    second = cache.leader_for_shard(0)
+
+    assert first is not second, "the dropped handle is not handed out again"
+    assert second is not None and cache.refreshes == 0, "and the table was not re-read"
+
+    # A shard the table names nobody for has no handle to drop, and that is not an
+    # error: a caller that found one broken and one that never had one want the same
+    # thing to happen.
+    nameless = RoutingCache(_single_shard_cluster({}), _FakeTableSource(_table(None)))
+    nameless.invalidate(0)
 
 
 # -- the same two things over a real cluster -----------------------------------

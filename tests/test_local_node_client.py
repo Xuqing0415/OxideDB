@@ -22,7 +22,8 @@ import pytest
 
 from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
-from oxidedb.client import LocalNodeClient, NodeClient
+from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, NodeClient,
+                            NodeClientFactory)
 from oxidedb.raft.node import MemoryRaftNode, NodeState
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
@@ -37,25 +38,46 @@ COMMITTED_KEY = b"aaa"
 LOCKED_KEY = b"zzz"
 
 
+#: Every node a test in this file builds.  A node drives its elections from a thread of
+#: its own (`MemoryRaftNode._tick`, started in its constructor), so a node nobody shuts
+#: down leaves a thread behind for the rest of the session.
+_BUILT_NODES = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_the_nodes_the_test_built():
+    yield
+    while _BUILT_NODES:
+        _BUILT_NODES.pop().shutdown()
+
+
+def _build(node):
+    """Keep a node, so that the end of the test stops its ticker thread."""
+    _BUILT_NODES.append(node)
+    return node
+
+
 def _single_node_leader():
     """A one-node cluster that elects itself, so proposals commit.
 
     No peers and no storage: the shard is real, the node keeps its log in memory, and
     nothing here has to wait for a network.
     """
-    node = MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
-                          get_peer_node=None,
-                          election_timeout_min=20, election_timeout_max=40)
+    node = _build(MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
+                                 get_peer_node=None,
+                                 election_timeout_min=20, election_timeout_max=40))
     wait_until(lambda: node.state == NodeState.LEADER, timeout=10,
                message="the single node never became the leader")
     return node
 
 
-def _quiet_follower():
+def _quiet_follower(node_id=2):
     """A node whose election timer will not fire during the test."""
-    node = MemoryRaftNode(node_id=2, peers=[], state_machine=MVCCStateMachine(),
-                          get_peer_node=None,
-                          election_timeout_min=60000, election_timeout_max=60000)
+    node = _build(MemoryRaftNode(node_id=node_id, peers=[],
+                                 state_machine=MVCCStateMachine(),
+                                 get_peer_node=None,
+                                 election_timeout_min=60000,
+                                 election_timeout_max=60000))
     assert node.state == NodeState.FOLLOWER
     return node
 
@@ -250,6 +272,96 @@ def test_propose_on_non_leader_returns_not_leader_code():
         assert result.error_code != ErrorCode.ERR_UNKNOWN
 
 
+class _ServerWithEveryShard:
+    """One server: a node in *every* shard's Raft group, which is what a server is."""
+
+    def __init__(self, node_id, num_shards):
+        self.node_id = node_id
+        self.shards = {shard_id: _quiet_follower(node_id)
+                       for shard_id in range(num_shards)}
+
+    def get_shard_node(self, shard_id):
+        return self.shards.get(shard_id)
+
+
+class _ClusterOfServers:
+    """The part of a sharded cluster a factory uses, and nothing else."""
+
+    def __init__(self, node_ids=(1, 2), num_shards=2):
+        self.servers = {node_id: _ServerWithEveryShard(node_id, num_shards)
+                        for node_id in node_ids}
+
+    def get_shard_server(self, node_id):
+        return self.servers.get(node_id)
+
+
+def test_the_factory_is_the_protocol_and_answers_with_clients():
+    factory = LocalNodeClientFactory(_ClusterOfServers())
+
+    assert isinstance(factory, NodeClientFactory)
+    for shard_id in (0, 1):
+        for node_id in (1, 2):
+            assert isinstance(factory.get_client(shard_id, node_id), LocalNodeClient)
+
+
+def test_a_node_id_on_its_own_would_name_the_wrong_group():
+    """The same id in two shards is two groups, and has to be two clients.
+
+    A server holds one node per shard, so "node 1" is one Raft group in shard 0 and
+    another in shard 1 - which is the whole reason the factory is keyed by a pair and
+    not by the id a caller thinks it is asking about.
+    """
+    factory = LocalNodeClientFactory(_ClusterOfServers())
+
+    first = factory.get_client(0, 1)
+    second = factory.get_client(1, 1)
+
+    assert first is not second
+    assert first._node is not second._node
+
+
+def test_the_factory_hands_out_one_client_per_node():
+    """Asked twice, it answers with the client it built the first time."""
+    factory = LocalNodeClientFactory(_ClusterOfServers())
+
+    assert factory.get_client(0, 1) is factory.get_client(0, 1)
+
+
+def test_the_factory_answers_none_for_a_node_it_has_no_handle_on():
+    """None and not an exception: the table names nodes a client cannot reach."""
+    factory = LocalNodeClientFactory(_ClusterOfServers(node_ids=(1,)))
+
+    assert factory.get_client(0, 1) is not None
+    assert factory.get_client(0, 7) is None, "no such server"
+    assert factory.get_client(9, 1) is None, "no such shard on that server"
+
+
+def test_the_factory_drops_a_client_it_is_told_to_forget():
+    """A handle that has stopped working is dropped, and the next ask builds a new one.
+
+    The node behind it is not dropped: nothing about where the shard is has changed,
+    only the way this client reaches it.
+    """
+    factory = LocalNodeClientFactory(_ClusterOfServers())
+
+    first = factory.get_client(0, 1)
+    factory.forget_client(0, 1)
+    second = factory.get_client(0, 1)
+
+    assert first is not second, "the handle was dropped"
+    assert second._node is first._node, "and the node behind it was not"
+
+
+def test_forgetting_a_client_nobody_asked_for_is_not_an_error():
+    """A caller that found one broken and one that never had one want the same thing."""
+    factory = LocalNodeClientFactory(_ClusterOfServers())
+
+    factory.forget_client(0, 1)
+    factory.forget_client(9, 7)
+
+    assert factory.get_client(0, 1) is not None
+
+
 def _two_shard_cluster():
     """A TSO group and a two-shard cluster, both started but not yet settled.
 
@@ -284,11 +396,19 @@ def _assert_two_shards(cluster, *keys):
     return shards
 
 
-def _client_for(cluster, key):
-    """The client for whichever node leads the shard that owns ``key``."""
+def _client_for(factory, cluster, key):
+    """The client for whichever node leads the shard that owns ``key``.
+
+    Through the factory, which is how a caller gets one, and for the pair the routing
+    table names: a shard, and the id of the server serving it.
+    """
     leader = cluster.get_leader_for_key(key)
     assert leader is not None, f"no shard leader for {key!r}"
-    return LocalNodeClient(leader[1])
+    node_id, _ = leader
+
+    client = factory.get_client(locate(cluster._range_map, key), node_id)
+    assert client is not None, f"no client for {key!r}"
+    return client
 
 
 def _prewrite(client, key, value, start_ts, primary_key):
@@ -318,8 +438,9 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
         tso_client = wait_for_tso_client(tso_cluster)
         _assert_two_shards(shard_cluster, KEY_A, KEY_B)
 
-        client_a = _client_for(shard_cluster, KEY_A)
-        client_b = _client_for(shard_cluster, KEY_B)
+        factory = LocalNodeClientFactory(shard_cluster)
+        client_a = _client_for(factory, shard_cluster, KEY_A)
+        client_b = _client_for(factory, shard_cluster, KEY_B)
 
         start_ts = tso_client.get_timestamp()
         commit_ts = tso_client.get_timestamp()
@@ -372,6 +493,7 @@ def test_a_prewrite_one_shard_refuses_is_refused_through_the_client_too():
         tso_client = wait_for_tso_client(tso_cluster)
         _assert_two_shards(shard_cluster, KEY_A, KEY_B)
 
+        factory = LocalNodeClientFactory(shard_cluster)
         node_b = shard_cluster.get_leader_for_key(KEY_B)[1]
         client_b = LocalNodeClient(node_b)
 
@@ -392,7 +514,7 @@ def test_a_prewrite_one_shard_refuses_is_refused_through_the_client_too():
 
         # The other shard did take the lock, so the transaction is undone through the
         # client that took it.
-        client_a = _client_for(shard_cluster, KEY_A)
+        client_a = _client_for(factory, shard_cluster, KEY_A)
         assert _prewrite(client_a, KEY_A, b"value_a", start_ts, KEY_A).success
         assert client_a.get_lock(KEY_A) is not None
 

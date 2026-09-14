@@ -4,8 +4,9 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from ..raft.node import MemoryRaftNode, NodeState
-from ..raft.state_machine import CommandType, ApplyResult, ErrorCode
+from ..client.node_client import NodeClient, NodeClientFactory
+from ..client.routing import ShardLeaders, ask_shard
+from ..raft.state_machine import ApplyResult, CommandType, ErrorCode, serialize_command
 from ..shard.router import locate
 from ..tso.tso import TSOClient
 from .lock_resolver import DEFAULT_LOCK_TTL, LockResolver
@@ -58,14 +59,20 @@ class TransactionCoordinator:
     def __init__(self, tso_client: TSOClient, shard_server,
                  lock_ttl: float = DEFAULT_LOCK_TTL,
                  validate_reads: bool = True,
-                 router=None):
+                 router=None, factory: Optional[NodeClientFactory] = None):
         self._tso_client = tso_client
         self._shard_server = shard_server
-        #: The client's routing table, when it has one.  Every leader this
-        #: coordinator looks up goes through it, so a transaction reads and writes
-        #: by one placement rather than by two.
-        self._router = router
-        self._resolver = LockResolver(shard_server, lock_ttl=lock_ttl)
+        #: Every shard this transaction touches, as a client that leads it, by the one
+        #: placement this client holds: the routing table when it has one and the
+        #: cluster's own leader lookup when it does not.  A transaction therefore reads
+        #: and writes by the same placement rather than by two, and the coordinator holds
+        #: no node - what it holds is the handle a caller outside the process would hold,
+        #: which is what makes this path survive the move off the process.
+        self._leaders = ShardLeaders(shard_server, factory=factory, router=router)
+        #: Built with the same leaders, so a lock this coordinator meets is settled by
+        #: the placement this coordinator read and wrote by.
+        self._resolver = LockResolver(shard_server, lock_ttl=lock_ttl,
+                                      leaders=self._leaders)
         self._validate_reads = validate_reads
         #: Held across read-set validation and the primary commit.  See commit().
         self._commit_lock = threading.Lock()
@@ -77,15 +84,19 @@ class TransactionCoordinator:
     def _get_shard_id(self, key: bytes) -> int:
         return locate(self._shard_server._range_map, key)
     
-    def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
-        if self._router is not None:
-            return self._router.leader_for_shard(shard_id)
+    def _get_shard_leader(self, shard_id: int) -> Optional[NodeClient]:
+        """The client for whichever node leads ``shard_id``, or None."""
+        return self._leaders.leader_for_shard(shard_id)
 
-        for server in self._shard_server._shard_servers.values():
-            node = server.get_shard_node(shard_id)
-            if node and node.state == NodeState.LEADER:
-                return node
-        return None
+    def _propose_to(self, shard_id: int, command: bytes) -> Optional[ApplyResult]:
+        """Append ``command`` to ``shard_id``'s leader, following the table once if refused.
+
+        A shard that says it is not the leader has told this client that the placement
+        it holds is old, which is not a thing a client can see for itself; ``ask_shard``
+        reads the table again and asks whoever leads now.  None means there is no leader
+        this client can reach, which callers treat the way they treat a refusal.
+        """
+        return ask_shard(self._leaders, shard_id, lambda client: client.propose(command))
     
     def begin(self) -> Tuple[int, int]:
         with self._lock:
@@ -159,6 +170,10 @@ class TransactionCoordinator:
         The key is remembered as read.  Whatever the caller decides from it, the
         decision is only valid while this snapshot is: commit() checks every read
         key for a version committed after start_ts and aborts if it finds one.
+
+        A shard whose leader has moved refuses the read rather than answering it, and
+        ``ask_shard`` reads the table again and asks whoever leads now - so the read
+        does not have to know that an election happened underneath it.
         """
         with self._lock:
             txn = self._transactions.get(txn_id)
@@ -167,12 +182,12 @@ class TransactionCoordinator:
             start_ts = txn.start_ts
 
         shard_id = self._get_shard_id(key)
-        leader = self._get_shard_leader(shard_id)
-        if leader is None:
-            raise RuntimeError(f"No leader for shard {shard_id}")
 
         for _ in range(LOCK_RESOLUTION_ATTEMPTS):
-            result = leader.get(key, start_ts)
+            result = ask_shard(self._leaders, shard_id,
+                               lambda client: client.get(key, start_ts))
+            if result is None:
+                raise RuntimeError(f"No leader for shard {shard_id}")
             if result.error_code != ErrorCode.ERR_LOCKED:
                 break
             if not self._resolver.await_resolution(key):
@@ -255,17 +270,17 @@ class TransactionCoordinator:
                 txn.commit_ts = commit_ts
 
             primary_shard_id = self._get_shard_id(txn.primary_key)
-            primary_leader = self._get_shard_leader(primary_shard_id)
 
-            if primary_leader is None:
+            if self._get_shard_leader(primary_shard_id) is None:
                 self._rollback_all_shards(txn, shard_groups)
                 with self._lock:
                     txn.status = TxnStatus.ABORTED
                 return False, None
 
-            primary_commit_result = self._commit_key(primary_leader, txn.primary_key, txn.start_ts, commit_ts)
+            primary_commit_result = self._commit_key(
+                primary_shard_id, txn.primary_key, txn.start_ts, commit_ts)
 
-            if not primary_commit_result.success:
+            if primary_commit_result is None or not primary_commit_result.success:
                 self._rollback_all_shards(txn, shard_groups)
                 with self._lock:
                     txn.status = TxnStatus.ABORTED
@@ -293,11 +308,11 @@ class TransactionCoordinator:
         """
         for key in sorted(txn.read_set):
             shard_id = self._get_shard_id(key)
-            leader = self._get_shard_leader(shard_id)
-            if leader is None:
+            client = self._get_shard_leader(shard_id)
+            if client is None:
                 return f"no leader for shard {shard_id}, holding {key!r}"
 
-            write_record = leader._state_machine._storage.get_latest_write(key)
+            write_record = client.get_write_record(key)
             if write_record is not None and write_record["commit_ts"] > txn.start_ts:
                 return (f"{key!r} was committed at {write_record['commit_ts']}, "
                         f"after this transaction started at {txn.start_ts}")
@@ -319,16 +334,13 @@ class TransactionCoordinator:
         # leaves locks behind for a transaction that is about to be aborted, and a
         # reader that meets one of those locks cannot tell it apart from a live
         # transaction - there is nothing to wait for and nothing to roll forward.
-        leaders = {}
         for shard_id in shard_groups:
-            leader = self._get_shard_leader(shard_id)
-            if leader is None:
+            if self._get_shard_leader(shard_id) is None:
                 return False
-            leaders[shard_id] = leader
 
         futures = {}
         for shard_id, keys in shard_groups.items():
-            future = self._executor.submit(self._prewrite_shard, leaders[shard_id], txn, keys)
+            future = self._executor.submit(self._prewrite_shard, shard_id, txn, keys)
             futures[future] = shard_id
         
         results = {}
@@ -345,9 +357,10 @@ class TransactionCoordinator:
         
         return True
     
-    def _prewrite_shard(self, leader: MemoryRaftNode, txn: Transaction, keys: List[Tuple[bytes, bytes]]) -> bool:
+    def _prewrite_shard(self, shard_id: int, txn: Transaction,
+                        keys: List[Tuple[bytes, bytes]]) -> bool:
         for key, value in keys:
-            command = leader._state_machine.serialize_command(
+            command = serialize_command(
                 CommandType.PREWRITE,
                 key=key,
                 value=value,
@@ -355,46 +368,39 @@ class TransactionCoordinator:
                 primary_key=txn.primary_key,
             )
             
-            result = leader.propose(command)
-            if not result.success:
+            result = self._propose_to(shard_id, command)
+            if result is None or not result.success:
                 return False
         
         return True
     
     def _rollback_all_shards(self, txn: Transaction, shard_groups: Dict[int, List[Tuple[bytes, bytes]]]):
         for shard_id, keys in shard_groups.items():
-            leader = self._get_shard_leader(shard_id)
-            if leader is None:
-                continue
-            
             for key, _ in keys:
-                command = leader._state_machine.serialize_command(
+                command = serialize_command(
                     CommandType.ROLLBACK,
                     key=key,
                     start_ts=txn.start_ts,
                 )
-                leader.propose(command)
+                self._propose_to(shard_id, command)
     
-    def _commit_key(self, leader: MemoryRaftNode, key: bytes, start_ts: int, commit_ts: int) -> ApplyResult:
-        command = leader._state_machine.serialize_command(
+    def _commit_key(self, shard_id: int, key: bytes, start_ts: int,
+                    commit_ts: int) -> Optional[ApplyResult]:
+        command = serialize_command(
             CommandType.COMMIT,
             key=key,
             start_ts=start_ts,
             commit_ts=commit_ts,
         )
-        return leader.propose(command)
+        return self._propose_to(shard_id, command)
     
     def _commit_secondary_shards(self, txn: Transaction, shard_groups: Dict[int, List[Tuple[bytes, bytes]]], commit_ts: int):
         for shard_id, keys in shard_groups.items():
-            leader = self._get_shard_leader(shard_id)
-            if leader is None:
-                continue
-            
             for key, _ in keys:
                 if key == txn.primary_key:
                     continue
                 
-                self._executor.submit(self._commit_key, leader, key, txn.start_ts, commit_ts)
+                self._executor.submit(self._commit_key, shard_id, key, txn.start_ts, commit_ts)
     
     def rollback(self, txn_id: int) -> bool:
         with self._lock:

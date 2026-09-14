@@ -28,6 +28,7 @@ those are different answers a caller reacts to differently; only ``scan`` raises
 because a range read's shape is rows and a dropped key would look like an absent one.
 """
 
+import threading
 from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
 from ..raft.node import MemoryRaftNode
@@ -128,3 +129,79 @@ class LocalNodeClient:
 
     def follower_read_index(self) -> Tuple[Optional[int], Optional[str]]:
         return self._node._read_index()
+
+
+@runtime_checkable
+class NodeClientFactory(Protocol):
+    """Where a caller's handles on nodes come from.
+
+    Keyed the way the routing table names a node, which is a shard *and* a node id and
+    not a node id on its own: one server holds a node in every shard's Raft group, so
+    node 1 is one group in shard 0 and a different group in shard 1, listening on a
+    different address for each.  A factory keyed by node id alone would hand back the
+    wrong group - which is why this is a pair even though the id is the part a caller
+    thinks it is asking about.
+
+    None means "this caller has no way to reach that node", which is an answer and not
+    a failure: the table names nodes a client may never have been given a handle on,
+    and every caller already has a path for a shard it cannot reach.
+    """
+
+    def get_client(self, shard_id: int, node_id: int) -> Optional[NodeClient]:
+        """The client for ``node_id`` in ``shard_id``'s group, or None."""
+
+    def forget_client(self, shard_id: int, node_id: int) -> None:
+        """Drop the client for that node, if one is being kept.
+
+        A handle that has stopped working is not worth keeping, and the caller that
+        found out is the only one that knows.  This is not a refresh: nothing about
+        where the shard is has changed, only the way this client reaches it.
+        """
+
+
+class LocalNodeClientFactory:
+    """The nodes in this process, behind the same protocol, built when first asked for.
+
+    The cluster it is built over is the one the routing cache already holds, and the
+    lookup is the pair the table publishes - a shard and the id of a server that serves
+    it.
+
+    Built lazily and kept, because a handle costs nothing but a caller that asked per
+    key would otherwise build one per key.  A client here is a handle and not a
+    connection, so what is cached is the wrapper; the node itself is the state.
+    """
+
+    def __init__(self, cluster):
+        self._cluster = cluster
+        self._lock = threading.Lock()
+        self._clients: Dict[Tuple[int, int], LocalNodeClient] = {}
+
+    def get_client(self, shard_id: int, node_id: int) -> Optional[NodeClient]:
+        with self._lock:
+            client = self._clients.get((shard_id, node_id))
+        if client is not None:
+            return client
+
+        server = self._cluster.get_shard_server(node_id)
+        if server is None:
+            return None
+        node = server.get_shard_node(shard_id)
+        if node is None:
+            return None
+
+        with self._lock:
+            # Two threads can get here at once; the first wrapper wins and the second
+            # is dropped.  That costs a wrapper nobody holds, and it keeps a caller
+            # from ever being handed two clients for one node.
+            return self._clients.setdefault((shard_id, node_id), LocalNodeClient(node))
+
+    def forget_client(self, shard_id: int, node_id: int) -> None:
+        """Drop the wrapper for that node, if it was built.
+
+        Nothing is closed - a wrapper around an object in this process holds nothing
+        that can be closed - so what is dropped is a handle, and the next ask builds it
+        again.  Forgetting a handle nobody is holding is not an error: a caller that
+        found one broken and a caller that never had one want the same thing to happen.
+        """
+        with self._lock:
+            self._clients.pop((shard_id, node_id), None)

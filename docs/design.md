@@ -418,11 +418,16 @@ when it was read - not that it is still current.  A stale cached table routes a 
 shard that will refuse it, which is a retry; a guessed table routes it somewhere nothing
 checks.
 
-**How the cache is kept honest.**  There are three ways back to the table and no fourth.
-A lookup that finds the node the table names has stopped leading reads the table again -
-the one staleness a cache can see for itself, and the one an election produces.  A shard
-that refuses a request because this client reached a node that is no longer its leader
-sends the client back for the new answer.  And a table that names nobody is read again,
+**How the cache is kept honest.**  There are two ways back to the table and no third.
+A shard that refuses a request because this client reached a node that is no longer its
+leader sends the client back for the new answer: one read of the table and one second
+question, because a refusal that survives a fresh table is the shard's current answer and
+asking a third time would only make a wrong one slower.  Asking the node itself whether it
+still leads is deliberately *not* one of the ways.  The node this client reached is the one
+whose belief is in question - a leader cut off from its peers goes on answering reads as if
+nothing had happened, and only a refusal from the shard can say otherwise - which is also
+why a lookup here hands out a client for the placement the table names rather than the node
+behind it.  And a table that names nobody is read again,
 because "nobody leads this shard" and "this table was read before the leader was published"
 are the same answer from the client's side, and only one of them is worth waiting out.
 Placement arrives a command at a time - the ranges, then a shard's replica set, then its

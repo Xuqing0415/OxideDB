@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 187 tests, roughly five minutes
+pytest tests -q             # 198 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -214,7 +214,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-187 tests.  `tests/test_durability.py` covers the correctness properties that
+198 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -316,12 +316,15 @@ ranges is refused rather than overwritten.
 routes by it and never looks at the cluster's own nodes - the test turns that into a
 failure rather than a convention - and a transaction reads and writes by the same
 placement, because a client that read by the table and wrote by scanning the cluster
-would be two clients wearing one name.  The ways the cache is kept honest are pinned with
-fakes: a lookup that finds the node the table names has stopped leading reads the table
-again; a table that names nobody is read again too, but no faster than the publisher could
-have written an answer - a range published before its leader is, and a shard that really
-has no leader, look identical from the client's side and only one of them is worth waiting
-out; and a shard that refuses a read sends the client back for the new answer.  The last
+would be two clients wearing one name.  The ways a placement is kept honest are pinned with
+fakes: a lookup hands out the client for the node the table names without inspecting it,
+because that node's own belief about leading is the thing in question; a table that names
+nobody is read again, but no faster than the publisher could have written an answer - a
+range published before its leader is, and a shard that really has no leader, look identical
+from the client's side and only one of them is worth waiting out; a shard that refuses a
+read sends the client back for the new answer exactly once, and a second refusal is taken
+as the answer rather than retried; and a handle that has stopped working is dropped and
+rebuilt while the placement is left alone.  The last
 test is all real:
 a three-node cluster, a live metadata group, and a leader whose node is shut down
 while the client holds a table naming it.  The read still returns what was committed.
@@ -364,6 +367,12 @@ match field for field, refusals and "no value" included.  Then it drives a cross
 transaction with one client per shard, having first asserted that the two keys really
 are in different shards *and* in different Raft groups, so that a routing change cannot
 quietly turn it back into a single-shard test that still passes.
+`LocalNodeClientFactory` is the same claim about where clients come from.  It is keyed by
+a shard *and* a node id, because one server holds a node in every shard's Raft group and an
+id on its own would name the wrong one - the test asks for the same id in two shards and
+requires two clients - and it answers `None` rather than raising for a node it has no way
+to reach, which is a placement the table may well name and a client may never have been
+given a handle on.
 
 Three environment notes:
 
@@ -434,11 +443,21 @@ Honest list of what is *not* done, roughly in priority order.
 * **The gRPC client path is scaffolding.**  The contract exists - six node-level
   primitives in `proto/client.proto`, with a four-value `error_code` and a leader hint -
   and so does the in-process side of it: `oxidedb/client/node_client.py` is the protocol a
-  caller meets a shard through, and `LocalNodeClient` implements it over a node in this
-  process.  What does not exist is the remote side: no servicer answers those six calls
-  and no client speaks them over a channel.  The callers that will hold one - the
-  coordinator, the lock resolver, the SQL executor - still hold node objects directly,
-  which is why the client can only reach a shard in its own process.
+  caller meets a shard through, `LocalNodeClient` implements it over a node in this
+  process, and `LocalNodeClientFactory` is where a caller gets one.  Every caller that is
+  not the shard itself now holds one of those and nothing else: the coordinator, the lock
+  resolver, the SQL executor and the routing cache reach a shard through a `NodeClient`,
+  `client/routing.py` is the one place that turns a placement into a handle - from the
+  routing table when the client has a table, and from the cluster's own leader lookup when
+  it does not, which is the in-process case - so no caller outside `raft/` reads a node's
+  `state`, its state machine or its storage.
+  What does not exist is the remote side: no servicer answers those six calls, no client
+  speaks them over a channel, `RemoteNodeClient` has no implementation, and an election is
+  followed by reading the table again rather than by reaching a new address, so a client
+  still reaches a shard in its own process.  `RoutingCache.invalidate` is the hook that
+  path will want - the placement is not in doubt when a connection drops, only the way to
+  reach it - and nothing calls it yet, because a handle that is an object in this process
+  does not break.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
@@ -455,11 +474,14 @@ Honest list of what is *not* done, roughly in priority order.
   for are the one it routes by and the one its own split in flight will produce, which it
   is asked for rather than left to guess: a split reaches the group from the shard's own
   thread, so the publisher's first pass can find the table a step ahead of the cluster.
-  A client reads that table and routes by it (`metadata/cache.py`), reading it again when
-  a shard refuses a request, when the node it names has stopped leading, or when it names
-  nobody and the read being held is older than the publisher's own poll interval - a range
-  whose leader report has not been published yet and a shard that has no leader are the
-  same thing to a client, and only one of them is worth waiting out.
+  A client reads that table and routes by it (`metadata/cache.py`), and what a lookup
+  hands out is a client for the node it names rather than the node: it does not ask that
+  node whether it still leads, because the node it reached is the one whose belief is in
+  question.  What sends a client back to the table is the shard refusing the request
+  (`refresh_for_shard`, called by the caller that met the refusal) or a table that names
+  nobody while the read being held is older than the publisher's own poll interval - a
+  range whose leader report has not been published yet and a shard that has no leader are
+  the same thing to a client, and only one of them is worth waiting out.
   A split is wired end to end.  `split_shard` freezes the range, waits out the writes that
   were admitted before the freeze, refuses rather than copy under a lock that may be an
   unapplied commit, moves the rows above the split point into the new shard's group as the
@@ -503,8 +525,10 @@ oxidedb/
                  its publisher, and the client-side cache of what it says
   shard/         the one routing rule for keys to shards
   sql/           SQL parser and executor
-  client/        the six primitives a client may ask one node, and the in-process
-                 implementation of them (`proto/client.proto` is the wire form)
+  client/        the six primitives a client may ask one node, the in-process
+                 implementation of them, the factory a caller gets one from, and the one
+                 place a placement becomes a handle (`proto/client.proto` is the wire
+                 form)
   database.py    embedded single-process database (MVCC + local transactions)
   cli.py         command line front end for the embedded database
 docs/            design notes and posts

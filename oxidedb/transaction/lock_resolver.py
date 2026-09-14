@@ -24,8 +24,9 @@ import time
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from ..raft.node import MemoryRaftNode, NodeState
-from ..raft.state_machine import CommandType
+from ..client.node_client import NodeClient
+from ..client.routing import ShardLeaders, ask_shard
+from ..raft.state_machine import CommandType, serialize_command
 from ..shard.router import locate
 
 #: How long a lock has to sit untouched before it stops counting as "in flight".
@@ -58,39 +59,40 @@ class PrimaryStatus(Enum):
 
 
 class LockResolver:
-    def __init__(self, shard_cluster, lock_ttl: float = DEFAULT_LOCK_TTL):
+    def __init__(self, shard_cluster, lock_ttl: float = DEFAULT_LOCK_TTL, leaders=None):
         self._shard_cluster = shard_cluster
         self._lock_ttl = lock_ttl
+        #: Where the client that leads a shard comes from.  A coordinator hands in its
+        #: own, so that the lock a transaction left behind is settled by the same
+        #: placement that transaction read and wrote by; on its own - which is how the
+        #: lock cleaner uses it - this resolver routes by the cluster it was handed.
+        self._leaders = leaders if leaders is not None else ShardLeaders(shard_cluster)
 
     def _get_shard_id(self, key: bytes) -> int:
         return locate(self._shard_cluster._range_map, key)
 
-    def _get_shard_leader(self, shard_id: int) -> Optional[MemoryRaftNode]:
-        for server in self._shard_cluster._shard_servers.values():
-            node = server.get_shard_node(shard_id)
-            if node and node.state == NodeState.LEADER:
-                return node
-        return None
+    def _get_shard_leader(self, shard_id: int) -> Optional[NodeClient]:
+        """The client for whichever node leads ``shard_id``, or None."""
+        return self._leaders.leader_for_shard(shard_id)
 
     def lock_on(self, key: bytes) -> Optional[Dict[str, Any]]:
         """The lock a shard leader currently holds for ``key``, or None."""
-        leader = self._get_shard_leader(self._get_shard_id(key))
-        if leader is None:
+        client = self._get_shard_leader(self._get_shard_id(key))
+        if client is None:
             return None
-        return leader._state_machine.get_lock_status(key)
+        return client.get_lock(key)
 
     def primary_status(self, primary_key: bytes, start_ts: int) -> PrimaryStatus:
         """Ask the primary key's shard what happened to the transaction."""
-        leader = self._get_shard_leader(self._get_shard_id(primary_key))
-        if leader is None:
+        client = self._get_shard_leader(self._get_shard_id(primary_key))
+        if client is None:
             return PrimaryStatus.UNKNOWN
 
-        storage = leader._state_machine._storage
-        write_record = storage.get_latest_write(primary_key)
+        write_record = client.get_write_record(primary_key)
         if write_record is not None and write_record["start_ts"] == start_ts:
             return PrimaryStatus.COMMITTED
 
-        lock = storage.get_newest_lock(primary_key)
+        lock = client.get_lock(primary_key)
         if lock is not None and lock["start_ts"] == start_ts:
             if self.remaining_ttl(lock) > 0:
                 return PrimaryStatus.PENDING
@@ -99,11 +101,11 @@ class LockResolver:
 
     def primary_commit_ts(self, primary_key: bytes, start_ts: int) -> Optional[int]:
         """The timestamp the transaction committed at, if it did."""
-        leader = self._get_shard_leader(self._get_shard_id(primary_key))
-        if leader is None:
+        client = self._get_shard_leader(self._get_shard_id(primary_key))
+        if client is None:
             return None
 
-        write_record = leader._state_machine._storage.get_latest_write(primary_key)
+        write_record = client.get_write_record(primary_key)
         if write_record is not None and write_record["start_ts"] == start_ts:
             return write_record["commit_ts"]
 
@@ -174,19 +176,17 @@ class LockResolver:
             time.sleep(LOCK_WAIT_POLL_INTERVAL)
 
     def _settle(self, key: bytes, start_ts: int, command_type: bytes, **kwargs) -> bool:
-        leader = self._get_shard_leader(self._get_shard_id(key))
-        if leader is None:
-            return False
-
-        command = leader._state_machine.serialize_command(
+        command = serialize_command(
             command_type, key=key, start_ts=start_ts, **kwargs)
-        result = leader.propose(command)
-        if result.success:
+        result = ask_shard(self._leaders, self._get_shard_id(key),
+                           lambda client: client.propose(command))
+        if result is not None and result.success:
             return True
 
         # Somebody else - another reader, or the cleaner - may have settled this lock
         # in between.  What matters is whether the lock this caller asked about is
         # still there, not whether this particular proposal is the one that removed
-        # it.
+        # it, and a shard that refused because it no longer leads is in exactly that
+        # position: the question that decides it is the one asked above, of the lock.
         current = self.lock_on(key)
         return current is None or current["start_ts"] != start_ts

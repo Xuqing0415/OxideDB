@@ -20,6 +20,7 @@ import socket
 
 from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_metadata_client, wait_until
+from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster
 from oxidedb.raft.shard_server import ShardedRaftCluster
@@ -176,9 +177,12 @@ def test_a_split_publishes_two_ranges_and_the_rows_are_there_first():
 
         # A client that routes by the table now reads the moved row from the new
         # shard, and the source shard is taking writes for the range it kept.
-        cache = RoutingCache(cluster, client)
+        # The route and the handle behind it: the client the cache hands out is the
+        # one for the node the table names, which is the pair the factory is keyed by.
+        factory = LocalNodeClientFactory(cluster)
+        cache = RoutingCache(cluster, client, factory=factory)
         leader = cache.leader_for_key(MOVED_KEY)
-        assert leader is not None and leader.node_id == table.shard(NEW_SHARD).leader_id
+        assert leader is factory.get_client(NEW_SHARD, table.shard(NEW_SHARD).leader_id)
         assert leader.get(MOVED_KEY).value == b"moved"
 
         source = cluster.get_shard_server(left.nodes[0]).get_shard_node(0)

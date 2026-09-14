@@ -10,23 +10,28 @@ refusal goes back to the table and hands out the new answer.
 Being out of date is the normal case, not an error.  A shard's leader moves when its node
 dies, and the table learns about it on the publisher's next poll; in between, every client
 holding the old table is routing at a node that has stopped leading.  So a refresh is
-deliberately narrow - when a shard refuses a read, when the node the table names has
-stopped claiming leadership, and when it names nobody at all, which is also what a table
-read between the range and the leader report looks like.  It is never per key: the table is
-on the hot path, and a fetch per key is exactly what the cache exists to avoid.  The one
-repeated read is the nameless one, and it is rate-limited to the publisher's own poll
-period - see :data:`MISSING_LEADER_REFRESH_INTERVAL`.
+deliberately narrow - when a shard refuses a read, and when the table names nobody at all,
+which is also what a table read between the range and the leader report looks like.  It is
+never per key: the table is on the hot path, and a fetch per key is exactly what the cache
+exists to avoid.  The one repeated read is the nameless one, and it is rate-limited to the
+publisher's own poll period - see :data:`MISSING_LEADER_REFRESH_INTERVAL`.
 
-It says nothing about how the client reaches a shard once it knows where that shard is.
-Here it is an object in the same process; a networked client would take the address the
-table publishes for the same node, which is why the table carries addresses at all.
+The refusal is the caller's to notice, and that is why what this hands out is a client and
+not a node.  A node the table names is exactly the node whose own belief about leading is
+in question - one cut off from its peers goes on answering as if nothing had happened - so
+this file does not ask it, and does not read its state.  ``refresh_for_shard`` is what a
+caller that met a refusal calls; ``ask_shard`` in ``client/routing.py`` is that caller.
+
+It says nothing about how a client reaches a shard once it knows where that shard is: the
+factory does, and what this file decides is which node the factory is asked for.
 """
 
 import threading
 import time
 from typing import Optional
 
-from ..raft.node import MemoryRaftNode, NodeState
+from ..client.node_client import (LocalNodeClientFactory, NodeClient,
+                                  NodeClientFactory)
 from .service import MetadataClient, RoutingTable, ShardPlacement
 
 #: How long a client waits before reading a table again because it named no leader for a
@@ -43,9 +48,13 @@ class RoutingCache:
     """The cluster's placement as one client sees it, with a way to be told it is old."""
 
     def __init__(self, cluster, client: MetadataClient,
+                 factory: Optional[NodeClientFactory] = None,
                  missing_leader_refresh_interval: float = MISSING_LEADER_REFRESH_INTERVAL):
-        self._cluster = cluster
         self._client = client
+        #: How this client reaches a node the table names.  The cluster is enough to
+        #: build the in-process one, which is the only kind there is so far; a client
+        #: outside the process hands in the factory it reaches nodes through.
+        self._factory = factory if factory is not None else LocalNodeClientFactory(cluster)
         self._lock = threading.RLock()
         #: How long a nameless leader is believed for.  A caller that knows the publisher
         #: writes faster than this can pass a shorter one; nothing should pass a longer
@@ -70,8 +79,8 @@ class RoutingCache:
         """A cache for a cluster that publishes to a metadata group, or None.
 
         None is the honest answer for a cluster started without a metadata service:
-        there is no table to read, and the caller keeps the older behaviour of looking
-        at the cluster's own nodes.
+        there is no table to read, and the caller routes by the cluster's own nodes
+        instead - which is what ``ShardLeaders`` does when it is given no router.
         """
         client = cluster.metadata_client()
         if client is None:
@@ -107,12 +116,15 @@ class RoutingCache:
         """Where the table says ``key`` lives."""
         return self.table().shard_for(key)
 
-    def leader_for_shard(self, shard_id: int) -> Optional[MemoryRaftNode]:
-        """The node the table names as ``shard_id``'s leader, if it is still leading.
+    def leader_for_shard(self, shard_id: int) -> Optional[NodeClient]:
+        """The client for the node the table names as ``shard_id``'s leader.
 
-        A table that names a node which has since stepped down is stale in the one way
-        this layer can detect by itself, so the lookup re-reads the table rather than
-        handing back a node it can see is not the leader.
+        The table is the answer, and this lookup does not also ask the node whether it
+        still leads.  The node it reached is the one whose belief is in question, so a
+        leader that has been cut off from its peers goes on answering reads as if
+        nothing had happened - and that is an answer a client cannot tell from the right
+        one.  What it can tell is a refusal, and a refusal is the shard's to give, not
+        this file's: ``ask_shard`` is what acts on it.
 
         A table that names nobody is answered as it stands, but only for as long as that
         answer could still be current.  It has two causes that look identical from here:
@@ -122,14 +134,35 @@ class RoutingCache:
         answer ``None`` for ever for the second one, so it reads again once the publisher
         has had time to write; see :data:`MISSING_LEADER_REFRESH_INTERVAL`.
         """
-        node = self._node_for(shard_id)
-        if node is None:
+        client = self._client_for(shard_id)
+        if client is None:
             self._refresh_if_it_could_have_changed()
-            return self._node_for(shard_id)
-        if node.state != NodeState.LEADER:
-            self.refresh()
-            return self._node_for(shard_id)
-        return node
+            return self._client_for(shard_id)
+        return client
+
+    def refresh_for_shard(self, shard_id: int) -> None:
+        """Read the table again, because ``shard_id`` refused this client.
+
+        The shard id is what the caller has - it is what the caller was asking about -
+        and the read it causes is of the whole table, because the table is whole: a
+        placement is not per key, so a client that refreshed one shard's entry would be
+        holding one decision split into two.
+        """
+        self.refresh()
+
+    def invalidate(self, shard_id: int) -> None:
+        """Forget this client's handle on the node the table names for ``shard_id``.
+
+        For a handle that has stopped working - a connection that dropped - which is not
+        a table that has gone old: the placement is not in doubt, only the way to reach
+        it.  Nothing calls this yet, because every handle so far is an object in this
+        process, and an object in this process does not break; it is the hook a
+        networked client needs.
+        """
+        placement = self.table().shard(shard_id)
+        if placement is None or placement.leader_id is None:
+            return
+        self._factory.forget_client(shard_id, placement.leader_id)
 
     def _refresh_if_it_could_have_changed(self) -> None:
         """Read the table again, unless the read being held is too recent to be improved on.
@@ -143,18 +176,16 @@ class RoutingCache:
                 return
         self.refresh()
 
-    def leader_for_key(self, key: bytes) -> Optional[MemoryRaftNode]:
-        """The node the table says should answer for ``key``."""
+    def leader_for_key(self, key: bytes) -> Optional[NodeClient]:
+        """The client for the node the table says should answer for ``key``."""
         placement = self.shard_for(key)
         if placement is None:
             return None
         return self.leader_for_shard(placement.shard_id)
 
-    def _node_for(self, shard_id: int) -> Optional[MemoryRaftNode]:
+    def _client_for(self, shard_id: int) -> Optional[NodeClient]:
+        """The factory's client for the node the table names for ``shard_id``."""
         placement = self.table().shard(shard_id)
         if placement is None or placement.leader_id is None:
             return None
-        server = self._cluster.get_shard_server(placement.leader_id)
-        if server is None:
-            return None
-        return server.get_shard_node(shard_id)
+        return self._factory.get_client(shard_id, placement.leader_id)

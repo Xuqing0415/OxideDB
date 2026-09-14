@@ -4,15 +4,21 @@ from typing import Dict, List, Optional, Tuple
 
 import msgpack
 
-from ..raft.node import NodeState
-from ..raft.state_machine import CommandType
+from ..client.node_client import LocalNodeClientFactory, NodeClientFactory
+from ..client.routing import ShardLeaders
+from ..raft.state_machine import CommandType, ErrorCode, ScanRefused, serialize_command
 from ..storage.engine import next_key
 from .parser import SQLParser, SelectStatement, InsertStatement
 
 
 class SQLExecutor:
-    def __init__(self, shard_cluster):
+    def __init__(self, shard_cluster, factory: Optional[NodeClientFactory] = None):
         self._shard_cluster = shard_cluster
+        #: One factory for the whole executor: a scan of every shard asks it for a
+        #: client per replica, and building one per range read would be building one
+        #: per key of the range in any implementation where a handle is a connection.
+        self._factory = factory if factory is not None else LocalNodeClientFactory(shard_cluster)
+        self._leaders = ShardLeaders(shard_cluster, factory=self._factory)
         self._parser = SQLParser()
     
     def execute(self, sql: str) -> List[Dict[str, any]]:
@@ -35,12 +41,11 @@ class SQLExecutor:
             # key schema: "{table}:{id_value}"，与 INSERT 写入路径保持一致
             key = f"{stmt.table.lower()}:{value}".encode()
 
-            leader_info = self._shard_cluster.get_leader_for_key(key)
-            if leader_info is None:
+            client = self._leaders.leader_for_key(key)
+            if client is None:
                 return []
 
-            _, leader = leader_info
-            result = leader.get(key)
+            result = client.get(key)
 
             if result.success and result.value:
                 # 优先按 msgpack dict 反序列化整行；失败则降级为原始 bytes（兼容直接 SET 的旧数据）
@@ -61,18 +66,40 @@ class SQLExecutor:
     
     def _execute_full_scan(self, stmt: SelectStatement) -> List[Dict[str, any]]:
         all_results = []
-        
-        for server in self._shard_cluster._shard_servers.values():
-            for shard_id in range(len(server._shards)):
-                node = server.get_shard_node(shard_id)
-                if node and node.state == NodeState.LEADER:
-                    scan_result = node._state_machine.scan(b"", b"\xff")
-                    for key, value in scan_result:
-                        if key.decode().startswith(f"{stmt.table}:"):
-                            _, column_value = key.decode().split(":", 1)
-                            all_results.append({column_value: value.decode()})
-        
+
+        for key, value in self._rows_from_every_shard(b"", b"\xff"):
+            if key.decode().startswith(f"{stmt.table}:"):
+                _, column_value = key.decode().split(":", 1)
+                all_results.append({column_value: value.decode()})
+
         return all_results
+
+    def _rows_from_every_shard(self, start_key: bytes,
+                               end_key: bytes) -> List[Tuple[bytes, bytes]]:
+        """Every row in the range, from whichever replica of each shard leads it.
+
+        A range read goes through a client, and a replica that is not its shard's
+        leader refuses the read instead of answering it - which is what makes it safe
+        to ask every replica and keep the answers: a follower's rows are rows that
+        shard has not promised, and a follower says so rather than handing them over.
+        A refusal that is not "not the leader" - a lock in the way - is raised, since
+        for that one there is nothing to keep and nobody else to ask.
+        """
+        rows: List[Tuple[bytes, bytes]] = []
+
+        for shard_id in self._shard_cluster.shard_ids():
+            for node_id in self._shard_cluster.shard_replica_ids(shard_id):
+                client = self._factory.get_client(shard_id, node_id)
+                if client is None:
+                    continue
+                try:
+                    rows.extend(client.scan(start_key, end_key))
+                except ScanRefused as refusal:
+                    if refusal.error_code == ErrorCode.ERR_NOT_LEADER:
+                        continue
+                    raise
+
+        return rows
     
     def _execute_range_scan(self, stmt: SelectStatement, where_condition: Tuple) -> List[Dict[str, any]]:
         column, operator, value = where_condition
@@ -106,14 +133,9 @@ class SQLExecutor:
         all_results = []
         shard_results = []
 
-        for server in self._shard_cluster._shard_servers.values():
-            for shard_id in range(len(server._shards)):
-                node = server.get_shard_node(shard_id)
-                if node and node.state == NodeState.LEADER:
-                    scan_result = node._state_machine.scan(start_key, end_key)
-                    for key, value in scan_result:
-                        if key.decode().startswith(f"{table_name}:"):
-                            shard_results.append((key, value))
+        for key, value in self._rows_from_every_shard(start_key, end_key):
+            if key.decode().startswith(f"{table_name}:"):
+                shard_results.append((key, value))
 
         sorted_results = sorted(shard_results, key=lambda x: x[0])
 
@@ -141,22 +163,20 @@ class SQLExecutor:
         row_id = stmt.values[0]
         row_key = f"{stmt.table.lower()}:{row_id}".encode()
 
-        leader_info = self._shard_cluster.get_leader_for_key(row_key)
-        if leader_info is None:
+        client = self._leaders.leader_for_key(row_key)
+        if client is None:
             return []
-
-        _, leader = leader_info
 
         # 整行序列化为 msgpack dict，列名统一小写以保持大小写无关
         row = {col.lower(): val for col, val in zip(stmt.columns, stmt.values)}
         value_bytes = msgpack.packb(row, use_bin_type=True)
 
-        command = leader._state_machine.serialize_command(
+        command = serialize_command(
             CommandType.SET,
             key=row_key,
             value=value_bytes,
             timestamp=int(time.time() * 1000000),
         )
-        leader.propose(command)
+        client.propose(command)
 
         return [{"result": "inserted"}]
