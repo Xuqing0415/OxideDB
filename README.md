@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 198 tests, roughly five minutes
+pytest tests -q             # 204 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -214,7 +214,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-198 tests.  `tests/test_durability.py` covers the correctness properties that
+204 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -373,6 +373,16 @@ id on its own would name the wrong one - the test asks for the same id in two sh
 requires two clients - and it answers `None` rather than raising for a node it has no way
 to reach, which is a placement the table may well name and a client may never have been
 given a handle on.
+`tests/test_client_boundary.py` is what keeps all of that true.  It scans the package's
+source for the three ways a caller could skip the seam - a state machine, a storage, or a
+node's own `state` - and fails if one appears in a file that is not the shard itself or a
+component running inside the cluster, with the allowlist written out and each entry saying
+what it is doing there.  It is a gatekeeper and not a behaviour test, in the same spirit as
+`tests/test_error_codes.py`: a new reach-in does not fail any test while the code it
+reaches into is in the same process, which is exactly why one file here is about the shape
+of the code rather than what it answers.  Three of its tests are controls - a source line
+that reaches in is built in memory and the scan has to point at it - because a scan that
+never fails is not evidence of anything.
 
 Three environment notes:
 
@@ -449,8 +459,9 @@ Honest list of what is *not* done, roughly in priority order.
   resolver, the SQL executor and the routing cache reach a shard through a `NodeClient`,
   `client/routing.py` is the one place that turns a placement into a handle - from the
   routing table when the client has a table, and from the cluster's own leader lookup when
-  it does not, which is the in-process case - so no caller outside `raft/` reads a node's
-  `state`, its state machine or its storage.
+  it does not, which is the in-process case - and `tests/test_client_boundary.py` is what
+  keeps it that way: no caller outside `raft/` reads a node's `state`, its state machine or
+  its storage.
   What does not exist is the remote side: no servicer answers those six calls, no client
   speaks them over a channel, `RemoteNodeClient` has no implementation, and an election is
   followed by reading the table again rather than by reaching a new address, so a client
