@@ -6,6 +6,12 @@ the last election.  This is the thread that tells it - the same shape as the loc
 cleaner, and for the same reason: a protocol that only tests run is a protocol that
 does not run.
 
+It reaches the table's group the way a client does, over a channel that follows the name a
+refusal gives.  A node that leads a shard is usually not the node that leads the table's
+group, so a publisher that could only propose to a group it led itself would have nothing
+to say about the shards the other nodes won - the leader column is exactly the part of the
+table that no single node can fill in alone.
+
 It publishes on change rather than on a timer.  The ranges and each shard's replica set
 are proposed once, and a leader report only when the leader or its term moved, because
 the table is read by every client that routes a key: a pass that rewrote it every poll
@@ -23,7 +29,6 @@ from typing import Any, Dict, Optional, Tuple
 
 from ..raft.node import NodeState
 from ..raft.state_machine import ErrorCode
-from .service import MetadataClient
 
 #: How often the publisher looks for something to say.  The table is on nobody's hot
 #: path, so this only decides how long a leader change takes to become visible.
@@ -33,6 +38,13 @@ DEFAULT_PUBLISH_INTERVAL = 0.5
 class MetadataPublisher:
     """Publishes this cluster's placement into the metadata group.
 
+    ``client`` is the table's group, used through four methods - ``init_routes``,
+    ``set_shard_nodes``, ``report_leader`` and ``table`` - and it is deliberately not
+    named as a type here: the in-process ``MetadataClient`` and the ``RemoteMetadataClient``
+    a node in a process of its own holds both provide them, and which one is handed in is
+    the difference between a publisher that can only speak when it leads the group and one
+    that can always speak.
+
     ``shard_cluster`` is used through five methods - ``range_map``, ``shard_ids``,
     ``shard_replica_ids``, ``shard_addresses`` and ``shard_leader`` - which is the whole
     of what the table needs to know about a cluster.  A cluster that can also say which
@@ -40,7 +52,7 @@ class MetadataPublisher:
     concludes that the table belongs to somebody else.
     """
 
-    def __init__(self, client: MetadataClient, shard_cluster,
+    def __init__(self, client, shard_cluster,
                  poll_interval: float = DEFAULT_PUBLISH_INTERVAL):
         self._client = client
         self._cluster = shard_cluster

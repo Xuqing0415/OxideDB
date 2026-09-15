@@ -26,6 +26,11 @@ the first writer wins and every other node is refused, which is why all of them 
 and it sweeps the locks of the shards it leads (``LockCleaner``).  Both are background
 threads, and both are stopped before the groups they talk to are.
 
+The report goes over the group's own port - the same walk a client makes, following the
+name a refusal gives - because the node that leads a shard is usually not the node that
+leads the table's group.  A publisher holding a node object could only speak while its own
+node led that group, which left the leader column empty for every shard somebody else won.
+
 Every group answers two kinds of caller, and one server carries both: the Raft traffic its
 own members send it, and the one question a client outside the cluster has - the whole table
 for the metadata group, a run of timestamps for the TSO group.  A member that is not leading
@@ -47,6 +52,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .client import RemoteMetadataClient
 from .metadata.publisher import MetadataPublisher
 from .metadata.service import (MetadataClient, MetadataStateMachine,
                                 add_metadata_services_to_server)
@@ -405,6 +411,7 @@ class ClusterNode:
         self._metadata_node: Optional[MemoryRaftNode] = None
         self._tso_node: Optional[MemoryRaftNode] = None
         self._metadata_client: Optional[MetadataClient] = None
+        self._metadata_writer: Optional[RemoteMetadataClient] = None
         self._publisher: Optional[MetadataPublisher] = None
         self._lock_cleaner: Optional[LockCleaner] = None
         self._storages: List[RaftStorage] = []
@@ -592,6 +599,22 @@ class ClusterNode:
         print(f"{name}: {address} (peers {sorted(peers)})", flush=True)
         return node
 
+    def _metadata_group_seeds(self) -> List[str]:
+        """Where the table's group listens, this node's own address first.
+
+        Every member is in the list because any of them may lead it, and the order is the
+        only optimisation: the client that walks these addresses remembers the one that
+        answered, so a node that leads the group pays one hop and a node that does not pays
+        two - which is what the name in a refusal is for.
+        """
+        voters = self._config.voters(self._config.metadata_group_size)
+        seeds = [self._config.metadata_address(node_id) for node_id in voters]
+        own = self._config.metadata_address()
+        if own in seeds:
+            seeds.remove(own)
+            seeds.insert(0, own)
+        return seeds
+
     def _metadata_leader(self) -> Optional[MemoryRaftNode]:
         """The metadata member to ask, or None while this node is not the leader."""
         node = self._metadata_node
@@ -606,9 +629,16 @@ class ClusterNode:
         and a refusal from a table that already holds them is the ordinary case rather
         than an error - see :class:`~oxidedb.metadata.publisher.MetadataPublisher`.  A
         second INIT_ROUTES here would make a refusal mean two different things.
+
+        The client it writes through is the socket's rather than this node's: the group's
+        leader is whichever node won that election, and a publisher holding a node object
+        could only get a command in on the passes that coincided with its own node leading.
+        The seeds are the group's members with this node first, so a command costs one hop
+        when this node does lead and two when it does not.
         """
         if self._config.bootstrap and self._metadata_node is not None:
-            self._publisher = MetadataPublisher(self._metadata_client, self._view)
+            self._metadata_writer = RemoteMetadataClient(self._metadata_group_seeds())
+            self._publisher = MetadataPublisher(self._metadata_writer, self._view)
             self._publisher.start()
 
         self._lock_cleaner = LockCleaner(self._view,
@@ -635,6 +665,9 @@ class ClusterNode:
         that ran on after its group had stopped would spend the time reporting failures,
         and the point of the order is that nothing writes once nothing is listening.
 
+        The publisher's client is closed here too: its channels are its own, and a socket
+        left open by a stopped thread is a socket nobody is going to close.
+
         The shards go next, and each of them stops its gRPC server and its node together -
         ``ShardServer.shutdown`` is one call for both, so "stop accepting" and "stop the
         node" are one step here rather than two.  It is the same order for the two groups
@@ -647,6 +680,10 @@ class ClusterNode:
         for stopper in (self._publisher, self._lock_cleaner):
             if stopper is not None:
                 stopper.stop()
+
+        if self._metadata_writer is not None:
+            self._metadata_writer.close()
+            self._metadata_writer = None
 
         if self._shard_server is not None:
             self._shard_server.shutdown()
