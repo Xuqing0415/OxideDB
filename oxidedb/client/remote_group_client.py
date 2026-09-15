@@ -16,7 +16,10 @@ seeds for that, and only when none of them answers does it become the caller's p
 The table's client keeps the table the way its in-process twin does, and rebuilds it through
 the table's own parse: what arrives on the wire is turned back into the payload
 ``_parse_table`` reads, so a record and a table field cannot come to mean two things in two
-parsers.
+parsers.  It also carries the table's three writes, because the table has a writer that is a
+client like any other - the cluster's publisher - and a publisher on a node that does not lead
+the group still has to get its command in.  A write is the walk a read makes, with the command
+the group's own state machine serialised in place of the question.
 """
 
 import threading
@@ -24,11 +27,16 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import grpc
 
-from oxidedb.proto import groups_pb2
+from oxidedb.proto import client_pb2, groups_pb2
+from oxidedb.proto.client_pb2_grpc import ClientServiceStub
 from oxidedb.proto.groups_pb2_grpc import MetadataServiceStub, TSOServiceStub
 
 from ..channels import ChannelPool, DEFAULT_TIMEOUT
-from ..metadata.service import RoutingTable, ShardPlacement, _parse_table
+from ..groups import local_code
+from ..metadata.service import (MetadataCommandType, RoutingTable, ShardPlacement,
+                                _parse_table, serialize_metadata_command)
+from ..raft.state_machine import ApplyResult, ErrorCode
+from ..shard.router import RangeMap
 from ..tso.tso import DEFAULT_BATCH_SIZE
 from .node_client import NodeUnreachable
 
@@ -83,9 +91,13 @@ class _GroupClient:
     def _ask(self, stub_type, method_name: str, request):
         """One call, at whichever address answers it.  Raises if none of them does.
 
-        The answer is the first one that is not a refusal, and a refusal is the last one
-        seen if no address answered at all - which is what a group with no leader looks
-        like from outside: every member says ask the leader, and none of them is it.
+        The answer is the first one that is not a refusal.  A refusal that names the leader
+        is not one: it is the walk's next step.  If no address answers the call at all, the
+        last of those is what the caller hears, because a group with no leader looks like
+        exactly that from outside - every member says ask the leader, and none of them is
+        it.  A member that refused the call itself outranks all of them, wherever in the
+        walk it arrived: it answered, and "the group will not take this command" is a
+        different answer from "ask somebody else" for the caller that has to act on it.
         """
         answered = None
         unanswered: List[str] = []
@@ -108,7 +120,8 @@ class _GroupClient:
                 with self._lock:
                     self._preferred = address
                 return response
-            answered = response
+            if answered is None or answered.error_code == groups_pb2.NOT_LEADER:
+                answered = response
             hint = response.leader_address if response.HasField("leader_address") else None
             if response.error_code == groups_pb2.NOT_LEADER and hint and hint not in asked:
                 pending.insert(0, hint)
@@ -155,15 +168,19 @@ def _payload(response) -> Dict[str, Any]:
 
 
 class RemoteMetadataClient(_GroupClient):
-    """The routing table, read from whichever node of its group answers.
+    """The routing table, read and written from whichever node of its group answers.
 
-    Reads only, and that is deliberate: a client routes by the table, and what writes the
-    table is the cluster.  The table is cached the way its in-process twin caches it, so a
-    lookup costs nothing until a refresh and ``table`` reads it the first time.
+    Reads are what a client that routes a key does with it: the table is cached the way its
+    in-process twin caches it, so a lookup costs nothing until a refresh and ``table`` reads
+    it the first time.  What it does not have is a refresh loop - its in-process twin is held
+    by a caller that already knows when to re-read, because a shard refused this client and
+    the placement is therefore in doubt - and this one is read on the same terms.
 
-    What it does not have is a refresh loop.  Its in-process twin is held by a caller that
-    already knows when to re-read - a shard refused this client, so the placement is in
-    doubt - and this one is read by the caller on the same terms.
+    The three writes are the cluster's, and they make the walk worth having: a publisher on a
+    node that does not lead the group is refused and told where the leader is, so its command
+    lands on the pass it was proposed rather than on whichever poll happens to coincide with
+    an election.  Each write answers with the result a caller acts on, and a successful one
+    drops the cached table, because a table served from before a write routes by it.
     """
 
     def __init__(self, seeds: Sequence[str],
@@ -208,6 +225,69 @@ class RemoteMetadataClient(_GroupClient):
     def list_shards(self) -> List[ShardPlacement]:
         """Every shard in the table, for a caller that wants all of it."""
         return list(self.table().shards.values())
+
+    # -- writes ------------------------------------------------------------
+
+    def init_routes(self, ranges: RangeMap) -> ApplyResult:
+        """Install the starting ranges.  Refused if the table already has any."""
+        return self._propose(
+            MetadataCommandType.INIT_ROUTES,
+            ranges=[[shard_id, start, end]
+                    for shard_id, (start, end) in sorted(ranges.items())],
+        )
+
+    def set_shard_nodes(self, shard_id: int, nodes: List[int],
+                        addresses: Optional[Dict[int, str]] = None) -> ApplyResult:
+        """Record which nodes serve a shard, and where they listen."""
+        return self._propose(
+            MetadataCommandType.SET_SHARD_NODES,
+            shard_id=shard_id,
+            nodes=list(nodes),
+            addresses=[[node_id, address]
+                       for node_id, address in sorted((addresses or {}).items())],
+        )
+
+    def report_leader(self, shard_id: int, node_id: int, term: int) -> ApplyResult:
+        """Record that ``node_id`` leads ``shard_id`` at ``term``.
+
+        A refused report is not necessarily a problem: a report that arrives after a newer
+        one is meant to lose, and the table keeps the newest claim.
+        """
+        return self._propose(
+            MetadataCommandType.REPORT_LEADER,
+            shard_id=shard_id, node_id=node_id, term=term,
+        )
+
+    def _propose(self, cmd_type: bytes, **kwargs) -> ApplyResult:
+        """One command, at whichever address takes it.  A refusal is returned, not raised.
+
+        The bytes are the machine's own - ``serialize_metadata_command``, which is what the
+        group parses - and the address is the walk's: a member that does not lead refuses and
+        names the leader, so the command lands where it can be applied instead of being
+        answered with somewhere else to ask.
+
+        One attempt, where the in-process twin tries three times.  That one waits because it
+        can only ask the leader it already has; this one has followed the leader's name to
+        get here, so a refusal means every address it knows has refused, and the caller's next
+        move is a fresh read of the group rather than another round of the same.
+        """
+        command = serialize_metadata_command(cmd_type, **kwargs)
+        try:
+            response = self._ask(ClientServiceStub, "Propose",
+                                 client_pb2.ProposeRequest(command=command))
+        except NodeUnreachable as nothing_answered:
+            # No address answered, which from the caller's side is a group with no leader:
+            # the command was not proposed anywhere, and the pass after this one tries again.
+            return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, str(nothing_answered))
+
+        if response.error_code != client_pb2.OK:
+            return ApplyResult.failure(local_code(response.error_code), response.message)
+
+        with self._lock:
+            self._table = None
+        return ApplyResult.success(
+            data=response.data if response.HasField("data") else None,
+            index=response.index if response.HasField("index") else None)
 
 
 class RemoteTSOClient(_GroupClient):

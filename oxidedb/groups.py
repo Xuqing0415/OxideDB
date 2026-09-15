@@ -7,7 +7,8 @@ and both classify the group's own error codes the same way.
 
 The messages differ (a table and a range of timestamps are not the same message), so what
 is shared is the two things that go into every answer the same way: the code a client acts
-on, and the leader's address on the one refusal that has somewhere to send it.
+on, and the leader's address on the one refusal that has somewhere to send it - and, on the
+client's side of the wire, the way back from that code to the one a caller branches on.
 """
 
 from typing import Any, Callable, Dict, Optional
@@ -28,6 +29,24 @@ def wire_code(error_code: Optional[int]) -> int:
     if is_not_leader(error_code):
         return groups_pb2.NOT_LEADER
     return groups_pb2.REFUSED
+
+
+def local_code(error_code: Optional[int]) -> int:
+    """The group's own code for a wire classification a caller has just read.
+
+    The other direction of :func:`wire_code`, and the one place a client of a wire
+    service reads a refusal: a shard's client service answers with the same four values as
+    these two groups - that is why the two enums are written out the same way - so the way
+    back is written out once as well.
+
+    Only two of the four have a code of their own, because a caller branches on two of
+    them: NOT_LEADER has somewhere to send the caller, and LOCKED is the one a resolver
+    has to unpick.  A refusal that answers no is the code for a command the machine would
+    not apply, which is what it was, and the message that came with it says why.
+    """
+    return {groups_pb2.NOT_LEADER: ErrorCode.ERR_NOT_LEADER,
+            groups_pb2.LOCKED: ErrorCode.ERR_LOCKED}.get(
+                error_code, ErrorCode.ERR_APPLY_ERROR)
 
 
 def refusal(message: str, error_code: Optional[int],

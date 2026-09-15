@@ -29,7 +29,8 @@ from oxidedb.proto import client_pb2
 from oxidedb.proto.client_pb2_grpc import ClientServiceStub
 
 from ..channels import ChannelPool, DEFAULT_TIMEOUT
-from ..raft.state_machine import ApplyResult, ErrorCode, ReadResult, ScanRefused
+from ..groups import local_code
+from ..raft.state_machine import ApplyResult, ReadResult, ScanRefused
 from .node_client import NodeClient, NodeClientFactory, NodeUnreachable
 from .remote_group_client import RemoteMetadataClient, RemoteTSOClient
 
@@ -140,16 +141,11 @@ class RemoteNodeClient:
     def _failure(response):
         """A refusal's code, message and hint, in the shapes the caller expects.
 
-        The classification is turned back into a code here, which is where the loss
-        happens: LOCKED and NOT_LEADER have codes of their own because callers branch on
-        them, and everything else is a command the machine would not apply.  See the
-        module docstring.
+        The classification is turned back into a code by the one function that does it
+        (``groups.local_code``), which is where the loss happens: see the module docstring.
         """
-        code = {client_pb2.NOT_LEADER: ErrorCode.ERR_NOT_LEADER,
-                client_pb2.LOCKED: ErrorCode.ERR_LOCKED}.get(
-                    response.error_code, ErrorCode.ERR_APPLY_ERROR)
         hint = response.leader_address if response.HasField("leader_address") else None
-        return code, response.message, hint
+        return local_code(response.error_code), response.message, hint
 
 
 class RemoteNodeClientFactory:
