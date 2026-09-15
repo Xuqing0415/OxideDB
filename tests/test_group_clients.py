@@ -14,13 +14,16 @@ test that only used the client could not tell a hint that was followed from a se
 happened to work.  Those two tests read the refusal with the raw stub first, assert what it
 says, and then require the client to get the table out of exactly that address.
 
-What the table says about a shard's leader is asserted twice, and differently, because in a
-cluster of processes it does not always say anything.  Only the node that leads the
-metadata group can propose to it - a member that does not lead that group refuses, and
-nothing on the wire forwards a proposal - so a shard led by another node is published with
-its replica set and its addresses and no leader.  The one-node cluster below is where the
-leader column is checked on its own, because there the node leads everything and the answer
-is not a race; the three-node cluster checks that a leader which *is* named is a real one.
+What the table says about a shard's leader is asserted twice, and the same way in both
+clusters: every node here runs a publisher, each of them reports the shards it leads, and a
+report reaches whichever member leads the table's group - over the same walk a client makes,
+following the name a refusal gives.  That walk is what makes the column fillable at all: the
+node leading a shard is usually not the node leading the group, and a publisher that could
+only propose to a group it led itself would publish a shard's replica set and its addresses
+and no leader.  Which is why that cluster is given four shards: with one, a publisher that
+cannot reach the group would look healthy every time the shard's election happened to land
+on the node that leads it.  The one-node cluster keeps its own test because there the answer
+is not a race: the only node it could name is the one that answered.
 
 A proposal is now something a client outside the cluster can make at all.  A member answers
 one by refusing and naming the leader, which is the path a read already walked, so the table
@@ -49,13 +52,19 @@ from oxidedb.shard.router import default_range_map
 
 @pytest.fixture(scope="module")
 def cluster(tmp_path_factory):
-    """Three nodes with two shards each: groups to lead, and members that do not lead them.
+    """Three nodes with four shards each: groups to lead, and members that do not lead them.
 
-    Module-wide because a cluster costs three processes and three elections, and because
-    no test here spoils another one's reading: the table only ever gains a leader report,
-    and the clock only ever moves forward.
+    Four shards rather than one so that the leader column cannot be filled in by accident: a
+    shard's leader is reported by the node that leads it, so a table that names every shard's
+    leader is only evidence of a publisher reaching a group it does not lead if the shards did
+    not all elect that group's leader.  Three nodes so that there is always a member that
+    does not lead.
+
+    Module-wide because a cluster costs three processes and a handful of elections, and
+    because no test here spoils another one's reading: the table only ever gains a leader
+    report, and the clock only ever moves forward.
     """
-    with start_cluster(num_nodes=3, num_shards=2,
+    with start_cluster(num_nodes=3, num_shards=4,
                        base_dir=str(tmp_path_factory.mktemp("oxidedb-groups"))) as running:
         yield running
 
@@ -64,9 +73,8 @@ def cluster(tmp_path_factory):
 def one_node(tmp_path_factory):
     """One node with two shards, which is the leader of every group it holds.
 
-    Where the three-node cluster cannot promise that a shard's leader gets published at
-    all - see the module docstring - this one can, so the leader column is checked here
-    rather than behind a condition.
+    Where the three-node cluster's leader column is waited for, this one's is decided: a
+    single node leads everything, so there is nothing to race and nobody else it could name.
     """
     with start_cluster(num_nodes=1, num_shards=2,
                        base_dir=str(tmp_path_factory.mktemp("oxidedb-one-node"))) as running:
@@ -132,6 +140,23 @@ def _published_table(client, num_shards):
         return None
     if any(not placement.nodes or not placement.addresses
            for placement in table.shards.values()):
+        return None
+    return table
+
+
+def _table_with_every_leader(client, num_shards):
+    """The table, once every shard's leader has been published.  ``None`` until then.
+
+    The leader column arrives on its own schedule and from more than one node: a publisher
+    reports the shards its own node leads, so a shard led elsewhere is named by that node's
+    publisher or by nobody.  Waiting for the whole column is what makes the assertions
+    below about the cluster's publishing rather than about how long a test was willing to
+    look.
+    """
+    table = _published_table(client, num_shards)
+    if table is None:
+        return None
+    if any(placement.leader_id is None for placement in table.shards.values()):
         return None
     return table
 
@@ -238,24 +263,26 @@ class TestTheRoutingTableOverTheWire:
                 with socket.create_connection((host, int(port)), timeout=2.0):
                     pass
 
-    def test_a_leader_the_table_names_is_a_node_that_serves_that_shard(
+    def test_every_shard_is_given_a_leader_that_really_serves_it(
             self, cluster, open_client):
-        """Whatever is said about a leader has to be a node that can answer for the shard.
+        """Every shard gets a leader named, and it is a node that can answer for it.
 
-        What this does not require is that every shard has a leader named in the table, for
-        the reason the module docstring gives: only the node that leads the metadata group
-        can propose a leader report to it, so a shard led elsewhere is published without
-        one.  That is a gap in the cluster's publishing rather than in the table, and the
-        README's Known gaps says what it costs and what closing it would take.  Here the
-        assertion is that a leader which *is* named is real and reachable.
+        The leader of a shard is usually not the node that leads the table's group, so this
+        is where a publisher reaching a group it does not lead is pinned: a publisher that
+        could only propose where it led would leave a shard led elsewhere with its range and
+        its replica set and no leader, and no amount of waiting would change that.  What is
+        named is then checked against the cluster - the node has to be in the replica set,
+        the address the table gives has to be the one that shard really listens on, and
+        something has to be listening there.  Four shards are what make this the ordinary case
+        rather than a lucky one: for it to pass without the publisher reaching a group it does
+        not lead, every shard's election would have to land on the group's own leader too.
         """
         client = open_client(RemoteMetadataClient, cluster.metadata_seeds)
-        table = wait_until(_asking(lambda: _published_table(client, cluster.num_shards)),
-                           message="the table was never read over the wire")
+        table = wait_until(
+            _asking(lambda: _table_with_every_leader(client, cluster.num_shards)),
+            message="a shard's leader was never published")
 
         for placement in table.shards.values():
-            if placement.leader_id is None:
-                continue
             assert placement.leader_id in placement.nodes
             assert placement.leader_address() == cluster.shard_address(
                 placement.shard_id, placement.leader_id)
@@ -304,16 +331,9 @@ class TestTheRoutingTableOverTheWire:
         """
         client = open_client(RemoteMetadataClient, one_node.metadata_seeds)
 
-        def settled():
-            table = _published_table(client, one_node.num_shards)
-            if table is None:
-                return None
-            if any(placement.leader_id is None for placement in table.shards.values()):
-                return None
-            return table
-
-        table = wait_until(_asking(settled),
-                           message="one node never named itself as a shard's leader")
+        table = wait_until(
+            _asking(lambda: _table_with_every_leader(client, one_node.num_shards)),
+            message="one node never named itself as a shard's leader")
 
         assert table.routes() == default_range_map(one_node.num_shards)
         for placement in table.shards.values():
