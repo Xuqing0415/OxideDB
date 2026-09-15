@@ -21,6 +21,14 @@ nothing on the wire forwards a proposal - so a shard led by another node is publ
 its replica set and its addresses and no leader.  The one-node cluster below is where the
 leader column is checked on its own, because there the node leads everything and the answer
 is not a race; the three-node cluster checks that a leader which *is* named is a real one.
+
+A proposal is now something a client outside the cluster can make at all.  A member answers
+one by refusing and naming the leader, which is the path a read already walked, so the table
+can be written from a node that does not lead its group.  Nothing forwards a proposal on the
+service's behalf - the caller is the one that moves - and the writes below are what that
+buys: the placement the group already holds, written back through a member that does not
+lead; a command the table will not take, answered as a refusal rather than as another "ask
+the leader"; and a leader report that is what the table names afterwards.
 """
 
 import socket
@@ -35,6 +43,7 @@ from oxidedb.channels import ChannelPool
 from oxidedb.client import NodeUnreachable, RemoteMetadataClient, RemoteTSOClient
 from oxidedb.proto import groups_pb2
 from oxidedb.proto.groups_pb2_grpc import MetadataServiceStub, TSOServiceStub
+from oxidedb.raft.state_machine import ErrorCode
 from oxidedb.shard.router import default_range_map
 
 
@@ -113,9 +122,18 @@ def _published_table(client, num_shards):
     replica set.  Both are answers rather than failures, and a client waits them out by
     reading again - which is what this does, so that the assertions below are about a
     published table rather than about a moment in the middle of publishing one.
+
+    The replica sets are waited for as well as the ranges: the publisher sends them as
+    commands of their own, so a table that has the ranges and no nodes is one it has not
+    finished with, and the assertions below are about a finished one.
     """
     table = client.table(refresh=True)
-    return None if table.routes() != default_range_map(num_shards) else table
+    if table.routes() != default_range_map(num_shards):
+        return None
+    if any(not placement.nodes or not placement.addresses
+           for placement in table.shards.values()):
+        return None
+    return table
 
 
 def _follower_naming_the_leader(cluster, pool):
@@ -158,6 +176,23 @@ def _get_one_timestamp(pool, cluster):
         if response.error_code == groups_pb2.OK:
             return response
     return None
+
+
+def _write_the_placement_back(client):
+    """A proposal the group has to accept: the placement it is already holding.
+
+    Written back rather than invented, because what is under test is the write path and not
+    the table's geometry: a command the table would refuse could not tell "the proposal
+    arrived" from "the proposal was wrong".  None while there is nothing to write back or a
+    member refused it, which is what waiting is for.
+    """
+    placement = client.table(refresh=True).shard(0)
+    if placement is None or not placement.nodes or not placement.addresses:
+        return None
+    if not client.set_shard_nodes(placement.shard_id, placement.nodes,
+                                  placement.addresses).success:
+        return None
+    return placement
 
 
 def _answer_to_an_empty_batch(stub):
@@ -392,4 +427,90 @@ class TestTheClockOverTheWire:
                             message="the walk never reached a member of the group")
 
         assert len(stamps) == 1
+
+
+class TestWritingTheTableOverTheWire:
+    """The table changed by a process that is not one of the nodes.
+
+    The cluster's publisher is a client of this group like any other, and what it does is
+    what these tests do: build a command, send it to the member that leads, and act on the
+    answer.  What is pinned here is that the port answers a proposal at all, that the walk
+    carries one to the leader as it carries a question, and that a command the table will not
+    take comes back as a refusal rather than as another address to ask.
+    """
+
+    def test_a_proposal_reaches_the_leader_through_a_member_that_does_not_lead(
+            self, cluster, open_client):
+        """A write walks the same path a read does, and for the same reason.
+
+        The client is seeded with one member that is not the leader and nothing else, so a
+        write that comes back successful can only have been applied by the member the refusal
+        named.  The table is then read back by a second client, because the writer's own
+        answer says what it asked for and only the group can say what it holds.
+        """
+        pool = ChannelPool()
+        try:
+            found = wait_until(lambda: _follower_naming_the_leader(cluster, pool),
+                               message="no member refused with a leader to name")
+        finally:
+            pool.close()
+        address, refusal = found
+
+        assert refusal.leader_address in cluster.metadata_seeds
+        assert refusal.leader_address != address
+
+        client = open_client(RemoteMetadataClient, [address])
+        written = wait_until(_asking(lambda: _write_the_placement_back(client)),
+                             message=f"a client seeded only with {address} never wrote")
+
+        reader = open_client(RemoteMetadataClient, cluster.metadata_seeds)
+        table = wait_until(_asking(lambda: _published_table(reader, cluster.num_shards)),
+                           message="the table was never read back")
+
+        assert table.shard(written.shard_id).nodes == written.nodes
+        assert table.shard(written.shard_id).addresses == written.addresses
+
+    def test_a_command_the_table_will_not_take_is_answered_with_a_refusal(
+            self, cluster, open_client):
+        """The refusal of the member that leads outranks the others saying ask the leader.
+
+        There is no shard 999 and there never will be, so the group refuses this report on its
+        geometry.  What the client has to hear is that refusal: a walk that kept the last
+        member's "ask the leader" would send the caller round the group again for an answer it
+        had already been given, and a publisher that read it as a leaderless group would keep
+        proposing a command that can never apply.
+        """
+        client = open_client(RemoteMetadataClient, cluster.metadata_seeds)
+        wait_until(_asking(lambda: _published_table(client, cluster.num_shards)),
+                   message="the table was never read over the wire")
+
+        result = client.report_leader(999, 1, 1)
+
+        assert not result.success
+        assert result.error_code == ErrorCode.ERR_APPLY_ERROR
+        assert "999" in result.error_msg
+
+    def test_a_report_from_a_client_is_what_the_table_names_afterwards(
+            self, cluster, open_client):
+        """The leader column, moved by a client - which is the whole of what the publisher does.
+
+        The term is one no election in this test will reach, so the claim cannot be moved out
+        from under the assertion by the publisher's next poll: what the table names afterwards
+        is the report this test proposed.  The node named is a real replica of that shard, so
+        the table still sends callers somewhere that can answer for it.
+        """
+        client = open_client(RemoteMetadataClient, cluster.metadata_seeds)
+        table = wait_until(_asking(lambda: _published_table(client, cluster.num_shards)),
+                           message="the table was never read over the wire")
+
+        placement = table.shard(0)
+        node_id = placement.nodes[0]
+        term = placement.leader_term + 10 ** 6
+
+        assert client.report_leader(placement.shard_id, node_id, term).success
+
+        named = client.table(refresh=True).shard(placement.shard_id)
+        assert named.leader_id == node_id
+        assert named.leader_term == term
+        assert named.leader_address() == cluster.shard_address(placement.shard_id, node_id)
 
