@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 245 tests, roughly five minutes
+pytest tests -q             # 248 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -560,19 +560,23 @@ Honest list of what is *not* done, roughly in priority order.
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
   line up.  The CLI drives a local `Database`, not a cluster.
-* **Only the node that leads the metadata group can publish to it.**  A proposal is not
-  forwarded: a member that does not lead the group answers `ERR_NOT_LEADER`, and no RPC
-  carries a command to whoever leads it.  In a cluster of processes that makes
-  `MetadataPublisher` useful on exactly one node - the one that happens to lead the table's
-  group - while the node leading a shard is usually another one.  What it costs is the
-  leader column: a shard led elsewhere is published with its range, its replica set and its
-  addresses and with no leader, so a client that routes by the table finds nobody to ask.
-  The addresses are there, which is what makes the small fix possible - a client could take
-  any replica of the shard and follow the shard's own refusal to its leader, the same hop a
-  leader hint already buys - and the alternative is a write path on the group's port, which
-  is a fifth service to serve and a decision about who may speak to it.
+* **The publisher only reaches the table's group from the node that leads it.**  A
+  proposal is not forwarded by the service: a member that does not lead answers
+  `ERR_NOT_LEADER` and names the leader, and the caller is the one that moves.  The port
+  does answer a proposal now - a member of this group serves the same `ClientService.Propose`
+  a shard does, and `RemoteMetadataClient` carries one to the leader over the walk - so the
+  table can be written from outside the group at all, and the hint is what makes the command
+  land on the pass it was proposed rather than on whichever poll follows an election.  What
+  is still missing is `MetadataPublisher` using that client: it holds the in-process
+  `MetadataClient`, which can only reach a leader that is this node, so in a cluster of
+  processes the publisher does its work on exactly one node - the one that happens to lead
+  the table's group - while the node leading a shard is usually another one.  What that costs
+  is the leader column: a shard led elsewhere is published with its range, its replica set
+  and its addresses and with no leader, so a client that routes by the table finds nobody to
+  ask.  Closing it is handing the publisher that remote client rather than a node object.
   `tests/test_group_clients.py` pins what is true now: a leader that *is* named is a real
-  node at an address that answers, and a one-node cluster names itself for every shard.
+  node at an address that answers, a one-node cluster names itself for every shard, and a
+  client outside the cluster can write the table through a member that does not lead it.
 * **Sharding is experimental and frozen - do not use it.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
@@ -615,6 +619,14 @@ Honest list of what is *not* done, roughly in priority order.
   nodes in its own process.  The lock resolver - the other thing in the transaction path
   that looks for a leader - takes its client from `ShardLeaders` like everything else,
   which in a cluster running in this process means the cluster's own nodes.
+* **A shard's state machine is built without being told which shard it is.**  The factory
+  `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
+  so a state machine that opened storage of its own - one file per shard - cannot be written
+  against that contract, and what `--data-dir` keeps is each group's log, its metadata and
+  its snapshots rather than a state machine's own memory.  A restarted shard comes back by
+  replaying (or restoring) what its log holds, which is why this is a constraint on the
+  factory's signature and not a hole in durability; widening it is a change to `ShardServer`
+  and to every caller that builds one.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
