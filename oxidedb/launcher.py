@@ -11,7 +11,8 @@ A node runs three kinds of Raft group, and each of them elects on its own:
 * its shards, at ``base + 100 * shard_id``, served by ``ShardServer`` - the Raft service
   and the client's six primitives on the same port;
 * the metadata group, at ``base + 100 * num_shards``, whose table a client routes by -
-  the Raft service and the client's question about the table on the same port;
+  the Raft service, the client's question about the table, and the proposal that changes
+  it, on the same port;
 * the TSO group, at ``base + 100 * (num_shards + 1)``, which hands out timestamps, on the
   same terms.
 
@@ -47,7 +48,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .metadata.publisher import MetadataPublisher
-from .metadata.service import MetadataClient, MetadataServicer, MetadataStateMachine
+from .metadata.service import (MetadataClient, MetadataStateMachine,
+                                add_metadata_services_to_server)
 from .raft.node import MemoryRaftNode, NodeState
 from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_PORT_STRIDE,
                                 ShardServer)
@@ -474,13 +476,17 @@ class ClusterNode:
         )
 
     def _serve_metadata_clients(self, node, server) -> None:
-        """Answer a client's question about the table, on the metadata group's port."""
-        from oxidedb.proto.groups_pb2_grpc import add_MetadataServiceServicer_to_server
+        """Answer a client's question about the table, and its proposal to change it.
 
-        add_MetadataServiceServicer_to_server(
-            MetadataServicer(node,
-                             self._group_leader_address(node, self._config.metadata_address)),
-            server)
+        Both on the metadata group's port, because that is where a caller that is not one of
+        the cluster's nodes reaches the table: the read is ``ListShards``, and a change is a
+        proposal - taken by whichever member leads, and refused by one that does not, with
+        the leader's address the caller follows.  That refusal is what lets the cluster's
+        publisher keep the table current from a node that does not lead the group.
+        """
+        add_metadata_services_to_server(
+            server, node,
+            self._group_leader_address(node, self._config.metadata_address))
 
     def _serve_tso_clients(self, node, server) -> None:
         """Answer a client's request for timestamps, on the TSO group's port."""

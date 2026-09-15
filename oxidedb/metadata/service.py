@@ -22,9 +22,11 @@ that cannot reach a quorum refuses to serve a table it cannot justify.
 
 What is not here yet: a command to split a range.  A split has to move the rows it cuts
 off before the table may say they belong somewhere else, so it arrives with that
-migration rather than ahead of it.  Nothing in the cluster publishes to this table
-either - that wiring is the next step, and until it lands a cluster still builds its
-routing table locally.
+migration rather than ahead of it.
+
+The table is written by a publisher (``metadata/publisher.py``) rather than by a client of
+the keyspace, and the two services anyone reaches the group by live here as well: the
+whole table for a read, and the one proposal that changes it.
 """
 
 import threading
@@ -35,7 +37,11 @@ import msgpack
 
 from ..groups import refusal
 from ..proto import groups_pb2
-from ..proto.groups_pb2_grpc import MetadataServiceServicer
+from ..proto.client_pb2_grpc import (ClientServiceServicer,
+                                     add_ClientServiceServicer_to_server)
+from ..proto.groups_pb2_grpc import (MetadataServiceServicer,
+                                     add_MetadataServiceServicer_to_server)
+
 from ..raft.node import MemoryRaftNode, RaftCluster
 from ..raft.state_machine import ApplyResult, ErrorCode, ReadResult, StateMachine
 from ..shard.router import RangeMap, locate
@@ -57,6 +63,23 @@ class MetadataCommandType:
     #: range a shard answers for, and it is proposed after the rows have moved, so
     #: the group checks it against the table rather than believing the caller.
     SPLIT = b"split"
+
+
+def serialize_metadata_command(cmd_type: bytes, **kwargs) -> bytes:
+    """The bytes of a metadata command: what ``apply`` parses and what a client builds.
+
+    A function rather than a state machine method, for the reason the shard's has
+    (``raft/state_machine.py``): the client is the side that builds a command - the
+    cluster's publisher is a client of this group like any other - and the bytes it builds
+    have to be the bytes this machine parses.  Two implementations would be two ways to
+    pack a command the group cannot read, and the failure would arrive as a refused
+    proposal rather than as the bug it is.
+
+    ``use_bin_type`` is not decoration.  A command's type is a ``bytes`` constant, and
+    without it the type comes back as text on the far side of the round trip, which makes
+    every command an unknown one.
+    """
+    return msgpack.packb({"type": cmd_type, **kwargs}, use_bin_type=True)
 
 
 class ShardPlacement:
@@ -375,7 +398,7 @@ class MetadataStateMachine(StateMachine):
             return self._version
 
     def serialize_command(self, cmd_type: bytes, **kwargs) -> bytes:
-        return msgpack.packb({"type": cmd_type, **kwargs}, use_bin_type=True)
+        return serialize_metadata_command(cmd_type, **kwargs)
 
     # -- snapshots ---------------------------------------------------------
 
@@ -594,6 +617,47 @@ class MetadataServicer(MetadataServiceServicer):
         response.shards.extend(shard_record(placement)
                                for placement in table.shards.values())
         return response
+
+
+class MetadataProposalServicer(ClientServiceServicer):
+    """The one client primitive a member of the table's group answers: a proposal.
+
+    The table is written by whoever wins the group's election, and a caller that reached
+    another member has to be sent to that one rather than given a second way in.  So this
+    is a shard's client service with five of its six calls missing: a member of this group
+    proposes, and a point read of a single document, a range read, a lock and a follower
+    read have no meaning against a table - the base class answers them with UNIMPLEMENTED,
+    which is an honest answer rather than a lie about the table.
+
+    It holds a servicer rather than repeating one.  A proposal's answer is a code, a
+    message, the term, the index it landed at, and the leader's address on the one refusal
+    that has somewhere to send the caller, and that is ``ClientServicer.Propose``; a second
+    copy of it here would be a second place for those five things to be put together
+    wrongly.
+    """
+
+    def __init__(self, node, leader_address=None):
+        # Imported here rather than at the top of the file: ``raft.client_servicer`` reaches
+        # back into this module through ``oxidedb.client``, so one of the two has to
+        # import the other late, and the file that knows what it wants is this one.
+        from ..raft.client_servicer import ClientServicer
+
+        self._proposer = ClientServicer(node, leader_address)
+
+    def Propose(self, request, context):
+        return self._proposer.Propose(request, context)
+
+
+def add_metadata_services_to_server(server, node, leader_address=None) -> None:
+    """Put this member's client-facing services on ``server``: the table, and a proposal.
+
+    One function because it is one port and one caller - a node running a member of this
+    group serves both here - and a test that wired one of them and not the other would be
+    testing a node that does not exist.
+    """
+    add_MetadataServiceServicer_to_server(MetadataServicer(node, leader_address), server)
+    add_ClientServiceServicer_to_server(
+        MetadataProposalServicer(node, leader_address), server)
 
 
 class MetadataCluster:
