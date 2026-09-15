@@ -151,6 +151,10 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
 * **Sharding** — experimental and frozen; see Known gaps.  The keyspace is split
   into ranges, each range served by its own Raft group, and the table that says which
   range is where has an owner of its own (`metadata/service.py`, another Raft group).
+  The placement is published by the cluster's own nodes rather than written by hand, and a
+  report reaches whichever member leads that group - the same walk a client makes, following
+  the name a refusal gives - because the node that leads a shard is usually not the node that
+  leads the group.
   The cluster publishes it through `metadata/publisher.py`: the ranges once, each
   shard's replica set and addresses once, and a leader report whenever a shard's leader
   or its term moves, so a client that reads the table can route without being told.
@@ -445,8 +449,14 @@ walked past, until the only seed that answers nothing at all is `NodeUnreachable
 than a refusal.  The clock is asked the same way: timestamps that only go up, a run that is
 used up replaced by one above it (the boundary an off-by-one would hand out twice), the
 single-timestamp call allocating exactly one, and a batch of none refused instead of
-rounded up to one.  One node leading every group is where the leader column is checked
-outright, because there it is decided rather than raced.
+rounded up to one.  The leader column is where the two cluster sizes part company: with
+three nodes and four shards every shard has to be named, and the node that names a shard is
+the one leading that shard rather than the one leading the table's group - so a publisher
+that could not reach a group it does not lead would leave the column empty - while against
+one node the answer is decided rather than raced, because there the only node it could name
+is the one that answered.  The table's own writes are read over the same socket: the
+placement the group already holds, written back through a member that does not lead it; a
+command the table refuses; and a report it takes, which is what the leader column is made of.
 
 Three environment notes:
 
@@ -560,23 +570,24 @@ Honest list of what is *not* done, roughly in priority order.
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
   line up.  The CLI drives a local `Database`, not a cluster.
-* **The publisher only reaches the table's group from the node that leads it.**  A
-  proposal is not forwarded by the service: a member that does not lead answers
-  `ERR_NOT_LEADER` and names the leader, and the caller is the one that moves.  The port
-  does answer a proposal now - a member of this group serves the same `ClientService.Propose`
-  a shard does, and `RemoteMetadataClient` carries one to the leader over the walk - so the
-  table can be written from outside the group at all, and the hint is what makes the command
-  land on the pass it was proposed rather than on whichever poll follows an election.  What
-  is still missing is `MetadataPublisher` using that client: it holds the in-process
-  `MetadataClient`, which can only reach a leader that is this node, so in a cluster of
-  processes the publisher does its work on exactly one node - the one that happens to lead
-  the table's group - while the node leading a shard is usually another one.  What that costs
-  is the leader column: a shard led elsewhere is published with its range, its replica set
-  and its addresses and with no leader, so a client that routes by the table finds nobody to
-  ask.  Closing it is handing the publisher that remote client rather than a node object.
-  `tests/test_group_clients.py` pins what is true now: a leader that *is* named is a real
-  node at an address that answers, a one-node cluster names itself for every shard, and a
-  client outside the cluster can write the table through a member that does not lead it.
+* **The publisher reaches the table's group from any node that serves it, and not from a
+  node that does not.**  A proposal is not forwarded by the service: a member that does not
+  lead answers `ERR_NOT_LEADER` and names the leader, and the caller is the one that moves.
+  The launcher hands the publisher that walk - a `RemoteMetadataClient` over the group's own
+  port - so a node that leads a shard gets its report in whether or not it leads the table's
+  group.  Before that it held the in-process `MetadataClient`, which could only reach a leader
+  that was this node, and the leader column of a cluster of processes was written by the one
+  node that happened to lead the group while the shards were led by the others.  What is
+  still open is a node that serves no member of the group at all: the publisher starts on the
+  nodes that hold one (`ClusterNode._start_background`), so in a cluster wider than
+  `metadata_group_size` a shard led by one of the others is published with its range, its
+  replica set and its addresses and with no leader.  Closing that is starting a publisher on
+  every node, for which no test here would be evidence - the clusters in `tests/` are exactly
+  as wide as the metadata group.  What `tests/test_group_clients.py` pins is the rest: every
+  shard of a four-shard, three-node cluster is named, each name is a node of that shard's
+  replica set at an address something answers at, a one-node cluster names itself for every
+  shard, and a client outside the cluster can write the table through a member that does not
+  lead it.
 * **Sharding is experimental and frozen - do not use it.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
