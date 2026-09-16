@@ -167,8 +167,7 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   copies the rows into the new shard's group as the versions they already were, proposes
   the split to the table, and re-ranges the servers locally before thawing the source -
   and a split that dies before its proposal is finished on the next start.  See Known
-  gaps for what is still missing: no migration, no follower reads, and no way to start
-  a cluster for a client in another process to connect to.
+  gaps for what is still missing: no migration and no follower reads.
 
 ## Storage engines (plan E)
 
@@ -598,7 +597,8 @@ Honest list of what is *not* done, roughly in priority order.
   replica set at an address something answers at, a one-node cluster names itself for every
   shard, and a client outside the cluster can write the table through a member that does not
   lead it.
-* **Sharding is experimental and frozen - do not use it.**  Every component routes
+* **Sharding is experimental, and frozen wherever it would have to move by itself: no
+  migration, no follower read.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
   set and the leaders that reported themselves, and `MetadataClient` reads it with the
@@ -638,12 +638,15 @@ Honest list of what is *not* done, roughly in priority order.
   copies left in the old shard are never reclaimed; nothing chooses split points or moves
   a shard between nodes, so there is no migration, no automatic splitting and no follower
   reads - every read goes to the leader.  A client can reach a shard it was never handed a
-  handle on, by the address the table names for it (`client/remote_node_client.py`), but
-  nothing in the repository starts a cluster for a client in another process to connect
-  to, so the cross-shard test still drives the coordinator through clients built over
-  nodes in its own process.  The lock resolver - the other thing in the transaction path
-  that looks for a leader - takes its client from `ShardLeaders` like everything else,
-  which in a cluster running in this process means the cluster's own nodes.
+  handle on, by the address the table names for it (`client/remote_node_client.py`), and a
+  cluster for that client to connect to is something the repository starts on its own
+  (`launcher.py`, and `tests/_cluster.py` over it), which is how one shard's client
+  service is tested across processes.  What is still in-process is everything above one
+  shard: the transaction coordinator and the lock resolver ask the cluster object they were
+  built over which shard a key belongs to, and take their client from `ShardLeaders` like
+  everything else, which in a cluster running in this process means the cluster's own nodes.
+  So the cross-shard test drives the coordinator through clients built over nodes in its own
+  process, and the CLI takes no `--server` and drives a local `Database`.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written

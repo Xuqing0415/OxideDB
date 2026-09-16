@@ -1,5 +1,5 @@
-# EXPERIMENTAL: sharding is frozen - a split moves rows without publishing the new
-# range map, do not use
+# EXPERIMENTAL: sharding is wired end to end for a placement that never has to change -
+# no migration and no follower read, so do not build a deployment on it
 import time
 
 import msgpack
