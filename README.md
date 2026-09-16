@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 248 tests, roughly five minutes
+pytest tests -q             # 252 tests, roughly five minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -160,8 +160,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   or its term moves, so a client that reads the table can route without being told.
   Clients route by it too (`metadata/cache.py`): one read of the table instead of a
   lookup per key; a shard that refuses a request names where the leader is when it knows,
-  so following an election costs one hop, and a refusal that names nowhere sends the
-  client back to the table.
+  so following an election costs one hop, and a refusal that names nowhere is answered by
+  the shard's other replicas - one call each, in the order the table lists them - before the
+  table is read again.
   `split_shard` is wired end to end: it freezes the range,
   copies the rows into the new shard's group as the versions they already were, proposes
   the split to the table, and re-ranges the servers locally before thawing the source -
@@ -261,7 +262,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-204 tests.  `tests/test_durability.py` covers the correctness properties that
+252 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -368,13 +369,16 @@ fakes: a lookup hands out the client for the node the table names without inspec
 because that node's own belief about leading is the thing in question; a table that names
 nobody is read again, but no faster than the publisher could have written an answer - a
 range published before its leader is, and a shard that really has no leader, look identical
-from the client's side and only one of them is worth waiting out; a shard that refuses a
-read sends the client back for the new answer exactly once, and a second refusal is taken
-as the answer rather than retried; and a handle that has stopped working is dropped and
+from the client's side and only one of them is worth waiting out; a refusal is answered by
+the address the shard names, and by the other replicas of its set when it names none - one
+call each, and no read of the table until they run out; a table read after that is the last
+answer rather than the first thing to try, and a second refusal is taken as the answer
+rather than retried; and a handle that has stopped working is dropped and
 rebuilt while the placement is left alone.  The last
-test is all real:
+tests are all real:
 a three-node cluster, a live metadata group, and a leader whose node is shut down
-while the client holds a table naming it.  The read still returns what was committed.
+while the client holds a table naming it.  The read still returns what was committed, and a
+write reaches the leader that replaced it without the table being read at all.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
 snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
 the read set validated the second commit is refused and one doctor stays on call;
@@ -544,10 +548,16 @@ Honest list of what is *not* done, roughly in priority order.
   it has heard from one - `MemoryRaftNode.leader_id` is set from an AppendEntries or an
   InstallSnapshot for the current term and dropped wherever the node steps out of that term
   - so following an election costs one hop to a new address instead of a read of the table,
-  and `ShardLeaders` consumes that hint once, for the retry that follows it, leaving the
-  table as the record it is.  A node that does not answer at all is `NodeUnreachable`, which
-  is not a refusal and is retried the same way, because a table that still names a node
-  which is gone is exactly the case it is for.
+  and `ShardLeaders` consumes that hint once, for the retry that follows it.  A refusal that
+  names nowhere is answered by the shard's other replicas, which the table publishes along
+  with the leader: the client walks them one at a time, remembering every address it has
+  been to, and reads the table only when the set is spent - which is what a leader that has
+  been killed costs a client over a wire, because the node that would have named its
+  successor is exactly the node that is gone.  A node that does not answer at all is
+  `NodeUnreachable`, which is not a refusal and is walked the same way, because a table that
+  still names a node which is gone is exactly the case it is for.  A walk ends when a shard
+  answers it (`ShardLeaders.answered`), so the next doubt is a new walk rather than a queue
+  one session has already drained.
   `oxidedb/launcher.py` is the other end: it runs one node - its shards, the routing
   table's group and the timestamp group, each on ports of its own - and publishes its
   placement, so a client in another process can reach a shard and use all six
@@ -603,11 +613,15 @@ Honest list of what is *not* done, roughly in priority order.
   A client reads that table and routes by it (`metadata/cache.py`), and what a lookup
   hands out is a client for the node it names rather than the node: it does not ask that
   node whether it still leads, because the node it reached is the one whose belief is in
-  question.  What sends a client back to the table is the shard refusing the request
-  (`refresh_for_shard`, called by the caller that met the refusal) or a table that names
-  nobody while the read being held is older than the publisher's own poll interval - a
-  range whose leader report has not been published yet and a shard that has no leader are
-  the same thing to a client, and only one of them is worth waiting out.
+  question.  A refusal is answered out of the same table before the table is read again:
+  `replica_addresses` hands out the set of nodes that serve the shard, leader first, and
+  `ask_shard` walks the ones it has not been to, which is what makes an election visible to
+  a client whose publisher has not written it down yet.  What sends a client back to the
+  table is that walk running out (`refresh_for_shard`, called by the caller that met the
+  refusal) or a table that names nobody while the read being held is older than the
+  publisher's own poll interval - a range whose leader report has not been published yet and
+  a shard that has no leader are the same thing to a client, and only one of them is worth
+  waiting out.
   A split is wired end to end.  `split_shard` freezes the range, waits out the writes that
   were admitted before the freeze, refuses rather than copy under a lock that may be an
   unapplied commit, moves the rows above the split point into the new shard's group as the
