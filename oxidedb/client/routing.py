@@ -26,7 +26,7 @@ already recovered from.
 """
 
 import threading
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from ..raft.state_machine import ErrorCode, ScanRefused
 from ..shard.router import locate
@@ -131,6 +131,19 @@ class ShardLeaders:
         if shard_id is None:
             return None
         return self.leader_for_shard(shard_id)
+
+    def ranges(self) -> Dict[int, Tuple[bytes, bytes]]:
+        """The ranges of the one placement this client holds, by shard id.
+
+        What a range read needs and a single key does not: which shards a range
+        covers.  It comes from the same place the leaders come from - the table when
+        there is one and the cluster's own map when there is not - so a scan cannot
+        read its rows by one placement while the keys in front of them are routed by
+        another.  There is no third answer to mix in.
+        """
+        if self._router is not None:
+            return self._router.routes()
+        return self._cluster.range_map()
 
     def shard_for_key(self, key: bytes) -> Optional[int]:
         """Which shard owns ``key``: the table's answer if there is one, the cluster's if not.

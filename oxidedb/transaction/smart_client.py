@@ -1,10 +1,11 @@
 import time
 import random
-from typing import Callable, Optional, Tuple, Dict, Any
+from typing import Callable, List, Optional, Tuple, Dict, Any
 
 from ..client.node_client import NodeClientFactory
 from ..client.routing import ShardLeaders, ask_shard
-from ..raft.state_machine import ReadResult, ErrorCode
+from ..raft.state_machine import (CommandType, ErrorCode, ReadResult,
+                                  serialize_command)
 from ..tso.tso import TSOClient
 from .coordinator import SerializationError, TransactionCoordinator
 
@@ -171,3 +172,92 @@ class SmartClient:
         self.add_write(txn_id, key, value)
         success, _ = self.commit(txn_id)
         return success
+
+    def delete(self, key: bytes) -> bool:
+        """Remove ``key``, as a tombstone at a timestamp from the cluster's clock.
+
+        A tombstone is a version like any other and has to be ordered like one: it
+        shadows every version at or before its timestamp for every reader after it,
+        which is what makes a deleted key read as absent rather than as a value
+        nobody replaced.  So the timestamp comes from the same group the transactions
+        take theirs from - the only thing that orders this delete against the commits
+        around it.
+
+        It goes to the shard's leader as one command rather than through a
+        transaction, because what a transaction writes is a value and this writes
+        none.  That leaves a blind write: a delete that races a transaction on the
+        same key can be overwritten by that transaction's commit, where a delete
+        inside the transaction would have been ordered with it.  Writing it as an
+        intent would need the lock record to carry "this version is a tombstone" over
+        the wire, and until it does, the honest thing is the command the shard already
+        has and a caller that knows what it costs.
+
+        False means the shard never took it - no leader this client can reach, or a
+        refusal - which is how ``put`` reports the same kind of nothing.
+        """
+        timestamp = self._tso_client.get_timestamp()
+        command = serialize_command(CommandType.DELETE, key=key, timestamp=timestamp)
+
+        def _do_delete():
+            shard_id = self._leaders.shard_for_key(key)
+            if shard_id is None:
+                raise RuntimeError(f"No shard holds {key!r}")
+
+            result = ask_shard(self._leaders, shard_id,
+                               lambda client: client.propose(command))
+            if result is None or not result.success:
+                # False rather than an error, the way ``put`` reports a commit it
+                # could not land: the caller's next move is the same either way.
+                return False
+            return True
+
+        return self._retry_with_backoff(_do_delete)
+
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+        """Every key in ``[start_key, end_key)``, from every shard it covers.
+
+        The one question a single shard cannot answer: the ranges a client holds cut
+        the range into as many pieces as it crosses, and each piece goes to the leader
+        that owns it.  A shard ranges the rows of its own piece, so the pieces are
+        concatenated in range order rather than in the order the shards happen to be
+        numbered.
+
+        A range no shard of this placement covers is left out rather than refused: the
+        placement is the whole of what this client knows, and rows it has no shard for
+        are rows it cannot read.
+
+        A piece whose shard has no reachable leader raises rather than coming back
+        short - a range read that quietly omitted a shard's rows would look exactly
+        like a range with no such rows.
+        """
+        rows: List[Tuple[bytes, bytes]] = []
+
+        for shard_id, (start, end) in sorted(self._leaders.ranges().items(),
+                                             key=lambda item: item[1][0]):
+            piece_start = self._piece_start(start_key, start)
+            piece_end = min(end_key, end)
+            if piece_start >= piece_end:
+                continue
+
+            answer = ask_shard(
+                self._leaders, shard_id,
+                lambda client: client.scan(piece_start, piece_end, timestamp))
+            if answer is None:
+                raise RuntimeError(f"No leader for shard {shard_id}")
+            rows.extend(answer)
+
+        return rows
+
+    @staticmethod
+    def _piece_start(caller_start: bytes, shard_start: bytes) -> bytes:
+        """Where one shard's piece of a caller's range begins: the larger of the two.
+
+        With one exception, and it is not a preference: the floor of the keyspace is
+        b"\x00", which is the separator byte the storage refuses inside a key - so a
+        piece that would begin at the floor begins at what the caller asked from
+        instead.  That is the same request rather than a wider one, because nothing
+        can be stored below the floor.
+        """
+        piece = max(caller_start, shard_start)
+        return caller_start if b"\x00" in piece else piece

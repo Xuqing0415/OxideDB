@@ -6,6 +6,7 @@ from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ErrorCode
 from oxidedb.shard.router import locate
 from oxidedb.tso.tso import TSOCluster, TSOClient
 from oxidedb.transaction.coordinator import TransactionCoordinator, TxnStatus
+from oxidedb.transaction.smart_client import SmartClient
 
 
 def get_free_port():
@@ -370,6 +371,77 @@ def test_prewrite_without_a_leader_for_one_shard_leaves_no_lock():
     print("Cross-shard prewrite without a leader test passed!")
 
 
+def test_a_scan_reads_every_shard_the_range_covers():
+    """One range read, two shards, and the rows come back in key order.
+
+    The keys are put in through the client, so each one is committed by the
+    transaction path into whichever shard owns it, and the range is then asked for
+    once.  A scan that only ever asked one shard would come back with half the rows
+    and no way for the caller to tell: the shard it did ask would answer honestly
+    about its own piece.
+    """
+    tso_cluster, shard_cluster = two_shard_cluster()
+
+    below = b"key0"      # first byte 0x6b -> shard 0
+    above = b"\x80key1"  # first byte 0x80 -> shard 1
+    wait_for_keys_leader(shard_cluster, [below, above])
+    tso_client = wait_for_tso_client(tso_cluster)
+
+    client = SmartClient(tso_client, shard_cluster)
+    assert client.put(below, b"in shard 0")
+    assert client.put(above, b"in shard 1")
+
+    shard_id_1, shard_id_2 = shard_ids(shard_cluster, below, above)
+    assert shard_id_1 != shard_id_2, "the two keys have to be in different shards"
+
+    rows = client.scan(b"", b"\xff")
+    assert rows == [(below, b"in shard 0"), (above, b"in shard 1")], (
+        "the range read did not come back with both shards' rows in key order"
+    )
+
+    # And a range that stops before the second shard's rows starts has to stop.
+    assert client.scan(b"", b"\x80") == [(below, b"in shard 0")]
+
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Cross-shard range read test passed!")
+
+
+def test_a_deleted_key_reads_back_as_absent_and_its_neighbour_does_not():
+    """A delete is a tombstone where the key was, not a hole in the range.
+
+    The tombstone is written as a version at a timestamp from the TSO, which is what
+    makes it shadow the value it removes for every reader after it - and is also why
+    the key next to it has to still be there afterwards.
+    """
+    tso_cluster, shard_cluster = two_shard_cluster()
+
+    doomed = b"doomed"      # shard 0
+    neighbour = b"neighbour"  # shard 0 as well, and it has to survive
+    above = b"\x80doomed"   # shard 1: the same delete, in another group
+    wait_for_keys_leader(shard_cluster, [doomed, neighbour, above])
+    tso_client = wait_for_tso_client(tso_cluster)
+
+    client = SmartClient(tso_client, shard_cluster)
+    for key in (doomed, neighbour, above):
+        assert client.put(key, b"here")
+
+    assert client.delete(doomed)
+    assert client.delete(above)
+
+    assert client.get(doomed) is None, "a deleted key has to read as absent"
+    assert client.get(above) is None, "and in the shard that is not the primary's"
+    assert client.get(neighbour) == b"here", "the delete took a key it was not asked for"
+
+    assert client.scan(b"", b"\xff") == [(neighbour, b"here")], (
+        "a tombstone has to be absent from a range read as well"
+    )
+
+    shard_cluster.shutdown()
+    tso_cluster.shutdown()
+    print("Cross-shard delete test passed!")
+
+
 if __name__ == "__main__":
     test_coordinator_begin()
     print("\n" + "="*60 + "\n")
@@ -380,3 +452,7 @@ if __name__ == "__main__":
     test_prewrite_refused_by_one_shard_leaves_no_lock()
     print("\n" + "="*60 + "\n")
     test_prewrite_without_a_leader_for_one_shard_leaves_no_lock()
+    print("\n" + "="*60 + "\n")
+    test_a_scan_reads_every_shard_the_range_covers()
+    print("\n" + "="*60 + "\n")
+    test_a_deleted_key_reads_back_as_absent_and_its_neighbour_does_not()

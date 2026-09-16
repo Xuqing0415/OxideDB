@@ -35,6 +35,7 @@ from typing import List, Optional
 
 from ..client.node_client import (LocalNodeClientFactory, NodeClient,
                                   NodeClientFactory)
+from ..shard.router import RangeMap
 from .service import MetadataClient, RoutingTable, ShardPlacement
 
 #: How long a client waits before reading a table again because it named no leader for a
@@ -181,6 +182,16 @@ class RoutingCache:
             if address is not None and address not in addresses:
                 addresses.append(address)
         return addresses
+
+    def routes(self) -> RangeMap:
+        """The ranges of the table this cache holds: which shard covers which keys.
+
+        A single key belongs to one shard and a range can cross every one of them,
+        so a range read is the caller that needs the table whole rather than one
+        entry at a time.  Same table as the leaders come from, for the same reason a
+        lookup and a write have to agree: one client, one placement.
+        """
+        return self.table().routes()
 
     def refresh_for_shard(self, shard_id: int) -> None:
         """Read the table again, because ``shard_id`` refused this client.
