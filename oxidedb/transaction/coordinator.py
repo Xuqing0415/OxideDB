@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..client.node_client import NodeClient, NodeClientFactory
 from ..client.routing import ShardLeaders, ask_shard
 from ..raft.state_machine import ApplyResult, CommandType, ErrorCode, serialize_command
-from ..shard.router import locate
 from ..tso.tso import TSOClient
 from .lock_resolver import DEFAULT_LOCK_TTL, LockResolver
 
@@ -82,7 +81,24 @@ class TransactionCoordinator:
         self._executor = ThreadPoolExecutor(max_workers=10)
     
     def _get_shard_id(self, key: bytes) -> int:
-        return locate(self._shard_server._range_map, key)
+        """Which shard owns ``key``, by the one placement this coordinator holds.
+
+        The table when this client was handed one and the cluster's own map when it
+        was not - the same answer, from the same lookup, that ``_get_shard_leader``
+        asks.  A coordinator that took its shards from the cluster while its leader
+        lookup read the table would write one key into one shard and validate a read
+        of another against a third, which is the split this closes.  It is also the
+        whole of what a client outside the cluster needs: with a table to route by
+        there is no cluster object to ask, and none is asked.
+
+        A key no shard of this placement covers has nowhere to go.  Saying so here
+        stops a write rather than sending it to a shard that would answer for a key
+        it does not own.
+        """
+        shard_id = self._leaders.shard_for_key(key)
+        if shard_id is None:
+            raise RuntimeError(f"No shard holds {key!r}")
+        return shard_id
     
     def _get_shard_leader(self, shard_id: int) -> Optional[NodeClient]:
         """The client for whichever node leads ``shard_id``, or None."""

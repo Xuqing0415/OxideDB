@@ -27,7 +27,6 @@ from typing import Any, Dict, Optional
 from ..client.node_client import NodeClient
 from ..client.routing import ShardLeaders, ask_shard
 from ..raft.state_machine import CommandType, serialize_command
-from ..shard.router import locate
 
 #: How long a lock has to sit untouched before it stops counting as "in flight".
 #: This is the trigger for the question, not the answer: the answer comes from the
@@ -60,31 +59,51 @@ class PrimaryStatus(Enum):
 
 class LockResolver:
     def __init__(self, shard_cluster, lock_ttl: float = DEFAULT_LOCK_TTL, leaders=None):
-        self._shard_cluster = shard_cluster
         self._lock_ttl = lock_ttl
         #: Where the client that leads a shard comes from.  A coordinator hands in its
         #: own, so that the lock a transaction left behind is settled by the same
         #: placement that transaction read and wrote by; on its own - which is how the
         #: lock cleaner uses it - this resolver routes by the cluster it was handed.
+        #: The cluster is used to build that and for nothing else: once this resolver
+        #: has leaders, which shard a key belongs to is their answer, not the cluster's.
         self._leaders = leaders if leaders is not None else ShardLeaders(shard_cluster)
 
-    def _get_shard_id(self, key: bytes) -> int:
-        return locate(self._shard_cluster._range_map, key)
+    def _get_shard_id(self, key: bytes) -> Optional[int]:
+        """Which shard owns ``key``, by the one placement this resolver holds.
+
+        The table's answer when this client was handed one and the cluster's own map
+        when it was not - the lookup the coordinator asks, because a lock a
+        transaction left behind has to be settled by the placement that transaction
+        read and wrote by.  A client outside the cluster holds no cluster object at
+        all, and with a table to route by it needs none.
+
+        None means this placement covers no such key, which is the same nothing as a
+        shard with no leader: there is nowhere to ask, and every caller here already
+        has an answer for that.
+        """
+        return self._leaders.shard_for_key(key)
 
     def _get_shard_leader(self, shard_id: int) -> Optional[NodeClient]:
         """The client for whichever node leads ``shard_id``, or None."""
         return self._leaders.leader_for_shard(shard_id)
 
+    def _client_for(self, key: bytes) -> Optional[NodeClient]:
+        """The client for the leader of whichever shard owns ``key``, or None."""
+        shard_id = self._get_shard_id(key)
+        if shard_id is None:
+            return None
+        return self._get_shard_leader(shard_id)
+
     def lock_on(self, key: bytes) -> Optional[Dict[str, Any]]:
         """The lock a shard leader currently holds for ``key``, or None."""
-        client = self._get_shard_leader(self._get_shard_id(key))
+        client = self._client_for(key)
         if client is None:
             return None
         return client.get_lock(key)
 
     def primary_status(self, primary_key: bytes, start_ts: int) -> PrimaryStatus:
         """Ask the primary key's shard what happened to the transaction."""
-        client = self._get_shard_leader(self._get_shard_id(primary_key))
+        client = self._client_for(primary_key)
         if client is None:
             return PrimaryStatus.UNKNOWN
 
@@ -101,7 +120,7 @@ class LockResolver:
 
     def primary_commit_ts(self, primary_key: bytes, start_ts: int) -> Optional[int]:
         """The timestamp the transaction committed at, if it did."""
-        client = self._get_shard_leader(self._get_shard_id(primary_key))
+        client = self._client_for(primary_key)
         if client is None:
             return None
 
@@ -178,7 +197,11 @@ class LockResolver:
     def _settle(self, key: bytes, start_ts: int, command_type: bytes, **kwargs) -> bool:
         command = serialize_command(
             command_type, key=key, start_ts=start_ts, **kwargs)
-        result = ask_shard(self._leaders, self._get_shard_id(key),
+        shard_id = self._get_shard_id(key)
+        if shard_id is None:
+            return False
+
+        result = ask_shard(self._leaders, shard_id,
                            lambda client: client.propose(command))
         if result is not None and result.success:
             return True

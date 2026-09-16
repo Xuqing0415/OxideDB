@@ -24,8 +24,9 @@ the table - which is why most of the file is about what a client may do before i
 asking the metadata group anything again.
 
 The rest of the file pins what "routes by the table" has to mean: a client with a table
-never looks at the cluster's own nodes, and a coordinator reads and writes by the same
-table rather than by a scan of its own.
+never looks at the cluster's own nodes, and a transaction reads, writes and looks for
+leaders by that one table rather than by a scan of its own - which is what lets the
+coordinator be handed a table and no cluster at all.
 """
 
 import time
@@ -89,18 +90,6 @@ class _FakeCluster:
 
     def get_shard_server(self, node_id):
         return self._servers.get(node_id)
-
-
-class _ShardlessCluster:
-    """A cluster with no local shard nodes: what a client outside it has.
-
-    ``_range_map`` is the one thing the table could not tell it and the group still
-    needs, so a transaction can find which shard a key belongs to; the nodes are gone,
-    so anything that resolves a leader by looking at them resolves nothing.
-    """
-
-    _range_map = {0: (b"", b"\xff")}
-    _shard_servers = {}
 
 
 class _FakeTableSource:
@@ -218,16 +207,24 @@ def test_a_shard_that_refuses_a_read_sends_the_client_back_to_the_table():
 
 
 def test_a_transaction_routes_by_the_table_and_not_by_the_cluster():
-    """A commit reads and writes by the same placement the reader used.
+    """A transaction reads, writes and settles locks by the placement it was handed.
 
-    The cluster here has no shard nodes at all, so a coordinator that resolved leaders
-    by scanning them would resolve nothing: everything this transaction knows comes
-    from the table.
+    Which shard owns a key is the same lookup that finds that shard's leader, so a
+    coordinator with a table needs no cluster object to work shards out of, and none is
+    given one here.  It used to need one: the shard a key belonged to came from the
+    cluster's own range map while the leader came from the table, which is two
+    placements in one transaction - and the one a client outside the cluster cannot
+    have, since what it holds is a table and no cluster at all.  The resolver, which
+    settles the locks a transaction meets, asks the same leaders.
     """
     node = _FakeNode(value=b"v1")
     cluster = _single_shard_cluster({1: node})
     router = RoutingCache(cluster, _FakeTableSource(_table(1)))
-    coordinator = TransactionCoordinator(_FakeTso(), _ShardlessCluster(), router=router)
+    coordinator = TransactionCoordinator(_FakeTso(), None, router=router)
+
+    assert coordinator._get_shard_id(KEY_A) == 0
+    assert coordinator._resolver._get_shard_id(KEY_A) == 0, (
+        "the lock resolver routes by the same placement")
 
     txn_id, _ = coordinator.begin()
     assert coordinator.read(txn_id, KEY_A) == b"v1"
