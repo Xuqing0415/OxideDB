@@ -19,8 +19,11 @@ publisher's own poll period - see :data:`MISSING_LEADER_REFRESH_INTERVAL`.
 The refusal is the caller's to notice, and that is why what this hands out is a client and
 not a node.  A node the table names is exactly the node whose own belief about leading is
 in question - one cut off from its peers goes on answering as if nothing had happened - so
-this file does not ask it, and does not read its state.  ``refresh_for_shard`` is what a
-caller that met a refusal calls; ``ask_shard`` in ``client/routing.py`` is that caller.
+this file does not ask it, and does not read its state.  What it offers a caller that met a
+refusal is both halves of the answer: ``replica_addresses`` is the set of nodes that client
+may ask instead, since the table publishes a replica set and only one of its members leads,
+and ``refresh_for_shard`` is the read it makes when none of them answers.  ``ask_shard`` in
+``client/routing.py`` is the caller that walks them in that order.
 
 It says nothing about how a client reaches a shard once it knows where that shard is: the
 factory does, and what this file decides is which node the factory is asked for.
@@ -28,7 +31,7 @@ factory does, and what this file decides is which node the factory is asked for.
 
 import threading
 import time
-from typing import Optional
+from typing import List, Optional
 
 from ..client.node_client import (LocalNodeClientFactory, NodeClient,
                                   NodeClientFactory)
@@ -150,6 +153,34 @@ class RoutingCache:
             self._refresh_if_it_could_have_changed()
             return self._client_for(shard_id)
         return client
+
+    def replica_addresses(self, shard_id: int) -> List[str]:
+        """Every address the table says serves ``shard_id``, the leader first.
+
+        Where a client may ask after the node the table named has refused it.  The table
+        publishes a whole replica set - which nodes serve the shard, and where each of them
+        serves it - and only one of them leads, so a client that stopped at the leader would
+        sit out every election the publisher has not written down yet.  The leader is named
+        first because while the table is current it is the one worth asking, and the rest
+        follow in the order the table lists them.
+
+        Which of them have been asked, and which is tried next, is the caller's bookkeeping
+        and not this file's: what is published here is placement, and a walk is what a
+        client does with it.
+        """
+        placement = self.table().shard(shard_id)
+        if placement is None:
+            return []
+
+        addresses = []
+        leader = placement.leader_address()
+        if leader is not None:
+            addresses.append(leader)
+        for node_id in placement.nodes:
+            address = placement.addresses.get(node_id)
+            if address is not None and address not in addresses:
+                addresses.append(address)
+        return addresses
 
     def refresh_for_shard(self, shard_id: int) -> None:
         """Read the table again, because ``shard_id`` refused this client.
