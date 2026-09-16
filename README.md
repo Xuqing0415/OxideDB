@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 252 tests, roughly five minutes
+pytest tests -q             # 260 tests, roughly seven minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -51,6 +51,25 @@ at one command at a time.  `--data-dir` (before the subcommand) keeps the data i
 oxidedb --data-dir ./demo set user:1 alice
 oxidedb --data-dir ./demo get user:1      # alice
 ```
+
+`--server` is the third mode, and the only one that talks to a cluster: it names a
+node of one - the address that node's shard 0 listens at - and the same four commands
+then travel over gRPC, through the routing table, to whichever shard owns each key:
+
+```
+oxidedb --server 127.0.0.1:8001 --shards 2 set user:1 alice
+oxidedb --server 127.0.0.1:8001 --shards 2 get user:1            # alice, out of whatever shard owns it
+oxidedb --server 127.0.0.1:8001 --shards 2 scan a: z            # every shard it covers
+```
+
+`--shards` is how many shards that node was started with, because a node's group
+ports sit above its shard ports - the arithmetic is `ports_for` in
+`oxidedb/launcher.py`, imported by the CLI rather than worked out a second time - and
+it defaults to the launcher's own default of two.  Several nodes may be given,
+comma-separated or repeated, and all of them are used as seeds: no client knows which
+member of the routing table's group leads, so one address it cannot use would
+otherwise end the walk.  `--data-dir` and `--server` together are refused, since the
+same key cannot be in two places.
 
 ## Running a node
 
@@ -90,8 +109,10 @@ before anything spoke it by `tests/test_client_proto.py`: the routing table read
 the clock asked for one timestamp or a run of them.  `oxidedb/client/remote_group_client.py`
 is the client side of it and `MetadataServicer` in `metadata/service.py` and `TSOServicer` in
 `tso/tso.py` serve it, so a program outside the cluster can use the six shard primitives,
-read the table and take a timestamp.  What it cannot do yet is route by the table on its own
-- see Known gaps - and the CLI still drives a local `Database` rather than a cluster.
+read the table and take a timestamp, and route by the table it read: a client holding one
+needs no cluster object at all, which is what `oxidedb/cli.py --server` is - that same
+client with a shell in front of it.  What no client can do yet is read from a follower;
+see Known gaps.
 
 ## Architecture
 
@@ -261,7 +282,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-252 tests.  `tests/test_durability.py` covers the correctness properties that
+260 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -398,8 +419,12 @@ checked byte for byte.  `tests/test_apply_results.py` covers the bounded window
 of apply results: it evicts oldest-first, and the result of the command a
 proposal waited for is still there afterwards, a rejected one included.
 `tests/test_cli.py` runs the command line front end as a subprocess: the default
-in-memory mode starts empty every time, `--data-dir` persists, and `get` reports a
-missing key with exit code 1.
+in-memory mode starts empty every time, `--data-dir` persists, `--data-dir` and
+`--server` together are refused, and `get` reports a missing key with exit code 1.
+Its last class starts a real node - `tests/_cluster.py`, so a process - and runs the
+CLI against it: a key set by one invocation read by the next, a range read that
+crosses both shards, a delete whose neighbour survives, and a `--server` that answers
+nothing reported on one line rather than as a traceback.
 `tests/test_client_proto.py` pins the wire contract before anything speaks it, and it
 is the one file here with no business logic in it: six node-level methods and no
 transaction among them, because a `Prewrite` RPC would put the primary-key choice on
@@ -564,21 +589,25 @@ Honest list of what is *not* done, roughly in priority order.
   client question on their own port - `MetadataServicer` and `TSOServicer`, registered
   beside the Raft service they already answered - and `client/remote_group_client.py` is
   the client side of it, walking the seed addresses it was given, following a refusal that
-  names the leader and stepping over an address that answers nothing.  What a client still
-  cannot do is route by the table on its own, for the reason the bullet above gives, and
-  the CLI and the examples still hold a local `Database` and take no `--server`, though one
-  shard's six primitives can already be
-  used from another process: `tests/_cluster.py` starts real `python -m oxidedb.launcher`
-  processes, waits for their `READY` line rather than for a number of seconds, and stops
-  each one by writing `stop` to its stdin - failing if a node goes without saying
-  `STOPPED` - and `tests/test_client_over_processes.py` writes, reads and range-reads
-  through that socket, including the bytes two objects in one interpreter never have to
-  serialise: a key whose first byte is 0x80, an empty value, a tombstone, a megabyte
-  value.  Everything above one shard is still a test with the cluster in the test process.
+  names the leader and stepping over an address that answers nothing.  A client outside the
+  cluster routes by the table it read - a lookup that resolves a shard's leader there needs no
+  cluster object to fall back on, and a client in another process has none - and
+  `oxidedb/cli.py --server` is that client with a shell in front of it: the same four
+  commands, over channels, through the same routing table.
+  `tests/_cluster.py` starts real `python -m oxidedb.launcher` processes, waits for their
+  `READY` line rather than for a number of seconds, and stops each one by writing `stop` to
+  its stdin - failing if a node goes without saying `STOPPED` - and
+  `tests/test_client_over_processes.py` writes, reads and range-reads through that socket,
+  including the bytes two objects in one interpreter never have to serialise: a key whose
+  first byte is 0x80, an empty value, a tombstone, a megabyte value.  `tests/test_cli.py` is
+  the same commands against the same kind of node, with a person's shell in the middle.
+  What is still a test with the cluster in the test process is everything above one shard:
+  the cross-shard transaction, whose coordinator is built over the cluster's own nodes
+  because the test is the cluster's own process.
   The old key/value `ClientService` and the `OxideDBClient` written against it are gone:
   `Set` cannot be answered correctly by a server, because the timestamp a write carries
   has to come from the client's own TSO batch for a transaction's prewrite and commit to
-  line up.  The CLI drives a local `Database`, not a cluster.
+  line up.
 * **The publisher reaches the table's group from any node that serves it, and not from a
   node that does not.**  A proposal is not forwarded by the service: a member that does not
   lead answers `ERR_NOT_LEADER` and names the leader, and the caller is the one that moves.
@@ -641,12 +670,13 @@ Honest list of what is *not* done, roughly in priority order.
   handle on, by the address the table names for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
   (`launcher.py`, and `tests/_cluster.py` over it), which is how one shard's client
-  service is tested across processes.  What is still in-process is everything above one
-  shard: the transaction coordinator and the lock resolver ask the cluster object they were
-  built over which shard a key belongs to, and take their client from `ShardLeaders` like
-  everything else, which in a cluster running in this process means the cluster's own nodes.
-  So the cross-shard test drives the coordinator through clients built over nodes in its own
-  process, and the CLI takes no `--server` and drives a local `Database`.
+  service is tested across processes, and the CLI reaches a cluster the same way
+  (`--server`).  What is left of this is narrower than it was: a client with a table routes
+  by it - the coordinator and the lock resolver ask `ShardLeaders` which shard a key belongs
+  to, the same lookup that finds that shard's leader, so nothing above the client needs a
+  cluster object at all - but a client *without* one still routes by the cluster's own
+  nodes, and the cross-shard transaction test is still driven in the cluster's own process.
+  What the CLI cannot do is read from a follower; every read goes to a leader.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
@@ -666,6 +696,16 @@ Honest list of what is *not* done, roughly in priority order.
   regenerates them with another toolchain until the version stamp is *newer* than the
   installed runtime, and a diff of a regenerated file is unreadable.  A test that pins the
   four files' sha256 is owed.
+* **A delete is a tombstone written outside the transaction path.**  What the CLI's
+  `delete` sends is the shard's own `DELETE` command - one command to the leader, stamped
+  from the same clock the transactions take their timestamps from, which is what puts the
+  tombstone in the same order as the commits around it, so a reader at or after it sees the
+  key as absent.  What it does not do is take a lock, because a transaction's write is a
+  value and a tombstone is not one: a delete that races a transaction on the same key can be
+  overwritten by that transaction's commit, where a delete written as an intent would have
+  been ordered with it.  Writing it as one means carrying "this version is a tombstone" in
+  the lock record and over the wire, which is a change to `proto/client.proto` and to the
+  state machine rather than to the command.
 * **A multi-key commit is atomic only on the Percolator path.**
   `oxidedb/transaction/local.py` - the embedded `Database` and the CLI - has no
   locks and no primary key: it writes every key of a transaction with one shared
@@ -690,7 +730,8 @@ oxidedb/
                  the one place a placement becomes a handle (`proto/client.proto` is the
                  wire form)
   database.py    embedded single-process database (MVCC + local transactions)
-  cli.py         command line front end for the embedded database
+  cli.py         command line front end: the embedded database, or a cluster
+                 through --server
 docs/            design notes and posts
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   blog/          the ReadIndex story: a read path that passed every test while wrong
