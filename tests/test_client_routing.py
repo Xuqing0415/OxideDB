@@ -6,18 +6,22 @@ once - one linearizable read instead of a lookup per key - and treats what it re
 decision it can be sent back to revisit, which is what a cached table has to be for the
 cache to be safe rather than merely fast.
 
-One kind of staleness and one way back to the table.  A cached table can name a node that
+One kind of staleness, and two ways of answering it.  A cached table can name a node that
 has stopped leading, and the only evidence of that a client can get is the shard refusing
 to answer: the node it reached is the one whose own belief is in question, since a leader
 cut off from its peers goes on answering reads as if nothing had happened.  So the lookup
 hands out the client for the placement the table published and inspects nothing behind it,
-the refusal is what reads the table again, and the last two tests are the same leader
-change with a real cluster, a real metadata group and a real node that dies.
+and the refusal is what sends the client on - to the address the shard named, to the other
+replicas of its set, and only then back to the table it read.  The tests at the end are the
+same leader change with a real cluster, a real metadata group and a real node that dies,
+one of them with a table frozen so that only a shard's own replicas can answer.
 
 The middle of the file is the mechanism that does the re-reading: ``ShardLeaders``, which
 answers with a client from the table when there is one and from the cluster when there is
-not, and ``ask_shard``, which is the one place that turns a refusal into a second
-question.
+not, and ``ask_shard``, which is the one place that turns a refusal into the next question:
+to the address the shard named, then to the shard's other replicas, and only then back to
+the table - which is why most of the file is about what a client may do before it is worth
+asking the metadata group anything again.
 
 The rest of the file pins what "routes by the table" has to mean: a client with a table
 never looks at the cluster's own nodes, and a coordinator reads and writes by the same
@@ -25,13 +29,15 @@ table rather than by a scan of its own.
 """
 
 import time
+from typing import Dict, Tuple
 
 import pytest
 
 from _ports import free_addresses
 from _wait import (wait_for_keys_leader, wait_for_metadata_client,
                    wait_for_tso_client, wait_until)
-from oxidedb.client import LocalNodeClient, LocalNodeClientFactory, ShardLeaders, ask_shard
+from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, RemoteNodeClientFactory,
+                            ShardLeaders, ask_shard)
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
 from oxidedb.raft.node import NodeState
@@ -52,14 +58,18 @@ class _FakeNode:
     """A shard node that answers with a value or refuses the way a deposed leader does:
     still claiming to lead, which is exactly what a client cannot detect."""
 
-    def __init__(self, value=None, error=None, state=NodeState.LEADER):
+    def __init__(self, value=None, error=None, state=NodeState.LEADER, leader_address=None):
         self._value = value
         self._error = error
         self.state = state
+        #: Where this node says the leader is, for the refusals it gives: a follower that
+        #: has heard from one names it, and a node that only knows it is not the leader
+        #: names nowhere.
+        self._leader_address = leader_address
 
     def get(self, key, timestamp=None):
         if self._error is not None:
-            return ReadResult.failure(self._error, "Not leader")
+            return ReadResult.failure(self._error, "Not leader", self._leader_address)
         return ReadResult.success(self._value)
 
 
@@ -129,6 +139,19 @@ def _table(leader_id, version: int = 1, nodes=(1, 2, 3)) -> RoutingTable:
 def _single_shard_cluster(nodes):
     return _FakeCluster({node_id: _FakeServer({0: node})
                          for node_id, node in nodes.items()})
+
+
+def _table_with_addresses(leader_id, addresses, version: int = 1) -> RoutingTable:
+    """A one-shard table that names its replica set and where each member serves it.
+
+    ``addresses`` is node id to address, and the nodes of the placement are its keys, so
+    the set the table names and the set a client can reach cannot drift apart in a test
+    that meant them to be the same.
+    """
+    placement = ShardPlacement(0, b"", b"\xff", nodes=sorted(addresses),
+                               addresses=dict(addresses), leader_id=leader_id,
+                               leader_term=1)
+    return RoutingTable(version, {0: placement})
 
 
 # -- what a lookup answers, and what it does not check -------------------------
@@ -208,6 +231,130 @@ def test_a_transaction_routes_by_the_table_and_not_by_the_cluster():
 
     txn_id, _ = coordinator.begin()
     assert coordinator.read(txn_id, KEY_A) == b"v1"
+
+
+# -- a refusal that leaves somewhere else to ask -------------------------------
+
+class _AddressableClient(LocalNodeClient):
+    """A handle that knows the address it was reached at.
+
+    A handle over a wire knows one, and that is what keeps the node the table named out of
+    the replicas a refusal queues: a round of addresses is keyed by address, and a handle
+    that cannot say which one it is was never going to be in one.
+    """
+
+    def __init__(self, node, address):
+        super().__init__(node)
+        self.address = address
+
+
+class _AddressBookFactory:
+    """A factory over addresses, with a small cluster's nodes behind them.
+
+    ``LocalNodeClientFactory`` answers None to every address, and that is honest for nodes
+    in this process - nothing here answers at one - which is also why the walk over a
+    shard's replicas cannot be tested with it.  This stands in for the factory a client
+    over a wire holds: the same four calls, with ``get_client_at`` finding something.
+    """
+
+    def __init__(self, nodes_by_address):
+        self._nodes = dict(nodes_by_address)
+        self._addresses: Dict[Tuple[int, int], str] = {}
+        self._clients: Dict[str, _AddressableClient] = {}
+
+    def get_client(self, shard_id: int, node_id: int, address=None):
+        if address is not None:
+            self._addresses[(shard_id, node_id)] = address
+        address = self._addresses.get((shard_id, node_id))
+        return None if address is None else self.get_client_at(shard_id, address)
+
+    def get_client_at(self, shard_id: int, address: str):
+        node = self._nodes.get(address)
+        if node is None:
+            return None
+        # One handle per address, the way a factory over a wire keeps one channel per
+        # address: two callers asking about one node are asking about one node.
+        return self._clients.setdefault(address, _AddressableClient(node, address))
+
+    def forget_client(self, shard_id: int, node_id: int) -> None:
+        self._addresses.pop((shard_id, node_id), None)
+
+
+def test_a_refusal_walks_the_shard_s_other_replicas_before_the_table():
+    """The table names one leader and a replica set, and only one member leads now.
+
+    Node 1 is what the table says, node 1 refuses, and the answer is on node 3: so the
+    client asks the two nodes it has not asked, one at a time, and the table is never read.
+    That is the difference between a client that survives an election the publisher has not
+    written down yet and one that sits out every election until it has.
+    """
+    addresses = {1: "node1:7001", 2: "node2:7001", 3: "node3:7001"}
+    factory = _AddressBookFactory({addresses[1]: _FakeNode(error=ErrorCode.ERR_NOT_LEADER),
+                                   addresses[2]: _FakeNode(error=ErrorCode.ERR_NOT_LEADER),
+                                   addresses[3]: _FakeNode(value=b"v2")})
+    source = _FakeTableSource(_table_with_addresses(1, addresses))
+    router = RoutingCache(_FakeCluster({}), source, factory=factory)
+    leaders = ShardLeaders(_FakeCluster({}), router=router)
+    asked = []
+
+    answer = ask_shard(leaders, 0, lambda client: asked.append(client) or client.get(KEY_A))
+
+    assert answer.value == b"v2"
+    assert [client.address for client in asked] == [addresses[1], addresses[2], addresses[3]]
+    assert router.refreshes == 0, "the replicas answered it, so the table had nothing to add"
+
+
+def test_a_refusal_that_names_the_leader_sends_the_client_there_before_any_replica():
+    """The shard's own answer is the newest placement there is, so it goes first.
+
+    Node 1 refuses and names node 3: following that costs one call and needs no read of the
+    table, and it skips node 2 - a node this client can reach and has no reason to ask,
+    because the node that refused it has just said who leads.
+    """
+    addresses = {1: "node1:7001", 2: "node2:7001", 3: "node3:7001"}
+    factory = _AddressBookFactory({addresses[1]: _FakeNode(error=ErrorCode.ERR_NOT_LEADER,
+                                                           leader_address=addresses[3]),
+                                   addresses[2]: _FakeNode(value=b"the skipped replica"),
+                                   addresses[3]: _FakeNode(value=b"v2")})
+    source = _FakeTableSource(_table_with_addresses(1, addresses))
+    router = RoutingCache(_FakeCluster({}), source, factory=factory)
+    leaders = ShardLeaders(_FakeCluster({}), router=router)
+    asked = []
+
+    answer = ask_shard(leaders, 0, lambda client: asked.append(client) or client.get(KEY_A))
+
+    assert answer.value == b"v2"
+    assert [client.address for client in asked] == [addresses[1], addresses[3]]
+    assert router.refreshes == 0
+
+
+def test_a_walk_that_finds_nobody_sends_the_client_back_to_the_table():
+    """Replicas are a second answer and not the last one: the table is still the record.
+
+    Every node the old table names refuses, so the walk spends the set and the client is
+    back where it started - and the table, which the publisher moved on before any of this,
+    is the one thing that can name a node the round was never going to reach.  One read of
+    it, and the write lands on the fourth node.
+    """
+    addresses = {1: "node1:7001", 2: "node2:7001", 3: "node3:7001"}
+    nodes = {address: _FakeNode(error=ErrorCode.ERR_NOT_LEADER)
+             for address in addresses.values()}
+    nodes["node4:7001"] = _FakeNode(value=b"v3")
+    factory = _AddressBookFactory(nodes)
+    source = _FakeTableSource(_table_with_addresses(1, addresses))
+    router = RoutingCache(_FakeCluster({}), source, factory=factory)
+    leaders = ShardLeaders(_FakeCluster({}), router=router)
+    asked = []
+
+    assert leaders.leader_for_shard(0) is not None, "this client holds the old table already"
+    source.move_on(_table_with_addresses(4, {4: "node4:7001"}))
+
+    answer = ask_shard(leaders, 0, lambda client: asked.append(client) or client.get(KEY_A))
+
+    assert answer.value == b"v3"
+    assert [client.address for client in asked] == [addresses[1], addresses[2], addresses[3],
+                                                    "node4:7001"]
+    assert router.refreshes == 1, "the set was spent, so the table was read"
 
 
 # -- the two sources a placement can come from ---------------------------------
@@ -431,6 +578,43 @@ def test_the_client_follows_a_leader_change_without_being_told():
         assert placement.leader_id != stopped
         assert shard_cluster.get_shard_server(placement.leader_id) is not None
     finally:
+        shard_cluster.shutdown()
+        tso_cluster.shutdown()
+        metadata.shutdown()
+
+
+def test_a_killed_shard_leader_is_answered_by_the_other_replicas_of_its_set():
+    """A table naming a leader that is gone, recovered without reading the table at all.
+
+    What a client over a wire has and an in-process one does not is the address of every
+    replica the table published, and this is what that buys: the write goes to the node the
+    table named, gets no answer, and lands on the leader its own set elected, with the
+    metadata group never asked.  The table is the cluster's real one, frozen at the moment
+    before the kill - a publisher that has not written yet is the situation, and freezing
+    the table is how this test says so without racing one - so a read of it would only hand
+    this client the same dead node back.
+    """
+    metadata, tso_cluster, shard_cluster = _cluster_with_metadata()
+    factory = RemoteNodeClientFactory()
+    try:
+        wait_for_keys_leader(shard_cluster, [KEY_A, KEY_B])
+        tso_client = wait_for_tso_client(tso_cluster)
+        table_client = wait_for_metadata_client(metadata)
+        table = _published_table(table_client, (0, 1))
+
+        router = RoutingCache(shard_cluster, _FakeTableSource(table), factory=factory)
+        client = SmartClient(tso_client, shard_cluster, router=router)
+        assert client.put(KEY_A, b"v1")
+
+        placement = table.shard_for(KEY_A)
+        assert len(placement.addresses) > 1, "a walk needs a set to walk over"
+        shard_cluster.get_shard_server(placement.leader_id).shutdown()
+        wait_for_keys_leader(shard_cluster, [KEY_A])
+
+        assert client.put(KEY_A, b"v2"), "the write never got past the node that was killed"
+        assert router.refreshes == 0, "the table was not read to find the new leader"
+    finally:
+        factory.close()
         shard_cluster.shutdown()
         tso_cluster.shutdown()
         metadata.shutdown()
