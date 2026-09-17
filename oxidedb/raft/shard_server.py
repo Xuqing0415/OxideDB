@@ -1,5 +1,6 @@
 # EXPERIMENTAL: sharding is wired end to end for a placement that never has to change -
 # no follower read, and no move that finishes, so do not build a deployment on it
+import os
 import time
 
 import msgpack
@@ -8,6 +9,7 @@ from dataclasses import dataclass, field
 
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from ..metadata.publisher import DEFAULT_PUBLISH_INTERVAL, MetadataPublisher
+from ..metadata.service import PROPOSE_ATTEMPTS, RETRY_BACKOFF
 from ..shard.router import default_range_map, locate
 from ..transaction.lock_cleaner import LockCleaner
 from ..transaction.lock_resolver import DEFAULT_LOCK_TTL
@@ -26,11 +28,19 @@ MIGRATION_RECORD_PREFIX = "migrate"
 #: now is a group this split cannot finish, not something to wait for for ever.
 SPLIT_LEADER_TIMEOUT = 10.0
 
+#: How long a shard that has moved goes on answering on the node it left, in seconds.
+#: Clients route by a table they cached, so the node one of them was sent to a moment
+#: ago is a node it may still ask: the group stays up for a fixed window after the table
+#: has moved on, and then it goes.  A fixed window is the only honest one - "until every
+#: client has noticed" is not something a server can know - and it is a parameter of the
+#: call that waits it out, so a test does not have to wait it out for real.
+MIGRATION_DRAIN_SECONDS = 30.0
+
 #: Shard ``s`` of a node listens at that node's base port plus ``s * this``, in both
 #: ``_get_shard_port`` and ``start_shards_network``, so the two cannot drift apart.
 SHARD_PORT_STRIDE = 100
 from .node import MemoryRaftNode, RaftCluster, NodeState
-from .state_machine import StateMachine, CommandType, ApplyResult
+from .state_machine import StateMachine, CommandType, ApplyResult, ErrorCode
 from .storage import RaftStorage, JSONFileStorage
 
 
@@ -284,6 +294,35 @@ class ShardServer:
             return node
         return None
     
+    def shutdown_shard(self, shard_id: int) -> bool:
+        """Stop serving one shard: its group, its port and its storage go together.
+
+        The group a move leaves behind.  Its rows are in the group the routing table now
+        names, so this one has nothing left to answer - and it has to stop answering,
+        because a client still holding the old table would otherwise be answered by a
+        group that no longer owns the range.
+
+        The storage goes with it, which :meth:`shutdown` does not do: a whole cluster
+        closing hands its storages to whoever built them, and this is one shard going on
+        its own with nobody else to release the file.  That matters to the caller that
+        means to move the directory out from under it - on Windows it has no choice, and
+        a directory still being written to would not be a faithful copy anyway.
+
+        False means this node was not serving the shard, which is what closing one twice
+        looks like: a caller that died in the middle of closing things comes back and
+        closes them again, and the second close is an answer rather than an error.
+        """
+        node = self._shards.pop(shard_id, None)
+        if node is None:
+            return False
+
+        self._shard_peers.pop(shard_id, None)
+        self._shard_addresses.pop(shard_id, None)
+        node.shutdown()
+        if node._storage is not None:
+            node._storage.close()
+        return True
+
     def shutdown(self):
         for node in self._shards.values():
             node.shutdown()
@@ -302,6 +341,39 @@ class MigrationPhase:
     COPYING = "copying"
     PROPOSING = "proposing"
     DONE = "done"
+
+
+class ProposalOutcome:
+    """The three answers a proposal to the routing table comes back with.
+
+    Read as what the caller knows now, because that is what decides the caller's next
+    move - and for a move, the next move is either finishing it or giving up on it.
+    """
+
+    #: The group applied it.  Whether it applied it just now or the first time it was
+    #: asked, the table says what the caller wanted it to say.
+    OK = "ok"
+    #: The group answered no, and would answer no again: the caller asked for something
+    #: the table will not hold, and a retry is the same question.
+    REJECTED = "rejected"
+    #: Nothing answered.  The proposal may or may not have landed and the caller cannot
+    #: tell the difference - which is the one outcome a move may not treat as failure.
+    UNREACHABLE = "unreachable"
+
+
+@dataclass
+class ProposalResult:
+    """What came of one proposal.  See :class:`ProposalOutcome`."""
+
+    outcome: str
+    #: What the group said when it refused, or why nothing answered.  For a human, and
+    #: for the refusals the wire flattens into one code: the message is where "the shard
+    #: is not in the table" and "the set overlaps the one leaving" are still told apart.
+    message: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == ProposalOutcome.OK
 
 
 @dataclass
@@ -347,6 +419,15 @@ class ShardedRaftCluster:
         self._migrations: Dict[int, MigrationState] = {}
         #: Why the last move could not be started or could not be copied.
         self._last_migration_error: Optional[str] = None
+        #: Which nodes serve each shard, when they are not every node of the cluster.  A
+        #: shard with no entry is served by all of them, which is the model this started
+        #: with; a move is what makes an entry, and this is how the cluster's own answer
+        #: about a shard follows the table without asking it.
+        self._placed_shards: Dict[int, List[int]] = {}
+        #: The data directories this cluster has moved aside, in the order it did.  Kept
+        #: for callers that look - a test, an operator - and never read back: nothing
+        #: here opens one.
+        self._orphan_dirs: List[str] = []
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
         return default_range_map(self._num_shards)
@@ -361,6 +442,18 @@ class ShardedRaftCluster:
         server = self._shard_servers.get(peer_id)
         return None if server is None else server.get_shard_node(shard_id)
     
+    def _remember_placement(self, shard_nodes: Optional[Dict[int, List[int]]]) -> None:
+        """Take the placement this cluster was started with as its own answer for it.
+
+        A node's servers know which shards they serve; the cluster has to know it too,
+        because the cluster is what answers "who serves this shard" - to a publisher, to
+        a client's route, to the rest of a move.  A shard nobody placed is served by every
+        node, which is what an entry that is not here means.
+        """
+        if shard_nodes:
+            self._placed_shards = {shard_id: sorted(set(members))
+                                   for shard_id, members in shard_nodes.items()}
+
     def update_range_map(self, range_map: Dict[int, tuple]):
         self._range_map = range_map
         for server in self._shard_servers.values():
@@ -373,6 +466,7 @@ class ShardedRaftCluster:
               lock_cleaner_ttl: float = DEFAULT_LOCK_TTL,
               metadata=None,
               metadata_publish_interval: float = DEFAULT_PUBLISH_INTERVAL):
+        self._remember_placement(shard_nodes)
         for node_id in range(1, self._num_nodes + 1):
             server = ShardServer(node_id, self._num_shards, self._num_nodes,
                                  get_peer_shard_node=self._get_peer_shard_node)
@@ -399,6 +493,7 @@ class ShardedRaftCluster:
                       lock_cleaner_ttl: float = DEFAULT_LOCK_TTL,
                       metadata=None,
                       metadata_publish_interval: float = DEFAULT_PUBLISH_INTERVAL):
+        self._remember_placement(shard_nodes)
         for node_id in range(1, self._num_nodes + 1):
             server = ShardServer(node_id, self._num_shards, self._num_nodes,
                                  get_peer_shard_node=self._get_peer_shard_node)
@@ -897,6 +992,211 @@ class ShardedRaftCluster:
             state.copied_keys.append(key)
         return True
 
+    def _addresses_on(self, node_ids: List[int], shard_id: int) -> Dict[int, str]:
+        """Where each of ``node_ids`` serves ``shard_id``, as the servers bound it.
+
+        The same answer :meth:`shard_addresses` gives, asked of a set of nodes rather
+        than of the shard.  The nodes a shard is moving to are not the nodes it is served
+        by yet, so a proposal that took its addresses from the shard's own answer would
+        hand the table the addresses of the group it is leaving.
+        """
+        addresses = {}
+        for node_id in node_ids:
+            server = self._shard_servers.get(node_id)
+            address = None if server is None else server.shard_address(shard_id)
+            if address is not None:
+                addresses[node_id] = address
+        return addresses
+
+    def _propose_move(self, shard_id: int, target_nodes: List[int]) -> ProposalResult:
+        """Tell the routing table that ``shard_id`` is served by ``target_nodes`` now.
+
+        The last step of a move and the only one a client can see, so it is written as
+        the one thing it may never do: describe a replica set the caller made up.  The set
+        being replaced is read out of the table at the attempt that uses it, rather than
+        taken from this cluster's own answer - the table's machine refuses a move whose
+        expectation of the current set is wrong (code 14), so a caller that guessed would
+        be refused every time two moves were computed from one table, and this process's
+        own answer is exactly the stale thing a 14 exists to catch.
+
+        The three outcomes are the three a caller can act on.  A refusal is final: the
+        machine would answer the same command the same way, and the loop does not ask it
+        twice.  No answer is not final - it means the command may or may not have landed -
+        and the second attempt is how the caller finds out, because the machine recognises
+        a move it has already applied and answers it as a success rather than as a second
+        write.
+
+        What is not here is any reading of *which* rule refused (12 through 16).  Each has
+        a code of its own in the machine and the wire flattens them all into one, so the
+        reason survives only in the message - see the README.  Nothing below branches on
+        it, and a caller that wants to (a 14 is worth re-reading the table for, a 15 is
+        worth walking away from) is reading prose, which is the debt and not the design.
+        """
+        client = self._metadata_client
+        if client is None:
+            # An in-process cluster has no table: its own range map is the whole world to
+            # it, and a move in one changes nothing a client could see.  There is nothing
+            # to tell, which is what a split says in the same position.
+            return ProposalResult(ProposalOutcome.OK, "there is no routing table to tell")
+
+        addresses = self._addresses_on(target_nodes, shard_id)
+        last_error = None
+        for attempt in range(PROPOSE_ATTEMPTS):
+            try:
+                table = client.table(refresh=True)
+            except RuntimeError as nothing_read:
+                # One exception for two shapes on purpose: the in-process client raises a
+                # RuntimeError when its group has no leader, and the one across a wire
+                # raises ``NodeUnreachable`` - which is one - when no address answered.
+                # Both mean the same thing here: nothing was asked, so nothing is known.
+                last_error = str(nothing_read)
+                time.sleep(RETRY_BACKOFF * (attempt + 1))
+                continue
+
+            placement = table.shard(shard_id)
+            if placement is None:
+                return ProposalResult(
+                    ProposalOutcome.REJECTED,
+                    f"shard {shard_id} is not in the routing table")
+
+            result = client.move_shard(shard_id, placement.nodes, target_nodes, addresses)
+            if result.success:
+                return ProposalResult(ProposalOutcome.OK)
+
+            if result.error_code != ErrorCode.ERR_NOT_LEADER:
+                return ProposalResult(ProposalOutcome.REJECTED, result.error_msg)
+
+            # Not the leader, and the client has already followed every name it was
+            # given - so either the group changed under it or nothing answered at all.
+            # Reading the table again is the only way to tell those apart, and it is
+            # where the next attempt starts.
+            last_error = result.error_msg
+            time.sleep(RETRY_BACKOFF * (attempt + 1))
+
+        return ProposalResult(ProposalOutcome.UNREACHABLE, last_error)
+
+    def _commit_move(self, shard_id: int, target_nodes: List[int],
+                     drain: float = MIGRATION_DRAIN_SECONDS) -> List[int]:
+        """Make the new group the shard's, and let the group it left go.
+
+        Called once the routing table says the shard is served by ``target_nodes`` - by
+        the move that proposed it, and by a cluster that comes back and finds that it is.
+        The order is not free:
+
+        1.  This cluster's own answer for the shard becomes the new set, so every question
+            it answers about the shard - who serves it, where its leader is, which address
+            to publish - is answered with the group the table names.  The group it left is
+            still up for the next step, and is not the answer to anything.
+        2.  That group goes on answering for a fixed window (``drain``).  A client routes
+            by a table it cached, so the node it was sent to a moment ago is a node it may
+            still ask: the window is what lets a client finish the read it arrived with
+            instead of meeting a closed port.  It cannot take new rows - it has been
+            frozen since before the copy, and stays frozen through all of this - so what
+            it can still answer is a read of what the copy already carried away.
+        3.  The move's note goes, while the storage holding it is still open.  The note is
+            what a cluster that comes back reads to find a move in flight; after this
+            there is none to find, and a note left inside a storage about to be closed
+            could not be deleted at all.
+        4.  The group goes: its node, its port and its storage, on every node that is not
+            in the new set.
+        5.  What is left on disk is renamed rather than deleted -
+            ``orphan-shard-<id>-<when>``, in the directory the shard's own storage lived
+            in.  A table that has to be put back, after a bug in the machine that holds it
+            or an operator's mistake, finds the rows still here; nobody finds them by
+            accident, because nothing looks under that name.  A leaked directory costs
+            disk and a lost range costs the data.
+
+        Every step is a no-op the second time, because the caller may be a cluster that
+        died in the middle of these and started again: closing a shard that is already
+        closed, deleting a note that is already gone and renaming a directory that is no
+        longer there are all answers rather than errors.
+
+        What it returns is the nodes whose group it closed, so an empty list is a move
+        that was already committed - which is an answer and not a failure, and is the
+        difference a caller can see between "I did it" and "it was done".
+        """
+        self._placed_shards[shard_id] = sorted(set(target_nodes))
+        self._migrations.pop(shard_id, None)
+        if self._metadata_publisher is not None:
+            # What it last published about who leads this shard was about the group that
+            # has just left, and the two groups' terms are not comparable: left alone,
+            # the publisher would not name the new group's leader until that group's term
+            # passed a term belonging to another group entirely.
+            self._metadata_publisher.forget_leader(shard_id)
+
+        if drain > 0:
+            time.sleep(drain)
+
+        self._forget_migration(shard_id)
+        return self._retire_source(shard_id)
+
+    def _forget_migration(self, shard_id: int) -> None:
+        """Drop a move's note, on every replica that wrote one.
+
+        :meth:`_remember_migration` writes to every replica of the source, and which of
+        them still hold that storage is read off the cluster rather than out of the note:
+        a note inside a group that has already been closed cannot be reached at all, no
+        matter what it says.  Deleting one that is not there is a no-op, which is what the
+        second run of a commit finds.
+        """
+        key = self._migration_record_key(shard_id)
+        for node in self._shard_nodes(shard_id):
+            if node._storage is not None:
+                node._storage.delete_admin(key)
+
+    def _retire_source(self, shard_id: int) -> List[int]:
+        """Close the group a shard left behind, on every node that is not serving it now.
+
+        Which nodes those are is read off the cluster rather than out of the move: a group
+        for the shard exists on the nodes that have one, and the nodes the table names now
+        are the ones that keep theirs.  A caller that came back after a restart has no
+        move in memory and does not need one - the placement is the whole of it.
+        """
+        target = set(self._placed_shards.get(shard_id, []))
+        retired = []
+        for node_id in sorted(self._shard_servers):
+            if node_id in target:
+                continue
+            server = self._shard_servers[node_id]
+            node = server.get_shard_node(shard_id)
+            if node is None:
+                continue
+            # Asked for before the close: the group is where its storage is known.
+            directory = node._storage.data_dir if node._storage is not None else None
+            if not server.shutdown_shard(shard_id):
+                continue
+            retired.append(node_id)
+            orphan = self._rename_storage(directory, shard_id)
+            if orphan is not None:
+                self._orphan_dirs.append(orphan)
+        return retired
+
+    def _rename_storage(self, directory: Optional[str], shard_id: int) -> Optional[str]:
+        """Move a retired shard's directory aside, under a name nothing reads.
+
+        None means there was nothing to move: a storage that keeps nothing on disk, or one
+        whose directory is already gone, which is what a second run finds.  A rename that
+        fails is left to raise - it is the one thing here that a repeat would not turn
+        into a no-op, and a caller told why is better than one told the move finished
+        while the data sits under the name clients look in.
+        """
+        if directory is None or not os.path.isdir(directory):
+            return None
+        base = os.path.join(os.path.dirname(os.path.abspath(directory)),
+                            f"orphan-shard-{shard_id}-{int(time.time())}")
+        target, suffix = base, 1
+        while os.path.exists(target):
+            # Two shards retiring into one directory within the same second: only a test
+            # does this, and a name that collided would be a rename that failed.
+            target = f"{base}-{suffix}"
+            suffix += 1
+        os.rename(directory, target)
+        return target
+
+    def orphan_dirs(self) -> List[str]:
+        """The directories this cluster has moved aside, in the order it did."""
+        return list(self._orphan_dirs)
+
     def recover_splits(self) -> List[int]:
         """Finish the splits this cluster was in the middle of when it stopped.
 
@@ -1182,13 +1482,19 @@ class ShardedRaftCluster:
         the one the table names and the one the table is about to.  Everything that
         answers a question about *the* shard - who serves it, where its leader is, which
         address to publish - means the first of them until the proposal lands, because
-        that is the one clients are being routed to.  Every other shard is served by
-        every node, which is the answer this gives when nothing is in flight.
+        that is the one clients are being routed to.
+
+        After the proposal lands it means the second of them, which is the placement this
+        cluster was told or moved to (``_placed_shards``).  A shard nothing here has an
+        entry for is served by every node, which is the model this started with and what
+        a shard a split created still gets.
         """
         state = self._migrations.get(shard_id)
-        if state is None:
-            return sorted(self._shard_servers)
-        return list(state.source_nodes)
+        if state is not None:
+            return list(state.source_nodes)
+        if shard_id in self._placed_shards:
+            return list(self._placed_shards[shard_id])
+        return sorted(self._shard_servers)
 
     def _nodes_on(self, node_ids: List[int], shard_id: int) -> List[MemoryRaftNode]:
         """The nodes of ``node_ids`` that are holding a group for ``shard_id``."""

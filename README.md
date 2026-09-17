@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 276 tests, roughly seven minutes
+pytest tests -q             # 282 tests, roughly seven minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -286,7 +286,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-276 tests.  `tests/test_durability.py` covers the correctness properties that
+282 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -685,8 +685,22 @@ Honest list of what is *not* done, roughly in priority order.
   `shard_replica_ids`, `shard_addresses`, `shard_leader`, `get_leader_for_key` - is answered
   with that group (`_serving_nodes`), so a group nothing routes to yet is not published.  A
   cluster that comes back finds the note and freezes the shard again, and waits for a
-  caller: nothing resumes a move on its own.  A client can reach a shard it was never handed a
-  handle on, by the address the table names for it (`client/remote_node_client.py`), and a
+  caller: nothing resumes a move on its own.  The two calls that finish one exist and are
+  tested on their own, and are deliberately not wired in yet.  `_propose_move` tells the
+  table the shard's new replica set, reading the set being replaced out of the table on
+  every attempt rather than proposing this process's own view of it: the machine refuses a
+  move whose expectation of the current set is wrong (code 14), so a guessed one is refused
+  every time two moves were computed from one table.  `_commit_move` then makes the
+  cluster's own answers follow the table, keeps the group the shard left answering for a
+  fixed window - `MIGRATION_DRAIN_SECONDS`, because a client routes by a table it cached and
+  the node it was sent to a moment ago is one it may still ask - closes that group on every
+  node that is not serving the shard now, drops the move's note while the storage holding it
+  is still open, and renames the storage it leaves behind to `orphan-shard-<id>-<when>`
+  rather than deleting it: a table that has to be put back - after a bug in the machine that
+  holds it, or an operator - finds the rows still on disk, and a leaked directory costs disk
+  where a lost range costs the data.  See `tests/test_move_proposal.py`.
+  A client can reach a shard it was never handed a handle on, by the address the table names
+  for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
   (`launcher.py`, and `tests/_cluster.py` over it), which is how one shard's client
   service is tested across processes, and the CLI reaches a cluster the same way
@@ -704,6 +718,10 @@ Honest list of what is *not* done, roughly in priority order.
   prose cannot, and closing that means widening the `ClientService` contract rather than
   adding a line, which is why it is written down rather than done: the callers that exist
   today read the message, and `tests/test_group_clients.py` pins what the wire answers.
+  A move's proposal is the first caller with a reason to mind.  It reads nothing but the
+  code - a refusal is final, whatever it said, and only silence is retried - so it is not
+  the message that decides anything today.  A caller that wanted to re-read the table after
+  a 14, and to walk away from a 15, would be telling them apart by prose.
 * **The remote metadata client's two placement-changing writes are smoke-tested, not
   driven.**  `RemoteMetadataClient.split_shard` was missing outright until a move needed
   its twin, and the failure that would have caused is an `AttributeError` inside
@@ -712,6 +730,14 @@ Honest list of what is *not* done, roughly in priority order.
   that the command arrives as itself and is checked by the machine
   (`tests/test_group_clients.py`).  What is still owed is a cluster driven end to end
   through the remote client.
+* **No client has been driven across a move's window.**  The table is rewritten under a
+  client that cached the one before it, and the group it was routed to goes on answering for
+  a fixed window and then stops - that window exists for a client, and no test has one on
+  the other side of it.  What is verified is the two ends: the table names the new group
+  once the move is committed, and the old group's port is closed when the window is over
+  (`tests/test_move_proposal.py`).  Whether a client that was routed to the old group meets
+  a refusal it can act on or a connection it can recover from is the question, and it is
+  owed a test with a client and a move happening at the same time.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
