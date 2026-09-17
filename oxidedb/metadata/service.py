@@ -63,6 +63,11 @@ class MetadataCommandType:
     #: range a shard answers for, and it is proposed after the rows have moved, so
     #: the group checks it against the table rather than believing the caller.
     SPLIT = b"split"
+    #: Move one shard's whole replica set to another one.  Like a split, it is proposed
+    #: after the rows are already in the new group - see ``design.md`` section 7 - and it
+    #: is the group that checks the call against the table, because a table naming a group
+    #: whose log does not have the rows yet is a lost range rather than a slow move.
+    MOVE_SHARD = b"move_shard"
 
 
 def serialize_metadata_command(cmd_type: bytes, **kwargs) -> bytes:
@@ -184,7 +189,7 @@ def _parse_table(payload: Dict[str, Any]) -> RoutingTable:
 class MetadataStateMachine(StateMachine):
     """The shard map, replicated.
 
-    Commands are the three ways the table changes; the read is the whole table under
+    Commands are the ways the table changes; the read is the whole table under
     :data:`TABLE_KEY`.  A command that cannot be applied is refused with a code rather
     than applied halfway, because a table that is locally wrong is worse than a write
     that failed: the whole point of the group is that everyone reading it reads the
@@ -211,6 +216,8 @@ class MetadataStateMachine(StateMachine):
                 return self._apply_report_leader(cmd)
             if cmd_type == MetadataCommandType.SPLIT:
                 return self._apply_split(cmd)
+            if cmd_type == MetadataCommandType.MOVE_SHARD:
+                return self._apply_move_shard(cmd)
 
             return ApplyResult.failure(1, f"Unknown metadata command: {cmd_type!r}")
         except Exception as error:
@@ -362,6 +369,90 @@ class MetadataStateMachine(StateMachine):
         return ApplyResult.failure(
             9, f"shard {new_shard_id} is already in the routing table "
                f"({right.start!r}, {right.end!r})")
+
+    def _apply_move_shard(self, cmd: Dict[str, Any]) -> ApplyResult:
+        """Replace one shard's replica set with the one that now holds its rows.
+
+        The second command that changes a placement, and the order is the split's: the rows
+        are copied to the new group first, so this arrives when the data has already moved
+        and the table is the last thing to learn about it - and the first thing a client
+        believes.  A move proposed before the copy would send every client to a group whose
+        log does not have the rows, which is not a slower move but a lost range.
+
+        What a move may not do is change the range.  Ranges are the split's business, and a
+        proposal that moved a shard and re-ranged it would be two writes the caller asked
+        for as one, the second of which the group has no way to check: the rows would have
+        been copied by whatever rule the caller used.
+
+        The refusals, each with its own code because they mean different things to a caller
+        deciding whether to retry:
+
+        * 12 - the shard to move is not in the table.
+        * 13 - the replica set being proposed could not serve the shard: it is empty,
+          repeats a node, or leaves one of its nodes with no address.  The whole point of
+          the switch is that clients are sent to the new nodes, so a set the table cannot
+          name an address for is the same as no set at all.
+        * 14 - the shard's replica set is not the one this proposal expects to replace.
+          Somebody else moved it, or the caller read the table before something else
+          changed it, and the caller has to read the table again before believing itself.
+        * 15 - the new replica set overlaps the one leaving.  A node cannot hold two groups
+          for one shard, and a set that partly overlaps is a member change - which needs
+          the group that is already serving, and is not implemented here.
+        * 16 - the shard already serves the proposed nodes, but with other addresses.
+
+        A retry of a move that already applied is a success rather than a conflict, for the
+        reason a retried split is: the caller cannot tell a lost response from a lost
+        proposal, so the group has to answer both the same way.
+
+        The leader and its term go with the group that is leaving, and that is not the
+        ``set_shard_nodes`` rule - it is unconditionally both.  A move replaces the whole
+        replica set, so the node that reported leading is not the leader of what serves the
+        shard now even if its id is on both sides of the proposal: that is a different
+        group, with its own election, and a claim carried over would name a leader that was
+        never elected there.
+        """
+        shard_id = int(cmd["shard_id"])
+        from_nodes = [int(node_id) for node_id in cmd["from_nodes"]]
+        nodes = [int(node_id) for node_id in cmd["nodes"]]
+        addresses = {int(entry[0]): str(entry[1]) for entry in cmd["addresses"]}
+
+        with self._lock:
+            placement = self._shards.get(shard_id)
+            if placement is None:
+                return ApplyResult.failure(
+                    12, f"shard {shard_id} is not in the routing table")
+
+            if not nodes or len(set(nodes)) != len(nodes) or any(
+                    node_id not in addresses for node_id in nodes):
+                return ApplyResult.failure(
+                    13, f"{nodes!r} cannot serve shard {shard_id}: a replica set is not "
+                        f"empty, does not repeat a node, and gives every node of it an "
+                        f"address")
+
+            if placement.nodes == nodes:
+                if placement.addresses == addresses:
+                    return ApplyResult.success()
+                return ApplyResult.failure(
+                    16, f"shard {shard_id} already serves {nodes}, at addresses "
+                        f"{placement.addresses!r} rather than {addresses!r}")
+
+            if placement.nodes != from_nodes:
+                return ApplyResult.failure(
+                    14, f"shard {shard_id} is served by {placement.nodes}, not by "
+                        f"{from_nodes} as this proposal expected")
+
+            if set(nodes) & set(from_nodes):
+                return ApplyResult.failure(
+                    15, f"{nodes} overlaps the replica set leaving shard {shard_id} "
+                        f"({from_nodes}); a move replaces the group, and a node cannot "
+                        f"hold two groups for one shard")
+
+            placement.nodes = nodes
+            placement.addresses = addresses
+            placement.leader_id = None
+            placement.leader_term = 0
+            self._version += 1
+        return ApplyResult.success()
 
     # -- reads -------------------------------------------------------------
 
@@ -535,6 +626,27 @@ class MetadataClient:
         return self._propose(
             MetadataCommandType.REPORT_LEADER,
             shard_id=shard_id, node_id=node_id, term=term,
+        )
+
+    def move_shard(self, shard_id: int, from_nodes: List[int], nodes: List[int],
+                   addresses: Optional[Dict[int, str]] = None) -> ApplyResult:
+        """Record that ``shard_id`` is served by ``nodes`` now, and not by ``from_nodes``.
+
+        The rows have to be in the new group before this is proposed: the table is what
+        clients route by, so the pass that names a node is the pass callers are sent there.
+        ``from_nodes`` is what the caller believes is serving the shard, and the group
+        refuses a move whose expectation does not hold - two moves of one shard, each
+        computed from the same table, would otherwise both apply, and the second would name
+        a group that never received the data.  A retry is safe: the group recognises the
+        move it already applied.
+        """
+        return self._propose(
+            MetadataCommandType.MOVE_SHARD,
+            shard_id=shard_id,
+            from_nodes=list(from_nodes),
+            nodes=list(nodes),
+            addresses=[[node_id, address]
+                       for node_id, address in sorted((addresses or {}).items())],
         )
 
     def _propose(self, cmd_type: bytes, **kwargs) -> ApplyResult:
