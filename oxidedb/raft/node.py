@@ -22,6 +22,20 @@ class NodeState(Enum):
 NOOP_COMMAND = b""
 
 
+#: The two reasons a shard can be frozen, and what a caller is told when one refuses a
+#: write.  The messages differ because the caller's next move does: a split leaves the
+#: shard answering for the half below the point, a move takes the shard away from this
+#: group altogether.
+FREEZE_SPLIT = "split"
+FREEZE_MIGRATION = "migration"
+FREEZE_REFUSALS = {
+    FREEZE_SPLIT: (ErrorCode.ERR_SPLIT_IN_PROGRESS,
+                   "the shard is being split; a new write is refused"),
+    FREEZE_MIGRATION: (ErrorCode.ERR_MIGRATING,
+                       "the shard is moving to another group; a new write is refused"),
+}
+
+
 #: How many recent apply results a node keeps.  ``propose`` records the result
 #: of the index it waited for and reads exactly that one back; nothing reads
 #: older entries.  Keeping one per applied command forever is a leak, because a
@@ -182,6 +196,8 @@ class MemoryRaftNode:
         # answered yet; draining them is what makes the copy a moment with a
         # beginning rather than a race with whatever is already in the air.
         self._writes_frozen = False
+        #: Why it was frozen, for the refusal it hands a caller.  See ``freeze_writes``.
+        self._freeze_reason = FREEZE_SPLIT
         self._proposes = 0
         
         self._apply_cond = threading.Condition(self._lock)
@@ -1015,9 +1031,11 @@ class MemoryRaftNode:
                 return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
             if self._writes_frozen and writes_new_data(command):
-                return ApplyResult.failure(
-                    ErrorCode.ERR_SPLIT_IN_PROGRESS,
-                    "the shard is being split; a new write is refused")
+                code, message = FREEZE_REFUSALS.get(
+                    self._freeze_reason,
+                    (ErrorCode.ERR_SPLIT_IN_PROGRESS,
+                     f"the shard is frozen ({self._freeze_reason}); a new write is refused"))
+                return ApplyResult.failure(code, message)
 
             self._proposes += 1
         try:
@@ -1044,21 +1062,26 @@ class MemoryRaftNode:
             entry = self._entry_at(self._commit_index)
             return entry is not None and entry.term == self._current_term
 
-    def freeze_writes(self) -> None:
+    def freeze_writes(self, reason: str = FREEZE_SPLIT) -> None:
         """Refuse the proposals that would add rows to this shard.
 
-        Called before the rows are copied into the shard that will own them, and
-        cleared only once the routing table says that shard owns them.  Between
+        Called before this shard's rows are read at one moment and copied somewhere
+        else - a split copying the half above a point, a move copying the whole range -
+        and cleared only once the routing table says where those rows are.  Between
         the two the shard answers for a range it is not allowed to add to, which
         is the only state in which a copy can be taken and still be the whole
         truth about that range: a row written after the copy would live in a
         shard the table no longer sends anyone to.
+
+        ``reason`` is what the refusal says, because the two operations do not answer
+        alike: see :data:`FREEZE_REFUSALS`.
 
         Applied to every replica of the shard, not just the leader, so that an
         election in the middle of the copy does not silently unfreeze it.
         """
         with self._lock:
             self._writes_frozen = True
+            self._freeze_reason = reason
 
     def resume_writes(self) -> None:
         """Take the freeze off.  See :meth:`freeze_writes`."""
@@ -1068,6 +1091,11 @@ class MemoryRaftNode:
     @property
     def writes_frozen(self) -> bool:
         return self._writes_frozen
+
+    @property
+    def freeze_reason(self) -> str:
+        """Why this shard is frozen.  Meaningful only while it is - see ``writes_frozen``."""
+        return self._freeze_reason
 
     def wait_for_writes_to_drain(self, timeout: float = 5.0) -> bool:
         """Wait until no admitted proposal is still in flight.

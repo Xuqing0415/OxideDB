@@ -28,6 +28,12 @@ class ErrorCode:
     ERR_TIMEOUT = 303
     ERR_ENTRY_OVERWRITTEN = 304
     ERR_SPLIT_IN_PROGRESS = 305
+    #: The same refusal for the other operation that reads a shard's rows at one moment
+    #: and moves them somewhere else.  A caller that hears "split" waits for this shard to
+    #: come back - it will still answer for the half below the split point - and one that
+    #: hears "migrating" has to look the range up again, because this group will not answer
+    #: for it at all.
+    ERR_MIGRATING = 306
 
 
 #: The commands that add rows to a shard, as opposed to finishing work that is
