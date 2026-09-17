@@ -176,7 +176,7 @@ class RemoteMetadataClient(_GroupClient):
     by a caller that already knows when to re-read, because a shard refused this client and
     the placement is therefore in doubt - and this one is read on the same terms.
 
-    The three writes are the cluster's, and they make the walk worth having: a publisher on a
+    The writes are the cluster's, and they make the walk worth having: a publisher on a
     node that does not lead the group is refused and told where the leader is, so its command
     lands on the pass it was proposed rather than on whichever poll happens to coincide with
     an election.  Each write answers with the result a caller acts on, and a successful one
@@ -256,6 +256,45 @@ class RemoteMetadataClient(_GroupClient):
         return self._propose(
             MetadataCommandType.REPORT_LEADER,
             shard_id=shard_id, node_id=node_id, term=term,
+        )
+
+    def split_shard(self, shard_id: int, split_key: bytes, new_shard_id: int,
+                    nodes: List[int],
+                    addresses: Optional[Dict[int, str]] = None) -> ApplyResult:
+        """Record that ``shard_id``'s range is now two ranges, one of them new.
+
+        The rows have to have been moved before this is proposed - the table is what clients
+        route by, so a range it hands out is a range whose data has to be there - and the
+        group checks the geometry against the table rather than believing the caller.  A
+        retry is safe: it recognises the split it already applied.
+        """
+        return self._propose(
+            MetadataCommandType.SPLIT,
+            shard_id=shard_id,
+            split_key=split_key,
+            new_shard_id=new_shard_id,
+            nodes=list(nodes),
+            addresses=[[node_id, address]
+                       for node_id, address in sorted((addresses or {}).items())],
+        )
+
+    def move_shard(self, shard_id: int, from_nodes: List[int], nodes: List[int],
+                   addresses: Optional[Dict[int, str]] = None) -> ApplyResult:
+        """Record that ``shard_id`` is served by ``nodes`` now, and not by ``from_nodes``.
+
+        The rows have to be in the new group before this is proposed, and ``from_nodes`` is
+        what the caller believes was serving the shard: the group refuses a move whose
+        expectation does not hold, since two moves of one shard computed from the same table
+        would otherwise both apply.  A retry is safe - the group recognises the move it
+        already applied.
+        """
+        return self._propose(
+            MetadataCommandType.MOVE_SHARD,
+            shard_id=shard_id,
+            from_nodes=list(from_nodes),
+            nodes=list(nodes),
+            addresses=[[node_id, address]
+                       for node_id, address in sorted((addresses or {}).items())],
         )
 
     def _propose(self, cmd_type: bytes, **kwargs) -> ApplyResult:

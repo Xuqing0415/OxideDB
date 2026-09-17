@@ -31,7 +31,10 @@ can be written from a node that does not lead its group.  Nothing forwards a pro
 service's behalf - the caller is the one that moves - and the writes below are what that
 buys: the placement the group already holds, written back through a member that does not
 lead; a command the table will not take, answered as a refusal rather than as another "ask
-the leader"; and a leader report that is what the table names afterwards.
+the leader"; and a leader report that is what the table names afterwards.  The two commands
+that change a placement travel that way too, and they are asked below one that refuses each
+of them on its geometry - which is how a command that arrived as itself is told from one the
+machine could not read at all.
 """
 
 import socket
@@ -509,6 +512,50 @@ class TestWritingTheTableOverTheWire:
         assert not result.success
         assert result.error_code == ErrorCode.ERR_APPLY_ERROR
         assert "999" in result.error_msg
+
+    def test_a_split_and_a_move_reach_the_machine_and_are_checked_there(
+            self, cluster, open_client):
+        """The two commands that change a placement travel as the other three do.
+
+        Neither proposal here may be one that applies: a split that applied would re-range a
+        live cluster out from under the rest of this module, and there is nowhere for a move
+        to go.  So both are refused, and what the refusals pin is the thing a command type can
+        get wrong: a ``bytes`` that arrives as text is an unknown command, and that refusal
+        says so.  Both of these come back instead in the machine's own words about the
+        geometry it was asked about, which is only possible for a command it read.
+
+        The refusals arrive as ``ERR_APPLY_ERROR`` rather than as the machine's own codes,
+        which is the shape of every refusal over this port - the wire's codes are the
+        transport's few, and the message is where the detail is.  The version is deliberately
+        not asserted either: the publisher's next pass is free to report a leader, and what a
+        refusal must not do is change the ranges or who serves them.
+        """
+        client = open_client(RemoteMetadataClient, cluster.metadata_seeds)
+        table = wait_until(_asking(lambda: _published_table(client, cluster.num_shards)),
+                           message="the table was never read over the wire")
+        placement = table.shard(0)
+
+        # The end of a range is not inside it, so this split is refused and not applied.
+        refused_split = client.split_shard(placement.shard_id, placement.end, 99,
+                                           placement.nodes, placement.addresses)
+        assert not refused_split.success
+        assert refused_split.error_code == ErrorCode.ERR_APPLY_ERROR
+        assert "not inside" in refused_split.error_msg, refused_split.error_msg
+
+        # ...and this move expects a replica set the table does not hold, which is the guard
+        # against two moves computed from one table.  Its target is a set the table does not
+        # hold either: a move whose target is already what the shard is served by is a
+        # success and not a refusal, which is what makes a retry after a lost response work.
+        refused_move = client.move_shard(placement.shard_id, [95, 96], [97, 98],
+                                         {97: "127.0.0.1:59751", 98: "127.0.0.1:59851"})
+        assert not refused_move.success
+        assert refused_move.error_code == ErrorCode.ERR_APPLY_ERROR
+        assert "as this proposal expected" in refused_move.error_msg, refused_move.error_msg
+
+        after = client.table(refresh=True)
+        assert after.routes() == table.routes()
+        assert after.shard(0).nodes == placement.nodes
+        assert after.shard(0).addresses == placement.addresses
 
     def test_a_report_from_a_client_is_what_the_table_names_afterwards(
             self, cluster, open_client):
