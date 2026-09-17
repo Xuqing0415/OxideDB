@@ -199,6 +199,24 @@ class MetadataPublisher:
         with self._lock:
             self._leaders[shard_id] = observed
 
+    def forget_leader(self, shard_id: int) -> None:
+        """Forget which node leads a shard, because the group that led it has left.
+
+        A move replaces a shard's replica set, and the terms of two different groups are
+        not comparable: the guard above - which keeps a stale report from overwriting a
+        newer one - would keep the new group's leader from being published at all, for as
+        long as the old group's term happened to be the higher of the two.  What is
+        forgotten here is not a fact about a shard; it is a fact about a group that is no
+        longer serving it.
+
+        The other half of what this publisher remembers, which shard's replica set it has
+        already published, is deliberately left alone: the move is the one writer of that
+        fact, and a publisher that wrote it again from the cluster's own view would be a
+        second writer of something the table has already been told.
+        """
+        with self._lock:
+            self._leaders.pop(shard_id, None)
+
     def leaders(self) -> Dict[int, Tuple[int, int]]:
         """What this publisher has told the table, for callers that want to look."""
         with self._lock:
