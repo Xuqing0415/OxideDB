@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 270 tests, roughly seven minutes
+pytest tests -q             # 276 tests, roughly seven minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -187,8 +187,12 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   `split_shard` is wired end to end: it freezes the range,
   copies the rows into the new shard's group as the versions they already were, proposes
   the split to the table, and re-ranges the servers locally before thawing the source -
-  and a split that dies before its proposal is finished on the next start.  See Known
-  gaps for what is still missing: no migration and no follower reads.
+  and a split that dies before its proposal is finished on the next start.  A move of a
+  shard to another group has the half that has to be right first: `move_shard` freezes the
+  source, copies its rows into a group on the nodes the caller named - at the timestamps
+  they already had - and then stops, because the proposal that would make that group the
+  shard's is not wired.  See Known gaps for what is still missing: a move that finishes,
+  and follower reads.
 
 ## Storage engines (plan E)
 
@@ -282,7 +286,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-270 tests.  `tests/test_durability.py` covers the correctness properties that
+276 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -627,7 +631,7 @@ Honest list of what is *not* done, roughly in priority order.
   shard, and a client outside the cluster can write the table through a member that does not
   lead it.
 * **Sharding is experimental, and frozen wherever it would have to move by itself: no
-  migration, no follower read.**  Every component routes
+  move that finishes, no follower read.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
   set and the leaders that reported themselves, and `MetadataClient` reads it with the
@@ -664,9 +668,24 @@ Honest list of what is *not* done, roughly in priority order.
   shard again, copies only what the new shard is missing, and proposes the split.
   What is still missing around it: it does not coordinate with a write that resolved to the
   old shard just before the range moved, so the copy can end up behind such a write; the
-  copies left in the old shard are never reclaimed; nothing chooses split points or moves
-  a shard between nodes, so there is no migration, no automatic splitting and no follower
-  reads - every read goes to the leader.  A client can reach a shard it was never handed a
+  copies left in the old shard are never reclaimed; nothing chooses split points; and a move
+  of a shard between nodes stops before the proposal that would make it a move, so there is
+  no automatic splitting and no follower reads either - every read goes to the leader.
+  A move has the half that has to be right first.  `move_shard(shard_id, target_nodes)`
+  freezes the source - refusing its writes with `ERR_MIGRATING`, which is deliberately not
+  the split's answer, because a caller told a shard is moving has to look the range up
+  again - reads its rows at that one moment, builds a group on the nodes the caller named,
+  copies the rows into it as the versions they already were, and then raises
+  `NotImplementedError`, with the shard left frozen and the move written into the source
+  shard's own storage before the first row moves.  The target set is the caller's to name
+  and has to be disjoint from the one serving the shard: a node cannot hold two groups for
+  one shard, and a set that overlapped would need a member changed in place, which is not
+  something this project's Raft does.  Until the proposal lands the table keeps naming the
+  group the shard is leaving, and every question the cluster answers about *the* shard -
+  `shard_replica_ids`, `shard_addresses`, `shard_leader`, `get_leader_for_key` - is answered
+  with that group (`_serving_nodes`), so a group nothing routes to yet is not published.  A
+  cluster that comes back finds the note and freezes the shard again, and waits for a
+  caller: nothing resumes a move on its own.  A client can reach a shard it was never handed a
   handle on, by the address the table names for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
   (`launcher.py`, and `tests/_cluster.py` over it), which is how one shard's client
@@ -677,6 +696,22 @@ Honest list of what is *not* done, roughly in priority order.
   cluster object at all - but a client *without* one still routes by the cluster's own
   nodes, and the cross-shard transaction test is still driven in the cluster's own process.
   What the CLI cannot do is read from a follower; every read goes to a leader.
+* **A refusal from a state machine loses its own code on the way to a client.**  The
+  machine answers a refused command with a code of its own - a split point outside the
+  range is 8, a move whose expectation of the replica set does not hold is 14 - and the
+  wire has one code for all of them (`ERR_APPLY_ERROR`), with the detail left in the
+  message.  A caller that wants to decide whether to retry from the code rather than from
+  prose cannot, and closing that means widening the `ClientService` contract rather than
+  adding a line, which is why it is written down rather than done: the callers that exist
+  today read the message, and `tests/test_group_clients.py` pins what the wire answers.
+* **The remote metadata client's two placement-changing writes are smoke-tested, not
+  driven.**  `RemoteMetadataClient.split_shard` was missing outright until a move needed
+  its twin, and the failure that would have caused is an `AttributeError` inside
+  `ShardedRaftCluster._publish_split` - unseen because every cluster that splits a shard in
+  `tests/` holds the in-process client.  Both writes are now tested as far as the wire:
+  that the command arrives as itself and is checked by the machine
+  (`tests/test_group_clients.py`).  What is still owed is a cluster driven end to end
+  through the remote client.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written

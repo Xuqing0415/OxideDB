@@ -1,5 +1,5 @@
 # EXPERIMENTAL: sharding is wired end to end for a placement that never has to change -
-# no migration and no follower read, so do not build a deployment on it
+# no follower read, and no move that finishes, so do not build a deployment on it
 """The one routing rule in the codebase.
 
 Every component that needs to know which shard owns a key - the shard server,

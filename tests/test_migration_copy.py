@@ -1,0 +1,258 @@
+"""A shard moved to another group: frozen where it is, copied to where it is going.
+
+A move is a split's protocol with the whole range as its subject - freeze the source, read
+its rows at one moment, copy them into the group that will own them, and only then tell the
+routing table - and it stops one step earlier than a split does today: the proposal that
+makes the new group the shard's is not wired, so a move that has copied its rows raises
+rather than pretending it finished.  What is here is the half that has to be right before
+any of that matters: no row is copied out of a shard that can still take writes, no group
+the cluster would route to is built before the table says so, and a move that cannot be
+made leaves the shard exactly as it was.
+
+What these tests pin: a shard's rows land in a new group on the nodes it was given, at the
+timestamps they already had, on every node of that group; while it is being moved the shard
+refuses new rows - with the refusal a move gives, which is not a split's - and the cluster
+still answers "who serves this shard" with the group it is leaving; a move onto a node that
+already serves the shard is refused before anything is frozen; a transaction holding a lock
+in the range stops a move and thaws the shard it had just frozen; and a move that died is
+found by the next start, as a frozen shard and the note it left behind.
+"""
+
+import pytest
+
+from _wait import wait_until
+from oxidedb.raft.shard_server import MigrationPhase, ShardedRaftCluster
+from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
+from oxidedb.raft.storage import EngineRaftStorage
+
+COUNT = 100
+KEYS = [b"key%03d" % index for index in range(COUNT)]
+VALUES = [b"value%03d" % index for index in range(COUNT)]
+
+#: Shard 0 of a one-shard map owns the whole keyspace, so where a key is is not a
+#: question these tests have to ask.
+MOVE_TO = [2, 3]
+NOTE = "migrate/0"
+
+
+def _set(state_machine, key, value, timestamp):
+    return state_machine.serialize_command(
+        CommandType.SET, key=key, value=value, timestamp=timestamp)
+
+
+def _prewrite(state_machine, key, value, start_ts):
+    return state_machine.serialize_command(
+        CommandType.PREWRITE, key=key, value=value, start_ts=start_ts, primary_key=key)
+
+
+def _started_cluster(tmp_path, shard_nodes=None):
+    cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
+    cluster.start(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        storage_factory=lambda node_id, shard_id: EngineRaftStorage(
+            data_dir=str(tmp_path / f"shard{shard_id}_node{node_id}")),
+        shard_nodes=shard_nodes,
+        lock_cleaner_interval=None,
+    )
+    return cluster
+
+
+def _write_rows(cluster, count=COUNT):
+    leader = wait_until(lambda: cluster.get_leader_for_key(KEYS[0]),
+                        message="shard 0 never elected a leader")[1]
+    for index in range(count):
+        assert leader.propose(
+            _set(leader._state_machine, KEYS[index], VALUES[index], index + 1)).success
+    return leader
+
+
+def _group(cluster, node_id, shard_id):
+    """The group that node holds for the shard, or None - peer set included."""
+    return cluster.get_shard_server(node_id).get_shard_node(shard_id)
+
+
+def test_a_shards_rows_land_in_a_new_group_on_the_nodes_it_was_given(tmp_path):
+    """The copy, and the two things about it that a table entry will depend on.
+
+    Every row is in the new group at the timestamp it already had - a copy stamped with
+    the moment of the move would be newer than any timestamp a client holds, and a
+    snapshot read would not see it - and every node of the new group has it, not just the
+    one the rows were sent to.
+    """
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    try:
+        leader = _write_rows(cluster)
+        source_storage = leader._state_machine._storage
+        committed = {key: source_storage.get_latest_version(key).timestamp for key in KEYS}
+
+        with pytest.raises(NotImplementedError):
+            cluster.move_shard(0, MOVE_TO)
+
+        state = cluster.migration_state(0)
+        assert state.phase == MigrationPhase.PROPOSING, "the copy is done and the switch owed"
+        assert state.target_nodes == MOVE_TO
+        assert state.source_nodes == [1]
+        assert sorted(state.copied_keys) == sorted(KEYS), "every row was copied"
+
+        target_leader = wait_until(lambda: cluster._leader_on(MOVE_TO, 0),
+                                   message="the new group never elected a leader")
+        for index, key in enumerate(KEYS):
+            assert target_leader.get(key).value == VALUES[index], key
+            for node_id in MOVE_TO:
+                version = _group(cluster, node_id, 0)._state_machine._storage.get_latest_version(key)
+                assert version is not None, (node_id, key)
+                assert version.timestamp == committed[key], (node_id, key)
+
+        # The group it is leaving is still the shard: the table has not been told, so a
+        # client has to keep being sent there and not to the group nothing routes to yet.
+        assert cluster.shard_replica_ids(0) == [1]
+        assert cluster.get_leader_for_key(KEYS[0])[0] == 1
+
+        # ...and it is still frozen, because a shard in two places is a shard that must
+        # not take a row only one of them would have.  A thaw is the proposal's to make.
+        assert leader.writes_frozen
+    finally:
+        cluster.shutdown()
+
+
+def test_the_shard_is_frozen_while_its_rows_are_copied(tmp_path, monkeypatch):
+    """Observed from inside the copy, which is the only place that can see it.
+
+    The row about to be copied is read from a shard that is refusing new rows at that
+    moment, and the refusal says a move rather than a split: the caller's next move is not
+    to wait for this shard to come back but to look the range up again, because this group
+    will not answer for it.
+    """
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    seen = {}
+    original = ShardedRaftCluster._move_row
+
+    def spy_move_row(self, source_leader, target_leader, key, value):
+        if not seen:
+            seen["frozen"] = source_leader.writes_frozen
+            seen["reason"] = source_leader.freeze_reason
+            seen["refused"] = source_leader.propose(
+                _set(source_leader._state_machine, b"x_new", b"v", 999))
+        return original(self, source_leader, target_leader, key, value)
+
+    monkeypatch.setattr(ShardedRaftCluster, "_move_row", spy_move_row)
+    try:
+        _write_rows(cluster, count=3)
+        with pytest.raises(NotImplementedError):
+            cluster.move_shard(0, MOVE_TO)
+    finally:
+        cluster.shutdown()
+
+    assert seen, "the move copied no rows, so nothing was observed"
+    assert seen["frozen"] is True, "the source was open while its rows were read"
+    assert seen["reason"] == "migration"
+    assert not seen["refused"].success
+    assert seen["refused"].error_code == ErrorCode.ERR_MIGRATING
+    assert "moving to another group" in seen["refused"].error_msg
+
+
+def test_a_move_onto_a_node_that_already_serves_the_shard_is_refused(tmp_path):
+    """A set that overlaps is not a move, and nothing is frozen to find that out.
+
+    The refusal comes before the freeze, which is the point of it: a caller that named the
+    wrong nodes has not asked for anything, and a shard left frozen by it would be a shard
+    nobody meant to stop.
+    """
+    cluster = _started_cluster(tmp_path)
+    try:
+        leader = _write_rows(cluster, count=1)
+
+        assert cluster.move_shard(0, MOVE_TO) is False
+        assert "already serve shard 0" in cluster.migration_error()
+        assert not leader.writes_frozen, "the caller was told no, so nothing was frozen"
+        assert cluster.migrations() == {}
+        assert _group(cluster, 2, 0).state is not None, "shard 0's group is untouched"
+        assert cluster.get_shard_server(2).shard_replica_ids(0) == [1, 2, 3]
+    finally:
+        cluster.shutdown()
+
+
+def test_a_lock_in_the_range_stops_the_move_and_thaws_the_shard(tmp_path):
+    """A lock may be a commit on its way, and a copy taken with one in flight is a loss.
+
+    The refusal is a reason to wait rather than a reason to stop answering: the shard is
+    exactly as it was, and the next attempt - once the transaction has settled - goes
+    through.
+    """
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    try:
+        leader = _write_rows(cluster, count=2)
+        assert leader.propose(_prewrite(leader._state_machine, KEYS[0], b"v", 10)).success
+
+        assert cluster.move_shard(0, MOVE_TO) is False
+        assert "lock" in cluster.migration_error()
+        assert not leader.writes_frozen, "a refused move has to thaw the shard"
+        assert cluster.migrations() == {}
+        assert _group(cluster, 2, 0) is None, "no group was built for a move that stopped"
+    finally:
+        cluster.shutdown()
+
+
+def test_a_move_that_died_comes_back_as_a_frozen_shard(tmp_path):
+    """The freeze is a fact about the shard, so it has to outlive the process that set it.
+
+    A cluster coming back cannot know how far the move got - the note deliberately does
+    not say - and a shard whose rows may already be in another group must not take rows
+    while that is unknown.  So it comes back frozen, and the note is what says where it
+    was going.
+    """
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    try:
+        _write_rows(cluster, count=2)
+        with pytest.raises(NotImplementedError):
+            cluster.move_shard(0, MOVE_TO)
+
+        note = _group(cluster, 1, 0)._storage.load_admin(NOTE)
+        assert note is not None, "the move is written down before a row is moved"
+    finally:
+        cluster.shutdown()
+
+    revived = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    try:
+        state = revived.migration_state(0)
+        assert state is not None, "the note is what a restarted cluster picks up"
+        assert state.target_nodes == MOVE_TO
+        assert state.source_nodes == [1]
+        assert state.phase == MigrationPhase.FREEZING
+
+        leader = wait_until(lambda: revived._shard_leader_node(0),
+                            message="the revived shard never elected a leader")
+        assert leader.writes_frozen, "a shard that may be in two places cannot take rows"
+        assert leader.freeze_reason == "migration"
+
+        # A caller picks the move up by asking for it again.  The rows are read out of the
+        # source - the note does not carry them - and the copy skips what the new group
+        # already has, which is what makes asking twice safe to do at all.
+        with pytest.raises(NotImplementedError):
+            revived.move_shard(0, MOVE_TO)
+        assert len(state.rows) == 2, "the rows are read out of the source again"
+        assert state.copied_keys == [], "the new group already had every row"
+        assert _group(revived, 2, 0) is not None, "and there is a group to switch to"
+    finally:
+        revived.shutdown()
+
+
+def test_a_shard_that_is_already_moving_refuses_a_different_move(tmp_path):
+    """One shard, one move in flight: two of them would be two groups and one range.
+
+    The refusal is about the target and not about the shard being busy, which is why it
+    names the move that is standing: a caller that asked for the same move is served (see
+    the test above), and a caller that asked for another one is told what is in the way.
+    """
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    try:
+        _write_rows(cluster, count=2)
+        with pytest.raises(NotImplementedError):
+            cluster.move_shard(0, MOVE_TO)
+
+        assert cluster.move_shard(0, [2]) is False
+        assert "already moving to [2, 3]" in cluster.migration_error()
+        assert cluster.migration_state(0).target_nodes == MOVE_TO, "the move stands"
+        assert _group(cluster, 2, 0) is not None, "and its new group is still there"
+    finally:
+        cluster.shutdown()
