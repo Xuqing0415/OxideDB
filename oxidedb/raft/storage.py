@@ -101,6 +101,31 @@ class RaftStorage(ABC):
     def delete_admin(self, key: str) -> None:
         """Forget a note written by :meth:`save_admin`.  Its absence is the point."""
 
+    def close(self) -> None:
+        """Let go of whatever this storage is holding open.
+
+        Nothing, for a storage that keeps nothing open between calls, which is why it is
+        not abstract.  It is here for the one caller that has to have the files released
+        before it touches them: a group being closed for good, whose directory is about to
+        be moved aside (see ``ShardedRaftCluster._commit_move``).  A whole cluster closing
+        releases its storages as part of that; one group closing on its own has no such
+        owner, so it asks the storage itself.
+
+        Calling it twice is calling it once.
+        """
+        pass
+
+    @property
+    def data_dir(self) -> Optional[str]:
+        """The directory this storage keeps its files in, or None if it has none.
+
+        The directory and not the file, because the one caller is a rename: a shard that
+        has moved leaves its whole storage behind under a name nothing reads.  None is the
+        honest answer for a storage that writes wherever it is told, and for one that keeps
+        everything in memory.
+        """
+        return None
+
     @abstractmethod
     def clear(self) -> None:
         pass
@@ -116,6 +141,10 @@ class JSONFileStorage(RaftStorage):
         self._log_path = os.path.join(data_dir, "raft_log.json")
         self._snapshot_path = os.path.join(data_dir, "raft_snapshot.bin")
         self._admin_path = os.path.join(data_dir, "raft_admin.json")
+
+    @property
+    def data_dir(self) -> Optional[str]:
+        return self._data_dir
 
     def _atomic_write(self, path: str, data: dict) -> None:
         fd, temp_path = tempfile.mkstemp(dir=self._data_dir)
@@ -273,6 +302,17 @@ class EngineRaftStorage(RaftStorage):
         if engine is None:
             engine = create_engine(data_dir, name="raft")
         self._engine = engine
+
+    @property
+    def data_dir(self) -> Optional[str]:
+        """Where the database lives, or None for an engine that keeps nothing on disk.
+
+        Asked of the engine rather than kept beside it, because the engine is what was
+        told the directory: a second copy here would be a second answer, and a node handed
+        an engine it built itself has no directory this class ever saw.
+        """
+        path = getattr(self._engine, "path", None)
+        return None if path is None else os.path.dirname(os.path.abspath(path))
 
     @staticmethod
     def _log_key(index: int) -> bytes:
