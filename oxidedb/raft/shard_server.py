@@ -483,6 +483,7 @@ class ShardedRaftCluster:
         self._load_pending_migrations()
         self.start_metadata_publisher(metadata, metadata_publish_interval)
         self._finish_pending_splits()
+        self._finish_pending_migrations()
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards")
     
     def start_network(self, state_machine_factory: Callable[[], StateMachine],
@@ -507,6 +508,7 @@ class ShardedRaftCluster:
         self._load_pending_migrations()
         self.start_metadata_publisher(metadata, metadata_publish_interval)
         self._finish_pending_splits()
+        self._finish_pending_migrations()
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards (network mode)")
 
     def start_lock_cleaner(self, interval: Optional[float] = DEFAULT_LOCK_CLEANER_INTERVAL,
@@ -808,7 +810,8 @@ class ShardedRaftCluster:
             self._move_row(source, target, key, value)
         return True
 
-    def move_shard(self, shard_id: int, target_nodes: List[int]) -> bool:
+    def move_shard(self, shard_id: int, target_nodes: List[int],
+                   drain: float = MIGRATION_DRAIN_SECONDS) -> bool:
         """Move ``shard_id`` to a new group on ``target_nodes``: freeze, copy, tell, let go.
 
         Called to start a move and to look again at one that is already under way.
@@ -832,6 +835,12 @@ class ShardedRaftCluster:
         same target set asks for the copy to be finished, which is idempotent because a
         row already in the new group at the same timestamp is the row.  A different target
         set is refused - there is no answer to that which would not lose one of the two.
+
+        ``drain`` is how long the group the shard leaves goes on answering once the table
+        has moved on, handed to :meth:`_commit_move`: a client routes by a table it cached,
+        and the node it was sent to a moment ago is one it may still ask.  A caller making
+        a move waits it out; a cluster finishing one it found already written down does
+        not, which is why it is a parameter rather than only a constant.
 
         A ``True`` answer means the table names the new group and the old one is closed.
         A ``False`` one means the move did not get there, and there are two ways that
@@ -858,7 +867,7 @@ class ShardedRaftCluster:
                 self._last_migration_error = (
                     f"shard {shard_id} is already moving to {in_flight.target_nodes}")
                 return False
-            return self._finish_move(in_flight)
+            return self._finish_move(in_flight, drain=drain)
 
         old_range = self._range_map.get(shard_id)
         if old_range is None:
@@ -914,7 +923,7 @@ class ShardedRaftCluster:
             self._remember_migration(state)
 
             copied = True
-            return self._finish_move(state)
+            return self._finish_move(state, drain=drain)
         finally:
             if not copied:
                 # Nothing of this move exists anywhere: no group was built and no row was
@@ -922,7 +931,8 @@ class ShardedRaftCluster:
                 self._migrations.pop(shard_id, None)
                 self._unfreeze_shard(shard_id, node_ids=source_nodes)
 
-    def _finish_move(self, state: MigrationState) -> bool:
+    def _finish_move(self, state: MigrationState,
+                     drain: float = MIGRATION_DRAIN_SECONDS) -> bool:
         """Copy the rows into the new group, tell the table, and let the old group go.
 
         Called for the first attempt and for every retry of it, and idempotent for the
@@ -935,6 +945,10 @@ class ShardedRaftCluster:
         first: a target node that already served the shard is a node this refuses to move
         onto (see :meth:`move_shard`), so building it is adding a group where there was
         none - and the group it replaces nothing of is the one the copy is written into.
+
+        ``drain`` is the window the group it left goes on answering for, handed to
+        :meth:`_commit_move`: a caller making the move waits it out, and a cluster
+        finishing one it found in the shard's own storage does not.
         """
         shard_id = state.shard_id
         source = self._wait_for_leader_on(state.source_nodes, shard_id)
@@ -950,10 +964,7 @@ class ShardedRaftCluster:
             start, end = self._range_map[shard_id]
             state.rows = self._committed_rows(source, start, end)
 
-        for node_id in state.target_nodes:
-            server = self._shard_servers[node_id]
-            if server.get_shard_node(shard_id) is None:
-                server.add_shard(shard_id, members=state.target_nodes)
+        self._ensure_group_on(state.target_nodes, shard_id)
 
         target = self._wait_for_leader_on(state.target_nodes, shard_id)
         if target is None:
@@ -984,7 +995,7 @@ class ShardedRaftCluster:
             self._last_migration_error = result.message
             return False
 
-        self._commit_move(shard_id, state.target_nodes)
+        self._commit_move(shard_id, state.target_nodes, drain=drain)
         return True
 
     def _copy_rows(self, source_leader: MemoryRaftNode, target_leader: MemoryRaftNode,
@@ -1274,6 +1285,42 @@ class ShardedRaftCluster:
         self._load_pending_splits()
         return self._finish_pending_splits()
 
+    def recover_migrations(self) -> List[int]:
+        """Finish the moves this cluster was in the middle of when it stopped.
+
+        A move writes down what it is doing before it does it - the shard, the set it is
+        leaving, the set it is going to - and the note is dropped only once the routing
+        table names the new group and the one it left has gone.  A cluster that comes back
+        and finds one is a cluster that was moving a shard when the process stopped, and
+        the routing table is what says how far it got:
+
+        * the table names the set the move was going to, so the proposal landed and what is
+          left is the half after it: the note goes and the group the shard left is let go,
+          which is :meth:`_commit_move` and nothing else.  Nothing is copied again - the
+          rows are already in the group the table names, which is the group the copy was
+          made for.
+        * the table still names the set the move was leaving, so nothing was proposed, and
+          the move is picked up where a retry of it is: freeze, copy what the new group is
+          missing, propose - which is :meth:`_finish_move`.
+        * the table names neither, which is an operator who moved the shard by hand or a
+          second move computed from the same table.  There is no answer here that is not a
+          guess, and guessing between two live groups is how a range ends up served by one
+          of them while its rows are in the other, so the shard stays frozen and the caller
+          is told what the table says.
+
+        The rows come back out of the source rather than out of the note, for the split's
+        reason: a note carrying a copy of the rows would be a second copy taken at some
+        earlier moment, and a copy of a copy is how a move loses a row.
+
+        Returns the shards whose move it finished.  A move it could not finish - the source
+        has no leader yet, the table cannot be reached, the table names a set that is
+        neither of the two - is left frozen and still remembered, and the next call picks
+        it up.  Every step is a no-op the second time, so a caller that is not sure whether
+        the last call got there may simply ask again.
+        """
+        self._load_pending_migrations()
+        return self._finish_pending_migrations()
+
     def _load_pending_splits(self) -> None:
         """Read the split notes this cluster's shards left behind, without acting."""
         for shard_id in sorted(self._range_map):
@@ -1291,8 +1338,9 @@ class ShardedRaftCluster:
         it.  The one thing that must not happen while that is unknown is the shard taking
         rows - a row written into it now would be one the new group does not have, on a
         shard the table may already have given away - so the source goes back to being
-        frozen here, and stays frozen until the move is finished.  Finishing one is a
-        caller's job for now: nothing resumes a move on its own yet.
+        frozen here, and stays frozen until the move is finished.  Finishing one is
+        :meth:`recover_migrations`, which reads the routing table to find out which half of
+        it is left.
         """
         for shard_id in sorted(self._range_map):
             if shard_id in self._migrations:
@@ -1327,6 +1375,69 @@ class ShardedRaftCluster:
 
         pending["rows"] = self._rows_above(source, shard_id, pending["split_key"])
         return self._finish_split(pending)
+
+    def _finish_pending_migrations(self) -> List[int]:
+        """Finish every move this cluster knows it was in the middle of."""
+        return [shard_id for shard_id in sorted(self._migrations)
+                if self._resume_migration(shard_id)]
+
+    def _resume_migration(self, shard_id: int) -> bool:
+        """Pick a move back up.  See :meth:`recover_migrations`."""
+        state = self._migrations.get(shard_id)
+        if state is None:
+            return False
+
+        # The freeze is a local fact, and it died with the process that set it.  It goes
+        # back on before anything else here happens: the shard may already be the new
+        # group's, and a row let into the old one now is a row nothing will carry across.
+        # This is also what makes the call safe to make twice.
+        self._freeze_shard(shard_id, reason="migration", node_ids=state.source_nodes)
+
+        if self._metadata_client is None:
+            # No table to disagree with: this cluster's own range map is the whole world to
+            # it, so nothing was proposed anywhere and the move finishes the way a retry of
+            # it does.
+            return self._finish_move(state, drain=0)
+
+        try:
+            table = self._metadata_client.table(refresh=True)
+        except RuntimeError as nothing_read:
+            # The same two shapes the proposal loop folds into one: an in-process group
+            # with no leader, and a client that found no address to ask.  Nothing was read,
+            # so nothing is known, and the move waits for the next call.
+            self._last_migration_error = str(nothing_read)
+            return False
+
+        placement = table.shard(shard_id)
+        if placement is None:
+            self._last_migration_error = (
+                f"shard {shard_id} is not in the routing table, and a move of it was in "
+                f"flight")
+            return False
+
+        if sorted(placement.nodes) == sorted(state.target_nodes):
+            # The proposal landed before the process stopped, so the shard is the new
+            # group's and the note is all that is left of the move.  The group has to be
+            # built here first: a restarted cluster builds the shards it was told to serve,
+            # and the one the table names is not necessarily one of them.
+            self._ensure_group_on(state.target_nodes, shard_id)
+            # No drain and no proposal.  A window is what lets a client that cached the old
+            # table finish the read it arrived with, and this process has been down long
+            # enough that no read is still waiting on it - waiting the window out was the
+            # caller's step, in the call that switched the table.
+            self._commit_move(shard_id, state.target_nodes, drain=0)
+            return True
+
+        if sorted(placement.nodes) == sorted(state.source_nodes):
+            # Nothing was proposed, so the copy is where the move stopped - or never
+            # started - and the call that finishes it is the one a caller retrying the
+            # move would make.
+            return self._finish_move(state, drain=0)
+
+        self._last_migration_error = (
+            f"shard {shard_id} is moving from {state.source_nodes} to "
+            f"{state.target_nodes}, and the routing table says {placement.nodes}")
+        return False
 
     def _remember_split(self, pending: Dict[str, Any]) -> None:
         """Write a split down, on every replica of the shard being split.
@@ -1438,6 +1549,23 @@ class ShardedRaftCluster:
             if server.get_shard_node(shard_id) is None:
                 server.add_shard(shard_id)
         self._num_shards = max(self._num_shards, shard_id + 1)
+
+    def _ensure_group_on(self, node_ids: List[int], shard_id: int) -> None:
+        """Make sure every node of ``node_ids`` is holding a group for ``shard_id``.
+
+        The set a move is going to, which is not a set this cluster was started with: a
+        restarted cluster builds the shards it was told to serve and nothing else, so the
+        group the routing table names has to be built here before it can answer anything.
+
+        What it comes back with is the copy.  A move's rows are committed through the group
+        they are carried into, so the storage under the new group's name on each of its
+        nodes is where they are; building the group is what reads them back, and it is the
+        only reason a restarted cluster can serve a shard it was not placed on.
+        """
+        for node_id in node_ids:
+            server = self._shard_servers[node_id]
+            if server.get_shard_node(shard_id) is None:
+                server.add_shard(shard_id, members=node_ids)
 
     def _rows_above(self, leader: MemoryRaftNode, shard_id: int, split_key: bytes):
         """The rows of ``shard_id``'s range that belong to the shard above the point."""

@@ -18,7 +18,9 @@ refuses new rows - with the refusal a move gives, which is not a split's - and t
 still answers "who serves this shard" with the group it is leaving; a move onto a node that
 already serves the shard is refused before anything is frozen; a transaction holding a lock
 in the range stops a move and thaws the shard it had just frozen; and a move that died is
-found by the next start, as a frozen shard and the note it left behind.
+finished by the next start, out of the note the shard it was leaving left behind - which is
+``tests/test_migration_recovery.py``'s subject, and the last test here is the in-process
+half of it.
 """
 
 from _wait import wait_until
@@ -47,12 +49,25 @@ def _prewrite(state_machine, key, value, start_ts):
         CommandType.PREWRITE, key=key, value=value, start_ts=start_ts, primary_key=key)
 
 
-def _started_cluster(tmp_path, shard_nodes=None):
+def _started_cluster(tmp_path, shard_nodes=None, storages=None):
+    """A three-node cluster, with shard 0 on ``shard_nodes``.
+
+    ``storages`` collects the storages the cluster was built with.  ``shutdown`` deliberately
+    leaves those open - a whole cluster closing hands them to whoever built the factory - and
+    a test that starts a second cluster over the same directories has to release them itself:
+    on Windows a directory cannot be renamed while a file inside it is open, and renaming one
+    is how a move puts the group it left aside.
+    """
+    def storage(node_id, shard_id):
+        opened = EngineRaftStorage(data_dir=str(tmp_path / f"shard{shard_id}_node{node_id}"))
+        if storages is not None:
+            storages.append(opened)
+        return opened
+
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
     cluster.start(
         state_machine_factory=lambda: MVCCStateMachine(),
-        storage_factory=lambda node_id, shard_id: EngineRaftStorage(
-            data_dir=str(tmp_path / f"shard{shard_id}_node{node_id}")),
+        storage_factory=storage,
         shard_nodes=shard_nodes,
         lock_cleaner_interval=None,
     )
@@ -61,6 +76,12 @@ def _started_cluster(tmp_path, shard_nodes=None):
     # metadata group of its own, and this is the shape of one that is out of reach.
     cluster._metadata_client = _TableThatAnswersNothing(cluster)
     return cluster
+
+
+def _close(storages):
+    """Release the storages a cluster was built with, so their directories can be renamed."""
+    for storage in storages:
+        storage.close()
 
 
 def _write_rows(cluster, count=COUNT):
@@ -227,15 +248,19 @@ def test_a_lock_in_the_range_stops_the_move_and_thaws_the_shard(tmp_path):
         cluster.shutdown()
 
 
-def test_a_move_that_died_comes_back_as_a_frozen_shard(tmp_path):
-    """The freeze is a fact about the shard, so it has to outlive the process that set it.
+def test_a_move_that_died_is_finished_by_the_next_start(tmp_path):
+    """The note outlives the process that wrote it, and the start after it is what acts.
 
-    A cluster coming back cannot know how far the move got - the note deliberately does
-    not say - and a shard whose rows may already be in another group must not take rows
-    while that is unknown.  So it comes back frozen, and the note is what says where it
-    was going.
+    A cluster coming back cannot know how far the move got - the note deliberately does not
+    say, because anything it said about that would be a lie the moment the process writing it
+    died - so the first thing it does is the one that is safe either way: the source is frozen
+    again, because its rows may already be in the new group and a shard that may be in two
+    places cannot take rows.  Then the move is finished the way a retry of it is, and what is
+    left is what a finished move always leaves - the new group serving the range, the group
+    it left closed, and the rows readable out of the group the cluster now answers with.
     """
-    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
+    opened = []
+    cluster = _started_cluster(tmp_path, shard_nodes={0: [1]}, storages=opened)
     try:
         _write_rows(cluster, count=2)
         assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
@@ -245,27 +270,24 @@ def test_a_move_that_died_comes_back_as_a_frozen_shard(tmp_path):
         assert note is not None, "the move is written down before a row is moved"
     finally:
         cluster.shutdown()
+        _close(opened)
 
+    # The whole process goes away, and what comes back has the note and nothing else: the
+    # freeze had to be put back on before the copy could be finished, and the rows are read
+    # out of the source again - the note does not carry them.
     revived = _started_cluster(tmp_path, shard_nodes={0: [1]})
     try:
-        state = revived.migration_state(0)
-        assert state is not None, "the note is what a restarted cluster picks up"
-        assert state.target_nodes == MOVE_TO
-        assert state.source_nodes == [1]
-        assert state.phase == MigrationPhase.FREEZING
+        assert revived.migrations() == {}, "the note was picked up, not left standing"
+        assert revived._load_migration_record(0) is None, "and it goes with the move"
+        assert revived._serving_nodes(0) == MOVE_TO, "the new group is the shard's"
+        assert _group(revived, 1, 0) is None, "and the group it left is gone"
+        for node_id in MOVE_TO:
+            assert _group(revived, node_id, 0) is not None
 
         leader = wait_until(lambda: revived._shard_leader_node(0),
-                            message="the revived shard never elected a leader")
-        assert leader.writes_frozen, "a shard that may be in two places cannot take rows"
-        assert leader.freeze_reason == "migration"
-
-        # A caller picks the move up by asking for it again.  The rows are read out of the
-        # source - the note does not carry them - and the copy skips what the new group
-        # already has, which is what makes asking twice safe to do at all.
-        assert revived.move_shard(0, MOVE_TO) is False, "the table was never reached"
-        assert len(state.rows) == 2, "the rows are read out of the source again"
-        assert state.copied_keys == [], "the new group already had every row"
-        assert _group(revived, 2, 0) is not None, "and there is a group to switch to"
+                            message="the moved shard never elected a leader")
+        assert leader.get(KEYS[0]).value == VALUES[0]
+        assert leader.get(KEYS[1]).value == VALUES[1]
     finally:
         revived.shutdown()
 

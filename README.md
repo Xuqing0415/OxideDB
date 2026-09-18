@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 286 tests, roughly seven minutes
+pytest tests -q             # 293 tests, roughly ten minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -191,7 +191,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   shard to another group is wired end to end too: `move_shard` freezes the source, copies
   its rows into a group on the nodes the caller named - at the timestamps they already had,
   so a snapshot read still finds them - tells the routing table, and then lets the group the
-  shard left go, keeping its storage under an orphan name rather than deleting it.  See
+  shard left go, keeping its storage under an orphan name rather than deleting it.  A move
+  that dies part way through is finished on the next start, out of the note it left in the
+  source shard and the answer the routing table gives.  See
   Known gaps for what is still missing: something that decides to move a shard in the first
   place, and follower reads.
 
@@ -287,7 +289,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-286 tests.  `tests/test_durability.py` covers the correctness properties that
+293 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -383,8 +385,11 @@ opens the socket rather than comparing strings.  A second test stops a leader's 
 and watches the table follow the election to the node that took over, at a higher term.
 The publisher's own rules are pinned without a cluster: it writes when something moved
 and not on a timer, so the table's version stands still across polls; a restart that
-re-proposes the same ranges is not a disagreement; and a table holding different
-ranges is refused rather than overwritten.
+re-proposes the same ranges is not a disagreement; a table holding different
+ranges is refused rather than overwritten; and a shard a move is in flight for is left to
+the move, which is the one writer of its replica set - the cluster's own answer for a moving
+shard is the group it is leaving, so a publisher that wrote it would undo a proposal that had
+landed.
 `tests/test_client_routing.py` is the other end of that join.  A client with a table
 routes by it and never looks at the cluster's own nodes - the test turns that into a
 failure rather than a convention - and a transaction reads and writes by the same
@@ -685,11 +690,21 @@ Honest list of what is *not* done, roughly in priority order.
   something this project's Raft does.  Until the proposal lands the table keeps naming the
   group the shard is leaving, and every question the cluster answers about *the* shard -
   `shard_replica_ids`, `shard_addresses`, `shard_leader`, `get_leader_for_key` - is answered
-  with that group (`_serving_nodes`), so a group nothing routes to yet is not published.  A
-  cluster that comes back finds the note and freezes the shard again, and waits for a
-  caller: nothing resumes a move on its own.  What the cluster can answer it with is the
-  whole of what happens to the freeze next.  It landed - the table names the new group, this
-  cluster's own answers follow it, and the group the shard left is closed and put aside.  It
+  with that group (`_serving_nodes`), so a group nothing routes to yet is not published -
+  which is also why the publisher leaves a shard a move is in flight for alone: the table's
+  entry for it is the move's to write, and a first pass that wrote the cluster's own answer
+  would undo a proposal that had landed.  A cluster that comes back finds the note, freezes
+  the shard again - the freeze is a local fact, and it died with the process that set it - and
+  finishes the move itself: `recover_migrations`, which the cluster calls as it starts and
+  which a caller may call again, because every step of it is a no-op the second time.  The
+  routing table is what says how much of the move is left, and its three answers are the three
+  below read backwards: the set the move was going to means the proposal landed and only the
+  half after it is left, the set it was leaving means the copy is where the move stopped and
+  the proposal is still owed, and anything else means somebody else has moved the shard -
+  which is not a question this cluster can answer for itself, so it stays frozen and says so.
+  What the cluster can answer it with is the whole of what happens to the freeze next.  It
+  landed - the table names the new group, this cluster's own answers follow it, and the group
+  the shard left is closed and put aside.  It
   was refused, which is final, because the machine would answer the same command the same
   way: the shard goes back to serving, because it is still the group the table names and a
   refusal is not a reason to leave a range unserved, and the group built to receive the rows
@@ -712,7 +727,8 @@ Honest list of what is *not* done, roughly in priority order.
   target set is a caller's to choose, and no client is driven through the window a move
   opens: the window is pinned by a test that asks the group the shard left, and a client
   holding the old table is not walked through the reroute.  See
-  `tests/test_move_proposal.py`.
+  `tests/test_move_proposal.py`, and `tests/test_migration_recovery.py` for a move killed in
+  each of the three states a restart can find it in, and the half of the move each one leaves.
   A client can reach a shard it was never handed a handle on, by the address the table names
   for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
