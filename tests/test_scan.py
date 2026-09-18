@@ -1,5 +1,5 @@
-import time
 from _ports import free_addresses
+from _wait import wait_for_leader, wait_for_replication, wait_for_shard_leaders
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 
@@ -7,9 +7,7 @@ from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 def test_scan_basic():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
-    time.sleep(2)
-    
-    leader = cluster.get_node(cluster.get_leader())
+    leader = cluster.get_node(wait_for_leader(cluster))
     
     keys = [b"key_a", b"key_b", b"key_c", b"key_d", b"key_e"]
     values = [b"value_a", b"value_b", b"value_c", b"value_d", b"value_e"]
@@ -22,8 +20,6 @@ def test_scan_basic():
             timestamp=100 + i,
         )
         leader.propose(command)
-    
-    time.sleep(0.5)
     
     result = leader._state_machine.scan(b"key_b", b"key_d")
     expected = [(b"key_b", b"value_b"), (b"key_c", b"value_c")]
@@ -40,9 +36,7 @@ def test_scan_basic():
 def test_scan_empty_range():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
-    time.sleep(2)
-    
-    leader = cluster.get_node(cluster.get_leader())
+    leader = cluster.get_node(wait_for_leader(cluster))
     
     command = leader._state_machine.serialize_command(
         CommandType.SET,
@@ -51,8 +45,6 @@ def test_scan_empty_range():
         timestamp=100,
     )
     leader.propose(command)
-    time.sleep(0.5)
-    
     result = leader._state_machine.scan(b"key_z", b"\xff")
     assert result == [], f"Empty range should return empty, got {result}"
     
@@ -67,7 +59,7 @@ def test_scan_across_shards():
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
-    time.sleep(3)
+    wait_for_shard_leaders(cluster, range(2))
     
     range_map = cluster._range_map
     print(f"Range map: {range_map}")
@@ -86,14 +78,18 @@ def test_scan_across_shards():
         )
         leader.propose(command)
     
-    time.sleep(0.5)
-    
     for shard_id in range(2):
-        server = cluster.get_shard_server(1)
-        node = server.get_shard_node(shard_id)
-        if node:
-            scan_result = node._state_machine.scan(b"", b"\xff")
-            print(f"Shard {shard_id} scan result: {scan_result}")
+        leader_id, _ = cluster.shard_leader(shard_id)
+        leader = cluster.get_shard_server(leader_id).get_shard_node(shard_id)
+        node = cluster.get_shard_server(1).get_shard_node(shard_id)
+        if node is None:
+            continue
+        # Node 1 is a replica of both groups, so its copies are the ones that have to
+        # catch up before the scan below shows the writes: an entry a replica holds but
+        # has not applied is not something it can scan.
+        wait_for_replication(leader, [node])
+        scan_result = node._state_machine.scan(b"", b"\xff")
+        print(f"Shard {shard_id} scan result: {scan_result}")
     
     cluster.shutdown()
     print("Cross-shard scan test passed!")

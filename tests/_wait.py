@@ -76,6 +76,22 @@ def wait_for_shard_leaders(cluster, shard_ids, timeout: float = DEFAULT_TIMEOUT)
                       message=f"no leader for every shard in {shard_ids!r}")
 
 
+def wait_for_replication(leader, followers, timeout: float = DEFAULT_TIMEOUT):
+    """Wait until every node in ``followers`` has applied what ``leader`` committed.
+
+    The condition is ``last_applied`` against the leader commit index, not log length: a
+    follower that holds an entry it has not applied cannot answer a read with it, so a test
+    that reads a replica is waiting for the apply and not for the append.
+    """
+    def applied():
+        commit_index = leader.commit_index
+        return commit_index if all(node.last_applied >= commit_index
+                                   for node in followers) else None
+
+    return wait_until(applied, timeout=timeout,
+                      message="a follower did not apply what the leader committed")
+
+
 def wait_for_tso_client(tso_cluster, timeout: float = DEFAULT_TIMEOUT):
     """Wait until the TSO Raft group has a leader, then return a client for it."""
     return wait_until(tso_cluster.get_client, timeout=timeout,
