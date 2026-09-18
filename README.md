@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 297 tests, roughly seven minutes
+pytest tests -q             # 297 tests, roughly four minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
