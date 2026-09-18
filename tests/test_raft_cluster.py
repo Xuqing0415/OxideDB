@@ -1,8 +1,9 @@
 import pytest
-import time
 import threading
 import tempfile
 import shutil
+from _wait import (wait_for_leader, wait_for_replication, wait_for_single_leader,
+                   wait_until)
 from oxidedb.raft import (
     RaftCluster, MVCCStateMachine, CommandType, NodeState, MemoryRaftNode,
     JSONFileStorage, LogEntry, NOOP_COMMAND,
@@ -18,39 +19,13 @@ def _write_entries(node):
     return [entry for entry in node._log if entry.command != NOOP_COMMAND]
 
 
-def _wait_for_single_leader(cluster, timeout=10.0):
-    """Wait until exactly one node claims leadership and the rest follow it.
-
-    A leader that has just been superseded keeps reporting LEADER until the
-    higher term reaches it, so asserting on a single instant races with that
-    handover.  What must hold is that the cluster *converges* on one leader - a
-    persistent two-leader state still fails this check.
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        leaders = [
-            node_id for node_id, node in cluster._nodes.items()
-            if node.state == NodeState.LEADER
-        ]
-        if len(leaders) == 1:
-            others = [
-                node for node_id, node in cluster._nodes.items()
-                if node_id != leaders[0]
-            ]
-            if all(node.state == NodeState.FOLLOWER for node in others):
-                return leaders[0]
-        time.sleep(0.05)
-    return None
-
-
 class TestRaftCluster:
     def test_election(self):
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
         try:
-            leader = _wait_for_single_leader(cluster)
-            assert leader is not None, "Cluster did not converge on a single leader"
+            leader = wait_for_single_leader(cluster)
             print(f"Leader elected: Node {leader}")
             
             nodes = cluster._nodes
@@ -77,8 +52,7 @@ class TestRaftCluster:
         cluster.start(lambda: MVCCStateMachine())
 
         try:
-            leader = _wait_for_single_leader(cluster)
-            assert leader is not None, "Cluster did not converge on a single leader"
+            leader = wait_for_single_leader(cluster)
             node = cluster._nodes[leader]
 
             # An elected leader has committed the no-op of its own term, so it knows
@@ -98,19 +72,13 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        original_leader = cluster.get_leader()
-        assert original_leader is not None
+        original_leader = wait_for_single_leader(cluster)
         print(f"Original leader: Node {original_leader}")
         
         original_leader_node = cluster.get_node(original_leader)
         original_leader_node.shutdown()
         
-        time.sleep(2)
-        
-        new_leader = cluster.get_leader()
-        assert new_leader is not None, "No new leader elected after leader failure"
+        new_leader = wait_for_single_leader(cluster)
         assert new_leader != original_leader, "New leader should be different from original"
         print(f"New leader after failure: Node {new_leader}")
         
@@ -120,10 +88,7 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         
         leader = cluster.get_node(leader_id)
         state_machine = leader._state_machine
@@ -132,7 +97,8 @@ class TestRaftCluster:
         result = leader.propose(command)
         assert result.success, f"Propose should succeed on leader: {result.error_msg}"
         
-        time.sleep(0.5)
+        wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                      if node_id != leader_id])
         
         for node_id, node in cluster._nodes.items():
             node_sm = node._state_machine
@@ -149,14 +115,13 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         
         leader = cluster.get_node(leader_id)
         
-        time.sleep(0.3)
+        wait_until(lambda: all(cluster.get_node(peer_id).current_term == leader.current_term
+                               for peer_id in leader._peers),
+                   message="a peer never heard the term the leader was elected at")
         
         for peer_id in leader._peers:
             peer = cluster.get_node(peer_id)
@@ -168,10 +133,7 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         
         leader = cluster.get_node(leader_id)
         state_machine = leader._state_machine
@@ -194,7 +156,8 @@ class TestRaftCluster:
         for key, value, success in results:
             assert success, f"Proposal for {key} should succeed"
         
-        time.sleep(0.5)
+        wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                      if node_id != leader_id])
         
         for i in range(5):
             key = f"key{i}".encode()
@@ -213,18 +176,12 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        original_leader_id = cluster.get_leader()
-        assert original_leader_id is not None
+        original_leader_id = wait_for_single_leader(cluster)
         original_leader = cluster.get_node(original_leader_id)
         
         original_leader.shutdown()
         
-        time.sleep(2)
-        
-        new_leader_id = cluster.get_leader()
-        assert new_leader_id is not None
+        new_leader_id = wait_for_single_leader(cluster)
         assert new_leader_id != original_leader_id
         
         cluster.shutdown()
@@ -233,19 +190,13 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(1)
-        
-        original_leader_id = cluster.get_leader()
-        assert original_leader_id is not None
+        original_leader_id = wait_for_single_leader(cluster)
         original_leader = cluster.get_node(original_leader_id)
         state_machine = original_leader._state_machine
         
         original_leader.shutdown()
         
-        time.sleep(2)
-        
-        new_leader_id = cluster.get_leader()
-        assert new_leader_id is not None
+        new_leader_id = wait_for_single_leader(cluster)
         assert new_leader_id != original_leader_id
         
         command = state_machine.serialize_command(CommandType.SET, key=b"test_key", value=b"test_value")
@@ -258,10 +209,7 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(2)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         
         leader = cluster.get_node(leader_id)
         state_machine = leader._state_machine
@@ -270,7 +218,8 @@ class TestRaftCluster:
             command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
             leader.propose(command)
         
-        time.sleep(0.5)
+        wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                      if node_id != leader_id])
         
         for node_id, node in cluster._nodes.items():
             assert len(_write_entries(node)) == 5, f"Node {node_id} should have 5 writes"
@@ -283,10 +232,7 @@ class TestRaftCluster:
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
         
-        time.sleep(2)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         
         leader = cluster.get_node(leader_id)
         state_machine = leader._state_machine
@@ -295,17 +241,18 @@ class TestRaftCluster:
             command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
             leader.propose(command)
         
-        time.sleep(0.5)
-        
         peer_id = leader._peers[0]
         peer = cluster.get_node(peer_id)
+        wait_for_replication(leader, [peer])
         peer.shutdown()
         
         for i in range(5, 10):
             command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
             leader.propose(command)
         
-        time.sleep(0.5)
+        survivors = [node for node_id, node in cluster._nodes.items()
+                     if node_id != peer_id]
+        wait_for_replication(leader, survivors)
         
         new_state_machine = MVCCStateMachine()
         new_peers = [nid for nid in cluster._nodes.keys() if nid != peer_id]
@@ -319,12 +266,10 @@ class TestRaftCluster:
         )
         cluster._nodes[peer_id] = new_peer
         
-        time.sleep(2)
-        
-        final_leader_id = cluster.get_leader()
-        assert final_leader_id is not None
+        final_leader_id = wait_for_leader(cluster)
         
         final_leader = cluster.get_node(final_leader_id)
+        wait_for_replication(final_leader, cluster._nodes.values())
         
         for i in range(10):
             key = f"key{i}".encode()
@@ -415,10 +360,7 @@ class TestRaftCluster:
             cluster = RaftCluster(num_nodes=3)
             cluster.start(lambda: MVCCStateMachine(), storage_factory)
             
-            time.sleep(2)
-            
-            leader_id = cluster.get_leader()
-            assert leader_id is not None
+            leader_id = wait_for_single_leader(cluster)
             leader = cluster.get_node(leader_id)
             state_machine = leader._state_machine
             
@@ -426,17 +368,15 @@ class TestRaftCluster:
                 command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
                 leader.propose(command)
             
-            time.sleep(0.5)
+            wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                          if node_id != leader_id])
             
             cluster.shutdown()
             
             new_cluster = RaftCluster(num_nodes=3)
             new_cluster.start(lambda: MVCCStateMachine(), storage_factory)
             
-            time.sleep(2)
-            
-            new_leader_id = new_cluster.get_leader()
-            assert new_leader_id is not None
+            wait_for_single_leader(new_cluster)
             
             for node_id, node in new_cluster._nodes.items():
                 assert len(_write_entries(node)) == 5, f"Node {node_id} should have 5 writes"
