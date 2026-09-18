@@ -55,6 +55,15 @@ SERVING = [1, 2, 3]
 MOVE_TO = [4, 5]
 NOTE = "migrate/0"
 
+#: The window a move is given in the tests that are not about the window: a move
+#: commits and the group it left is gone either way, and what ``drain`` buys is the
+#: time in between, so a test that jumps to the far side of it does not have to spend
+#: the thirty seconds a cluster offers by default (``MIGRATION_DRAIN_SECONDS``).  What
+#: the window itself is for is pinned in
+#: ``test_the_group_the_shard_left_keeps_answering_until_the_window_closes``, which
+#: asks for a window long enough to sample inside.
+SHORT_WINDOW = 0.2
+
 
 def _set(state_machine, key, value, timestamp):
     return state_machine.serialize_command(
@@ -304,7 +313,7 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
         before = _published(client, (0,))
         assert before.shard(0).nodes == SERVING
 
-        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
 
         after = client.table(refresh=True)
         assert after.shard(0).nodes == MOVE_TO
@@ -358,7 +367,7 @@ def test_a_move_the_table_refuses_puts_the_shard_back_and_keeps_what_was_copied(
                                   "shard 0 is served by [1], not by [1, 2, 3]")
         cluster._metadata_client = refuser
 
-        assert cluster.move_shard(0, MOVE_TO) is False
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW) is False
         assert refuser.calls == 1, "a refusal is final: the same command is not asked twice"
         assert "served by [1]" in cluster.migration_error()
 
@@ -396,7 +405,7 @@ def test_a_proposal_whose_answer_never_arrives_is_proposed_again(tmp_path):
         loser = _LostAnswerClient(cluster.metadata_client())
         cluster._metadata_client = loser
 
-        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
 
         # The move landed on the attempt whose answer was lost, and the attempt that
         # followed it was answered as a success rather than applied a second time - which
@@ -422,7 +431,7 @@ def test_a_table_that_cannot_be_read_is_tried_again_before_the_move_gives_up(tmp
         blind = _BlindTableClient(cluster.metadata_client())
         cluster._metadata_client = blind
 
-        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
 
         assert blind.reads == 2, "the read that failed was followed by another one"
         assert client.table(refresh=True).shard(0).nodes == MOVE_TO
@@ -442,7 +451,7 @@ def test_a_table_that_cannot_be_reached_leaves_the_shard_frozen_and_retryable(tm
         unreachable = _UnreachableClient(original)
         cluster._metadata_client = unreachable
 
-        assert cluster.move_shard(0, MOVE_TO) is False
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW) is False
         assert unreachable.calls == PROPOSE_ATTEMPTS, "three attempts, then the caller is told"
         assert "no leader" in cluster.migration_error()
 
@@ -465,7 +474,7 @@ def test_a_table_that_cannot_be_reached_leaves_the_shard_frozen_and_retryable(tm
         # Asking again is asking to finish that same move, and it does: the copy it had
         # already made is not made twice, and the table takes the proposal this time.
         cluster._metadata_client = original
-        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
         assert client.table(refresh=True).shard(0).nodes == MOVE_TO
         assert cluster._load_migration_record(0) is None
         assert cluster._serving_nodes(0) == MOVE_TO
@@ -485,7 +494,7 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
         _published(client, (0,))
         original = cluster.metadata_client()
         cluster._metadata_client = _UnreachableClient(original)
-        assert cluster.move_shard(0, MOVE_TO) is False, "stopped with the copy made"
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW) is False, "stopped with the copy made"
         cluster._metadata_client = original
         assert cluster._propose_move(0, MOVE_TO).ok
 
@@ -523,7 +532,7 @@ def test_finishing_a_move_twice_is_finishing_it_once(tmp_path):
         client = wait_for_metadata_client(metadata)
         _write_rows(cluster)
         before = _published(client, (0,))
-        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
         after = client.table(refresh=True)
 
         # The cluster that comes back to a finished move: the proposal is made again
