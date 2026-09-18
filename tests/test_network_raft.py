@@ -1,6 +1,5 @@
-import time
 from _ports import free_addresses
-from _wait import wait_for_single_leader
+from _wait import wait_for_replication, wait_for_single_leader
 import tempfile
 import shutil
 from oxidedb.raft.node import NOOP_COMMAND, RaftCluster, NodeState
@@ -31,7 +30,6 @@ def test_network_election():
     print("Network election test passed!")
     
     cluster.shutdown()
-    time.sleep(1)
 
 
 def test_network_log_replication():
@@ -40,10 +38,7 @@ def test_network_log_replication():
     cluster = RaftCluster(num_nodes=3)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    leader_id = cluster.get_leader()
-    assert leader_id is not None
+    leader_id = wait_for_single_leader(cluster)
     print(f"Leader for replication test: Node {leader_id}")
     
     leader = cluster.get_node(leader_id)
@@ -53,9 +48,9 @@ def test_network_log_replication():
         command = leader._state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
         result = leader.propose(command)
         assert result.success, f"Proposal {i} should succeed: {result.error_msg}"
-        time.sleep(0.1)
     
-    time.sleep(1)
+    wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                  if node_id != leader_id])
     
     for node_id, node in cluster._nodes.items():
         print(f"Node {node_id}: log_len={node.log_length}, commit_index={node.commit_index}")
@@ -77,7 +72,6 @@ def test_network_log_replication():
     print("Network log replication test passed!")
     
     cluster.shutdown()
-    time.sleep(1)
 
 
 def test_network_persistence():
@@ -95,20 +89,14 @@ def test_network_persistence():
             storage_factory=storage_factory,
         )
         
-        time.sleep(5)
-        
-        leader_id = cluster.get_leader()
-        assert leader_id is not None
+        leader_id = wait_for_single_leader(cluster)
         leader = cluster.get_node(leader_id)
         
         for i in range(5):
             command = leader._state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
             leader.propose(command)
-            time.sleep(0.1)
         
         cluster.shutdown()
-        time.sleep(3)
-        
         # The restarted cluster listens on fresh ports.  Re-binding the same
         # ports immediately is not reliable on Windows: once the listening socket
         # closes, the port can sit in TIME_WAIT and gRPC's bind then fails.  The
@@ -123,10 +111,7 @@ def test_network_persistence():
             storage_factory=storage_factory,
         )
         
-        time.sleep(5)
-        
-        new_leader_id = new_cluster.get_leader()
-        assert new_leader_id is not None
+        wait_for_single_leader(new_cluster)
         
         for node_id, node in new_cluster._nodes.items():
             writes = [entry for entry in node._log if entry.command != NOOP_COMMAND]
@@ -143,9 +128,7 @@ def test_network_persistence():
 
 if __name__ == "__main__":
     test_network_election()
-    time.sleep(2)
     print("\n" + "="*60 + "\n")
     test_network_log_replication()
-    time.sleep(2)
     print("\n" + "="*60 + "\n")
     test_network_persistence()
