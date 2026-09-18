@@ -723,7 +723,14 @@ Honest list of what is *not* done, roughly in priority order.
   to, the same lookup that finds that shard's leader, so nothing above the client needs a
   cluster object at all - but a client *without* one still routes by the cluster's own
   nodes, and the cross-shard transaction test is still driven in the cluster's own process.
-  What the CLI cannot do is read from a follower; every read goes to a leader.
+  What the CLI cannot do is read from a follower; every read goes to a leader.  Neither the
+  CLI nor any other client here waits for a cluster that has only just started: a group with
+  no leader yet answers with an error rather than a refusal, and a table the publisher has
+  not written yet covers no key at all, so a command run in the first second of a cluster's
+  life fails - `the clock cannot allocate a timestamp`, or `No shard holds` for a key the
+  cluster is about to serve - instead of waiting it out.  Every test waits for those two
+  things before it writes (`_wait.py`, `_cluster.py`); a person at a shell waits a moment
+  and asks again.
 * **A refusal from a state machine loses its own code on the way to a client.**  The
   machine answers a refused command with a code of its own - a split point outside the
   range is 8, a move whose expectation of the replica set does not hold is 14 - and the

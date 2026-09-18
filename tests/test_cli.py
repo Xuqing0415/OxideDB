@@ -18,6 +18,8 @@ import sys
 import pytest
 
 from _cluster import start_cluster
+from _wait import wait_until
+from oxidedb.client import RemoteNodeClientFactory
 
 
 def _cli(*args):
@@ -78,6 +80,48 @@ class TestCli:
         assert "host:port" in result.stderr
 
 
+def _wait_until_the_cluster_can_be_written_to(cluster) -> None:
+    """Wait for the two things a first write needs and ``READY`` does not promise.
+
+    READY is a promise about ports rather than about elections (see ``tests/_cluster.py``),
+    and the routing table is a third thing with a delay of its own: the publisher writes
+    the ranges and each shard's replica set at its own poll interval, so a client arriving
+    in the first moments of a cluster's life is told that the cluster holds no such key.
+    That is what the CLI said before this wait was here.  A timestamp is the other half,
+    and it comes from a group that elects on its own schedule.
+
+    So the wait is the test's, and it is for two observable things - a timestamp, and a
+    published leader for every shard - rather than for a number of seconds.  Both are
+    asked for in one loop, and the ask that fails is a retry rather than an error: a
+    client that has just arrived has no other way to say "not yet".  The CLI is one shot
+    and has no such loop, which is a gap of its own; see the Known gaps in the README.
+    """
+    factory = RemoteNodeClientFactory(metadata_seeds=cluster.metadata_seeds,
+                                      tso_seeds=cluster.tso_seeds)
+    try:
+        client = factory.metadata_client()
+
+        def writable():
+            # One try around both asks: a group with no leader answers with an error
+            # rather than a refusal, and "not yet" is the only thing it can mean here.
+            try:
+                factory.tso_client().get_timestamp()
+                table = client.table(refresh=True)
+            except RuntimeError:
+                return None
+            if len(table.shards) < cluster.num_shards:
+                return None
+            nameless = [shard_id for shard_id, placement in table.shards.items()
+                        if placement.leader_id is None]
+            return None if nameless else table
+
+        wait_until(writable,
+                   message="the cluster never became writable: no timestamp, or a shard "
+                           "with no published leader")
+    finally:
+        factory.close()
+
+
 @pytest.fixture(scope="module")
 def cluster(tmp_path_factory):
     """One node with two shards, in its own process, for every test below.
@@ -87,6 +131,7 @@ def cluster(tmp_path_factory):
     """
     with start_cluster(num_nodes=1, num_shards=2,
                        base_dir=str(tmp_path_factory.mktemp("oxidedb-cli-cluster"))) as running:
+        _wait_until_the_cluster_can_be_written_to(running)
         yield running
 
 
