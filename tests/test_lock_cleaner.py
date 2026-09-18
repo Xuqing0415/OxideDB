@@ -1,6 +1,7 @@
 from _ports import allocate_port
 from _wait import wait_for_keys_leader, wait_until
 import hashlib
+import time
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, LockStatus
 from oxidedb.tso.tso import TSOCluster, TSOClient
@@ -120,7 +121,38 @@ def test_lock_cleaner_abort():
     print("Lock cleaner abort test passed!")
 
 
+def test_shutdown_does_not_wait_out_the_poll_interval():
+    """Stopping a cluster does not wait for the cleaner to sleep its interval off.
+
+    The cleaner waits on an event instead of sleeping the interval, so the join in
+    its ``stop`` comes back as soon as the pass it is in the middle of finishes.  At
+    the interval a cluster runs with - thirty seconds - a cleaning thread that slept
+    would hold that join for the whole five second timeout, and every shutdown would
+    look like a hang.  The budget below is loose on purpose: what is pinned is that
+    the wait is over at all, not how long a thread takes to unwind.
+    """
+    peer_addresses = {
+        1: f'127.0.0.1:{get_free_port()}',
+        2: f'127.0.0.1:{get_free_port()}',
+        3: f'127.0.0.1:{get_free_port()}',
+    }
+
+    shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
+    shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(),
+                                peer_addresses=peer_addresses)
+
+    assert shard_cluster._lock_cleaner is not None, "the default has to start a cleaner"
+
+    started = time.monotonic()
+    shard_cluster.shutdown()
+    waited = time.monotonic() - started
+
+    assert waited < 2.0, f"shutdown waited {waited:.2f}s on a cleaner sleeping it off"
+
+
 if __name__ == "__main__":
     test_read_with_lock()
     print("\n" + "="*60 + "\n")
     test_lock_cleaner_abort()
+    print("\n" + "="*60 + "\n")
+    test_shutdown_does_not_wait_out_the_poll_interval()

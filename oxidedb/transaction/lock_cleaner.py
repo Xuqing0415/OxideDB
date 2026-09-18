@@ -23,9 +23,8 @@ class LockCleaner:
         self._poll_interval = poll_interval
         self._lock_ttl = lock_ttl
         self._resolver = LockResolver(shard_cluster, lock_ttl=lock_ttl)
-        self._running = False
+        self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.RLock()
 
     def _expired_locks(self):
         """Every lock a leader holds that is older than the TTL.
@@ -53,26 +52,25 @@ class LockCleaner:
             self._resolver.resolve_lock(key, lock)
 
     def start(self):
-        with self._lock:
-            if self._running:
-                return
-            self._running = True
+        if self._thread is not None:
+            return
 
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="lock-cleaner",
+                                        daemon=True)
         self._thread.start()
 
     def _run(self):
-        while self._running:
+        while not self._stop.is_set():
             try:
                 self._clean_expired_locks()
             except Exception:
                 pass
 
-            time.sleep(self._poll_interval)
+            self._stop.wait(self._poll_interval)
 
     def stop(self):
-        with self._lock:
-            self._running = False
-
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=5)
