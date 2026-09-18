@@ -296,8 +296,10 @@ python -m pytest tests -q
 The suite takes 133.70s measured, down from 557.79s, and none of that is a test that got
 weaker: fixed sleeps became waits on an observable condition (`tests/_wait.py`), and the
 `LockCleaner` now wakes on an event instead of a shutdown being joined out of a `sleep` of
-its poll interval.  The second one was a product bug - every stop of a sharded cluster cost
-five seconds - found by measuring rather than by reading.
+its poll interval.  That second one was a product bug, and by then it was the largest single
+thing in the suite - five seconds for every stop of a sharded cluster, almost half of the
+whole run - which is the reason to measure a slow suite rather than to assume it is the
+tests: the slowest thing in it can be the product.
 
 298 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
