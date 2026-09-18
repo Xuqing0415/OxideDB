@@ -788,7 +788,10 @@ Honest list of what is *not* done, roughly in priority order.
   caller is told `REFUSED`, with the shard's prose and no leader to follow - so `ask_shard`
   does not walk on it, and the caller is the one that has to.  Closing that wants the same
   widening the gap above about a refusal's own code is waiting for: a code on the wire for a
-  range that is frozen, beside the one for a lock and the one for a lost leadership.
+  range that is frozen, beside the one for a lock and the one for a lost leadership.  The two
+  shapes that could carry it, and the question that decides between them - whether a caller
+  should be told to read the table again or to wait - are written out as an open decision in
+  `docs/design.md`, section 7.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
