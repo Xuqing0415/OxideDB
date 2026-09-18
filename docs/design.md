@@ -518,8 +518,9 @@ that has been true since before its rows were read; a commit or a rollback is no
 neither adds anything to the range.  And nothing in the refusal says where the shard went,
 because this group does not know: it was told to stop taking rows, not where they were
 going.  Over the wire that refusal is the one code the client service has for "the shard
-said no", with the shard's words left in the message and no address to follow - which is
-the open decision at the end of this section.
+said no", with the shard's words left in the message and no address to follow - a refusal
+whose answer is one read away, and whose shape on the wire is what the open decision at
+the end of this section is about.
 
 **After the window: the walk, and what it costs.**  When the window is over, the group and
 its port are gone, so a client still holding the old table asks an address that nothing
@@ -572,9 +573,9 @@ because the primary key of a transaction and its timestamp are the client's to c
 table is the same one either way, since what a lookup hands out is a client and not a node.
 And the lock resolver is not a second placement any more: it asks `ShardLeaders`, like the
 coordinator and the SQL executor, so the transaction path has one lookup and one placement.
-What the classification does to a refusal is what the open decision is about.
+What the classification does to a refusal is what the open decision below is about.
 
-### Open decision: the refusal a moving shard gives, over the wire
+### Open decision: the wire shape of the refusal a moving shard gives
 
 A shard frozen because its range is moving refuses a write, and what it refuses with does
 not survive the client service: the shard's own code is flattened into the one code for
@@ -585,34 +586,35 @@ shard's any more - and the answer is knowable, one read away.  Today `ask_shard`
 refusal to lead and on nothing else, so a write that arrives in the window is handed back
 to the caller, whose only usable next move is to read the table itself.
 
-So the decision that has to come first is what the caller should be told to do, and the
-wire change follows from it:
+**What the caller should be told to do is settled: read the table again.**  The group the
+shard moved to already owns the range, so a write routed by a fresh table lands, and the
+refusal is evidence about placement rather than a reason to wait.  It is also what the
+metadata machine already says one layer up about a placement that has gone stale: a move
+whose expectation of the current set is wrong is answered with "read the table again
+before believing yourself" (code 14), and this refusal is the same news one layer down.
+Waiting is the candidate this section has refused from the start, for a reason that does
+not stop being true here: a caller told to wait cannot tell "wait" from "give up" without
+knowing how long the window is, which would make the window a promise clients depend on.
+The command line draws the same line for the same reason, and had to in order to exist: a
+`--server` command waits for a cluster to exist and not for a command to succeed.
 
-* **Read the table again.**  The group the shard moved to already owns the range, so a
-  write routed by a fresh table lands; the refusal is evidence about placement and not a
-  reason to wait, and a caller told to wait cannot tell "wait" from "give up" without
-  knowing how long the window is.  This is what the metadata machine already says about a
-  stale placement: a move whose expectation of the current set is wrong is answered with
-  "read the table again before believing yourself" (code 14), and this refusal is the same
-  news one layer down.
-* **Wait and retry.**  Cheaper for a caller with nothing else to do, and it needs no new
-  code, but it spins on the same refusal until something reads the table anyway, and it
-  turns the window's length into a promise a client depends on.
-
-If the first, the wire has to carry it, and there are two shapes: a code of its own beside
-`LOCKED` and `NOT_LEADER`, which widens the client service contract and would make this the
-first of the shard's own codes to be named rather than flattened - so how that family is
-treated is part of the decision, not a detail of it - or `REFUSED` carrying something to
-act on, which is a smaller change to the enum and a larger change to what a refusal means,
-because the field that carries "somewhere else to ask" is an address and a group that is
-moving has none to give.
+**What is still owed is the shape that carries it.**  Two are possible, and the choice
+between them is not decidable on its own.  A code of its own beside `LOCKED` and
+`NOT_LEADER` would widen the client service contract, and it would be the first of the
+shard's own codes to be *named* rather than flattened - so taking it is less a decision
+about this refusal than about how that whole family is treated, which is a question the
+next widening of `ClientService` is the natural place to settle.  `REFUSED` carrying
+something to act on is the other shape: a smaller change to the enum and a larger change to
+what a refusal means, because the field that carries "somewhere else to ask" is an address,
+and a group that is moving has none to give.
 
 **Milestone.**  Nothing writes to the wrong place today - the refusal is honest and the
-caller can read the table - so this is not a correctness debt.  It is due with the next
+caller can read the table - so this is not a correctness debt, and what a client should do
+about it is no longer in question: only the carrier is.  That is due with the next
 widening of `ClientService`, and before follower reads: follower reads put a second
 decision about placement in the client, and a caller that has to read prose to act on a
-refusal is a caller that cannot be anything but this repository's own code.  Until then it
-is written down in the README as well as here.
+refusal is a caller that cannot be anything but this repository's own code.  Until then
+it is written down in the README as well as here.
 
 ### What is not covered.
 
@@ -634,8 +636,9 @@ There is no membership change, so a move is a whole group replaced rather than a
 swapped: a shard cannot be given a replica on a node that already serves it, and the group
 it leaves is gone rather than shrunk.
 
-The write that arrives in the window is still the caller's to act on - see the open
-decision above for what a client would need in order not to be.
+The write that arrives in the window is still the caller's to act on, because the refusal
+does not cross the wire: what a client should do about it is settled above, and the shape
+that would carry it is what is still owed.
 
 Follower reads do not exist.  The read index a follower would ask for is implemented on the
 node and nothing routes a read through it, so every read goes to a leader, including the
