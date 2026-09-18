@@ -94,11 +94,11 @@ class ClusterStore:
 
         The wait is here rather than in the client because of what it would mean there:
         a client answers or raises with its reason, and a caller with state to keep
-        decides what to do next.  A command that retried itself would be deciding, on
-        every caller's behalf, a question the design notes deliberately leave open -
-        what to make of a write refused because its range is moving - and a shell has no
-        business answering that one.  What this does is narrower: it waits for the
-        cluster to exist, and then sends the command exactly once.
+        decides what to do next.  A command that retried itself would also be deciding,
+        on every caller's behalf, that a refusal is a reason to wait - and the design
+        notes settle the opposite for the one refusal that is about placement: a range
+        that is moving is a reason to read the table again.  What this does is
+        narrower: it waits for the cluster to exist, and then sends the command once.
         """
         deadline = time.monotonic() + max(0.0, timeout)
         reason = None

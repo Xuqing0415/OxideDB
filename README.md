@@ -762,8 +762,9 @@ Honest list of what is *not* done, roughly in priority order.
   once and reports the reason it could not.  The wait is the CLI's rather than the client's
   because it is a property of a process with one shot at its command: a client answers or
   raises with its reason and a caller holding state decides what to do next - and a command
-  that retried itself would be answering, on every caller's behalf, a question the design
-  notes leave open about a write refused while its range is moving.  Every test that routes
+  that retried itself would be overruling, on every caller's behalf, the answer the design
+  notes give for a write refused while its range is moving - read the table again, since the
+  range is not that shard's any more.  Every test that routes
   now goes through this wait rather than a fixture's own loop (`tests/test_cli.py`).
 * **A refusal from a state machine loses its own code on the way to a client.**  The
   machine answers a refused command with a code of its own - a split point outside the
@@ -790,16 +791,15 @@ Honest list of what is *not* done, roughly in priority order.
   now (`tests/test_client_across_a_move.py`): a read that arrived before the move is answered
   by the group the shard left, a write to it is refused, and once the window closes the client
   walks the addresses it holds - one timeout each - and reads the table again, which is what
-  finds the group the shard moved to.  What is not fixed is what the client does with the
-  refused write.  That the range is frozen *because it is moving* is a reason to read the
-  table again, but the shard's own code for it (`ERR_MIGRATING`) does not cross the wire - a
-  caller is told `REFUSED`, with the shard's prose and no leader to follow - so `ask_shard`
-  does not walk on it, and the caller is the one that has to.  Closing that wants the same
+  finds the group the shard moved to.  What the client is to do with the refused write is
+  settled: read the table again, because the group the shard moved to already owns the
+  range.  What is not there is the carrier - the shard's own code for it (`ERR_MIGRATING`)
+  does not cross the wire, so a caller is told `REFUSED`, with the shard's prose and no
+  leader to follow, and `ask_shard` does not walk on it.  Closing that wants the same
   widening the gap above about a refusal's own code is waiting for: a code on the wire for a
   range that is frozen, beside the one for a lock and the one for a lost leadership.  The two
-  shapes that could carry it, and the question that decides between them - whether a caller
-  should be told to read the table again or to wait - are written out as an open decision in
-  `docs/design.md`, section 7.
+  shapes it could take, and why the choice waits for that widening rather than being made
+  here, are written out as an open decision in `docs/design.md`, section 7.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
