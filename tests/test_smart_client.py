@@ -51,7 +51,7 @@ def test_readonly_transaction():
     shard_cluster = ShardedCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
     )
     wait_for_keys_leader(shard_cluster, [b"test_key"])
     

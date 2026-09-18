@@ -15,11 +15,12 @@ are said once rather than once per backend.
 
 ``--server`` wants the address a node's shard 0 listens at, because a node's other
 ports are derived from that one - by ``ports_for`` in ``oxidedb/launcher.py``, which is
-imported here rather than worked out a second time.  ``--shards`` is how many shards
-that node was started with, since the two group ports sit above the shards; it
-defaults to the launcher's own default.  Several nodes may be named, comma-separated
-or repeated, and all of them are used as seeds: no client knows which member of either
-group leads, so one address it cannot use would otherwise be the end of the walk.
+imported here rather than worked out a second time.  Nothing has to be said about the
+cluster for that: a node's ports are three fixed segments above its base port, so the
+two group ports follow from the address alone.  Several nodes may be named,
+comma-separated or repeated, and all of them are used as seeds: no client knows which
+member of either group leads, so one address it cannot use would otherwise be the end
+of the walk.
 
 A node is READY before it can be written to, so a ``--server`` command asks before it
 sends: a timestamp from the clock's group, and a table naming every shard and its
@@ -33,7 +34,7 @@ import time
 
 from oxidedb.client import RemoteNodeClientFactory
 from oxidedb.database import Database
-from oxidedb.launcher import DEFAULT_NUM_SHARDS, ports_for
+from oxidedb.launcher import ports_for
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.transaction.smart_client import SmartClient
 
@@ -62,12 +63,8 @@ class ClusterStore:
     through the same routing table and the same transaction coordinator.
     """
 
-    def __init__(self, servers, num_shards):
-        metadata_seeds, tso_seeds = _group_seeds(servers, num_shards)
-        #: How many shards the cluster behind ``--server`` was started with.  The wait
-        #: below asks the table for that many, which is the only way it can tell a
-        #: table nobody has finished writing from one that is complete.
-        self._num_shards = num_shards
+    def __init__(self, servers):
+        metadata_seeds, tso_seeds = _group_seeds(servers)
         self._factory = RemoteNodeClientFactory(metadata_seeds=metadata_seeds,
                                                 tso_seeds=tso_seeds)
         #: The group's client, held here rather than only inside the cache: the wait
@@ -134,9 +131,31 @@ class ClusterStore:
         except RuntimeError as failure:
             return f"the routing table cannot be read yet ({failure})"
 
-        if len(table.shards) < self._num_shards:
-            return (f"the table names {len(table.shards)} of the {self._num_shards} "
-                    f"shards the cluster was started with")
+        if not table.shards:
+            return "the table names no shard yet"
+
+        # Every key has a shard, or this table is one the publisher has not finished
+        # writing: the ranges are contiguous, so what is missing is a placement nobody
+        # has published yet.  Counted rather than compared against a number the caller
+        # had to know - how many shards a cluster has is the table's own business, and a
+        # caller told to expect the wrong number would wait for a table that is as
+        # complete as it is ever going to be.  Where the table starts depends on how the
+        # ranges were split, so the check is that it starts at the bottom of the
+        # keyspace rather than partway up it.
+        placements = sorted(table.shards.values(), key=lambda placed: placed.start)
+        covered = placements[0].start
+        if covered not in (b"", b"\x00"):
+            return (f"the table starts at {covered!r} rather than at the bottom of the "
+                    f"keyspace, so the shards below it have not been published")
+        for placement in placements:
+            if placement.start != covered:
+                return (f"the table names no shard for the range from {covered!r} to "
+                        f"{placement.start!r}, so it is not finished being written")
+            covered = placement.end
+        if covered != b"\xff":
+            return (f"the table covers the keyspace up to {covered!r}, and the shards "
+                    f"above it have not been published")
+
         nameless = [shard_id for shard_id, placement in table.shards.items()
                     if placement.leader_id is None]
         if nameless:
@@ -159,19 +178,19 @@ class ClusterStore:
         self._factory.close()
 
 
-def _group_seeds(servers, num_shards):
+def _group_seeds(servers):
     """The table's addresses and the clock's, derived from the nodes' own blocks.
 
-    A node takes shard ``s`` at ``port + 100 * s``, the routing table's group above
-    the last shard, and the timestamp group above that.  That is the arithmetic of
+    A node takes its shards from its base port upwards, the routing table's group above
+    the shard segment, and the timestamp group above that.  That is the arithmetic of
     ``oxidedb/launcher.py``, imported rather than repeated, so an address worked out
     here is the address those nodes bound - which is the whole reason it lives in one
-    function there.
+    function there, and the reason this needs nothing but the addresses.
     """
     metadata, tso = [], []
     for server in servers:
         host, port = server.rsplit(":", 1)
-        ports = ports_for(int(port), num_shards)
+        ports = ports_for(int(port))
         metadata.append(f"{host}:{ports.metadata}")
         tso.append(f"{host}:{ports.tso}")
     return metadata, tso
@@ -198,15 +217,6 @@ def _parser():
         help="a node of a running cluster, at the address its shard 0 listens at, "
              "comma-separated for several nodes; the commands then go to that "
              "cluster instead of to a local database",
-    )
-    parser.add_argument(
-        "--shards",
-        type=int,
-        default=DEFAULT_NUM_SHARDS,
-        metavar="N",
-        help="how many shards the cluster behind --server was started with, which "
-             "is what locates its group ports (default: %(default)s, the launcher's "
-             "own default)",
     )
     parser.add_argument(
         "--wait",
@@ -257,7 +267,7 @@ def _open(parser, args):
         if not host or not port.isdigit():
             parser.error(f"--server wants host:port, and {address!r} is not that")
 
-    store = ClusterStore(servers, args.shards)
+    store = ClusterStore(servers)
     try:
         store.wait_until_routable(args.wait)
     except RuntimeError:

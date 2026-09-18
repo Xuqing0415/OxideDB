@@ -45,7 +45,7 @@ def _cluster_with_metadata(num_shards=1):
     cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
         # Room for the shard the split binds a port for; see _ports.free_addresses.
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
         lock_cleaner_interval=None,
         metadata=metadata,
     )

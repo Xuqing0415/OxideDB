@@ -55,7 +55,7 @@ def test_scan_empty_range():
 def test_scan_across_shards():
     from oxidedb.raft.shard_server import ShardedRaftCluster
     
-    peer_addresses = free_addresses(num_shards=2)
+    peer_addresses = free_addresses()
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)

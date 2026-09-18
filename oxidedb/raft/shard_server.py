@@ -36,9 +36,12 @@ SPLIT_LEADER_TIMEOUT = 10.0
 #: call that waits it out, so a test does not have to wait it out for real.
 MIGRATION_DRAIN_SECONDS = 30.0
 
-#: Shard ``s`` of a node listens at that node's base port plus ``s * this``, in both
-#: ``_get_shard_port`` and ``start_shards_network``, so the two cannot drift apart.
-SHARD_PORT_STRIDE = 100
+#: How many ports of a node belong to its shards: shard ``s`` listens at that node's base
+#: port plus ``s``, here and in :func:`oxidedb.launcher.ports_for`, so the two cannot
+#: drift apart.  The two group ports are the two above this segment, which makes it the
+#: bound on how many shards a node can have as well: one more would want the port the
+#: routing table's group is holding.
+SHARD_SEGMENT = 1000
 from .node import MemoryRaftNode, RaftCluster, NodeState
 from .state_machine import StateMachine, CommandType, ApplyResult, ErrorCode
 from .storage import RaftStorage, JSONFileStorage
@@ -93,13 +96,16 @@ class ShardServer:
         publish an address nothing is listening on.
         """
         if self._base_address is None:
-            return self._base_port + shard_id * SHARD_PORT_STRIDE + self._node_id
+            # In-process, where the base port is one number for the whole cluster: each
+            # node gets a block of the segment, the way one base port per node gives it
+            # one on real ports, so two nodes' shards cannot land on one number.
+            return self._base_port + self._node_id * SHARD_SEGMENT + shard_id
         return self._shard_port_of(self._base_address, shard_id)
 
     @staticmethod
     def _shard_port_of(base_address: str, shard_id: int) -> int:
         """The port the node at ``base_address`` serves ``shard_id`` on."""
-        return int(base_address.split(":")[1]) + shard_id * SHARD_PORT_STRIDE
+        return int(base_address.split(":")[1]) + shard_id
 
     def _peer_address(self, base_address: str, shard_id: int) -> str:
         host, _ = base_address.split(":")

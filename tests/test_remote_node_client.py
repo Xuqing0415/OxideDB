@@ -53,7 +53,7 @@ def _cluster(num_shards: int = 2) -> ShardedRaftCluster:
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=num_shards)
     _BUILT_CLUSTERS.append(cluster)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(),
-                          peer_addresses=free_addresses(num_shards=num_shards),
+                          peer_addresses=free_addresses(),
                           lock_cleaner_interval=None)
     return cluster
 

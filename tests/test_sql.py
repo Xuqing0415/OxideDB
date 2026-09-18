@@ -29,7 +29,7 @@ def test_sql_parser():
 
 
 def test_sql_executor():
-    peer_addresses = free_addresses(num_shards=2)
+    peer_addresses = free_addresses()
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)

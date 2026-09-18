@@ -51,7 +51,7 @@ def two_shard_cluster():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
     )
     return tso_cluster, shard_cluster
 

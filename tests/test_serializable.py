@@ -42,7 +42,7 @@ def _cluster():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
         # Nothing here is abandoned, and these tests are about the commit path, so
         # the cleaner stays off.
         lock_cleaner_interval=None,

@@ -489,7 +489,7 @@ def _cluster_with_metadata(num_shards=2):
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=num_shards)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=num_shards),
+        peer_addresses=free_addresses(),
         lock_cleaner_interval=None,
         metadata=metadata,
     )

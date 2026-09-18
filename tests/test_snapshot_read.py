@@ -166,7 +166,7 @@ def test_transaction_reads_the_snapshot_it_started_with():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
     )
 
     key = b"snapshot_key"  # first byte 0x73 -> shard 0
@@ -234,7 +234,7 @@ def test_reads_of_two_keys_share_one_snapshot():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
     )
 
     key_a = b"key0"      # first byte 0x6b -> shard 0

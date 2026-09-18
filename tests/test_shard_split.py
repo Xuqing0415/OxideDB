@@ -11,7 +11,7 @@ from oxidedb.tso.tso import TSOCluster
 
 def test_shard_split():
     # Room for the shard the split creates and binds a port for; see _ports.
-    peer_addresses = free_addresses(num_shards=2)
+    peer_addresses = free_addresses()
     
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
@@ -78,9 +78,10 @@ def test_a_split_moves_a_row_as_the_version_it_already_is():
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
     cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        # Room for the shard the split creates: shard ``s`` of a node lives at
-        # ``base + 100 * s``, so a one-shard allocation collides with itself.
-        peer_addresses=free_addresses(num_shards=2),
+        # A node's ports are a block of its own, so the nodes are a whole block apart.
+        # The shard a split creates takes the port next to this node's shard 0, which is
+        # inside that block and nobody else's.
+        peer_addresses=free_addresses(),
         lock_cleaner_interval=None,
     )
     try:
@@ -145,9 +146,10 @@ def test_a_split_refuses_while_a_transaction_holds_a_lock_in_the_range():
     cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
     cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
-        # Room for the shard the split creates: shard ``s`` of a node lives at
-        # ``base + 100 * s``, so a one-shard allocation collides with itself.
-        peer_addresses=free_addresses(num_shards=2),
+        # A node's ports are a block of its own, so the nodes are a whole block apart.
+        # The shard a split creates takes the port next to this node's shard 0, which is
+        # inside that block and nobody else's.
+        peer_addresses=free_addresses(),
         lock_cleaner_interval=None,
     )
     try:

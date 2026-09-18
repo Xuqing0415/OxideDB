@@ -96,7 +96,7 @@ class NodeProcess:
     @property
     def ports(self):
         """Every port this node binds, by the arithmetic this node itself used."""
-        return ports_for(self.config.port, self.config.num_shards)
+        return ports_for(self.config.port)
 
     # -- what it has said ---------------------------------------------------
 
@@ -383,8 +383,9 @@ def start_cluster(num_nodes: int = 1, num_shards: int = DEFAULT_NUM_SHARDS,
 
     # One block per node, wide enough that no node's shards, metadata port or TSO port can
     # land on another node's: the base ports below are what the nodes themselves derive
-    # their other ports from, so they have to be block_width apart.
-    bases = [allocate_port(span=block_width(num_shards)) for _ in range(num_nodes)]
+    # their other ports from, so they have to be a whole block apart - and a block is the
+    # same width whatever the nodes were told to serve.
+    bases = [allocate_port(span=block_width()) for _ in range(num_nodes)]
     configs = [_config(node_id, bases, num_shards, host, root)
                for node_id in range(1, num_nodes + 1)]
 

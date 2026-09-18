@@ -114,7 +114,7 @@ def _assert_the_rows_are_where_the_table_says(cluster, client):
 
 def test_a_split_that_died_before_the_proposal_is_finished_on_the_next_start(
         tmp_path, monkeypatch):
-    addresses = free_addresses(num_shards=2)
+    addresses = free_addresses()
     metadata = _start_metadata(tmp_path)
     cluster = _start_cluster(tmp_path, addresses, metadata)
     try:
@@ -162,7 +162,7 @@ def test_a_split_that_died_before_the_proposal_is_finished_on_the_next_start(
 
 
 def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkeypatch):
-    addresses = free_addresses(num_shards=2)
+    addresses = free_addresses()
     metadata = _start_metadata(tmp_path)
     cluster = _start_cluster(tmp_path, addresses, metadata)
     copied = []
@@ -217,7 +217,7 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
 
 
 def test_a_split_that_finished_leaves_nothing_to_pick_up(tmp_path):
-    addresses = free_addresses(num_shards=2)
+    addresses = free_addresses()
     metadata = _start_metadata(tmp_path)
     cluster = _start_cluster(tmp_path, addresses, metadata)
     try:

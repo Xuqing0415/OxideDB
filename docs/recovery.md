@@ -289,7 +289,9 @@ to respect:
   it was started with, every node serving all of them, which is also why `_ensure_shard`
   exists for a split's new shard: the shard the recovery is finishing may not be one this
   node was started with.  The process side needs the same step, and `shard_ids()` cannot be
-  the table's list.
+  the table's list.  A shard the node was not started with is a group it has to build, so
+  this is `ensure_serving`'s other half - and the port for it is the segment's, up to the
+  bound below.
 * A group a process was started with holds every node of the cluster.  `start_shards` is
   called without `shard_nodes`, so `_get_peer_nodes` answers "every other node" and
   `shard_replica_ids` is the whole cluster - which is what the publisher has been sending,
@@ -297,16 +299,18 @@ to respect:
   cannot be the build-or-close the cluster side gets away with: a shard the node already
   holds, whose members are not the set the table now names, has to be torn down and built
   again with those members, because `MemoryRaftNode` takes its peers once and keeps them.
-* A node's port block has room for exactly the shards it was started with, and that is a
-  hard stop for a split in a process.  Shard `s` listens at `base + 100 * s` and the
-  metadata group at `base + 100 * num_shards`, so the shard a first split creates wants the
-  port the metadata group is already holding: with one shard, both are `base + 100`.
-  `grpc` raises out of `add_insecure_port` for a port that is already bound rather than
-  reporting a failure, so a recovery wired in as it stands would not come up - and
-  `_resume_split` builds the new shard's group *after* freezing the source, so this is a
-  start that dies with the shard frozen.  Making room - a wider block, or group ports that
-  do not come out of the shard count - changes `ports_for` and every address a client or a
-  peer derives from it, which is why it is a decision for this work and not a detail of it.
+* A node's ports were, until this was written, sized for exactly the shards it was
+  started with: shard `s` listened at `base + 100 * s`, the metadata group at
+  `base + 100 * num_shards`, so the shard a first split creates wanted the port the
+  metadata group was already holding.  `grpc` raises out of `add_insecure_port` for a port
+  that is already bound rather than reporting a failure, so a recovery wired in as it
+  stood would not have come up - and `_resume_split` builds the new shard's group *after*
+  freezing the source, so that would have been a start that died with the shard frozen.
+  The layout is now three fixed segments - shard `s` at `base + s`, the two groups at
+  `base + SHARD_SEGMENT` and above - so a split's new shard has a port of its own, and the
+  bound is `SHARD_SEGMENT`, which `ClusterConfig.validate` refuses a configuration above.
+  What is still missing is the same check on the split itself: it is the split that would
+  want shard `SHARD_SEGMENT` and find the routing table's group there.
 
 ## 6. Order, failure, tests
 

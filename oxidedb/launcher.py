@@ -8,13 +8,18 @@ is not one of them.
 
 A node runs three kinds of Raft group, and each of them elects on its own:
 
-* its shards, at ``base + 100 * shard_id``, served by ``ShardServer`` - the Raft service
-  and the client's six primitives on the same port;
-* the metadata group, at ``base + 100 * num_shards``, whose table a client routes by -
-  the Raft service, the client's question about the table, and the proposal that changes
-  it, on the same port;
-* the TSO group, at ``base + 100 * (num_shards + 1)``, which hands out timestamps, on the
-  same terms.
+* its shards, at ``base + shard_id``, served by ``ShardServer`` - the Raft service and
+  the client's six primitives on the same port;
+* the metadata group, at ``base + SHARD_SEGMENT``, whose table a client routes by - the
+  Raft service, the client's question about the table, and the proposal that changes it,
+  on the same port;
+* the TSO group, at the port above that one, which hands out timestamps, on the same terms.
+
+Three fixed segments rather than "the groups above the last shard", because the shards a
+node serves are not fixed: a split makes one, and a group port has to be a port no shard
+will ever want.  Nothing about a node's addresses depends on how many shards it was
+started with, so a client works the group ports out from the one address it was given, and
+``SHARD_SEGMENT`` is the bound on how many shards a node can have.
 
 That arithmetic lives in :func:`ports_for` and nowhere else, so an address this node
 publishes is one another node derives the same way - and a program that runs these nodes,
@@ -57,7 +62,7 @@ from .metadata.publisher import MetadataPublisher
 from .metadata.service import (MetadataClient, MetadataStateMachine,
                                 add_metadata_services_to_server)
 from .raft.node import MemoryRaftNode, NodeState
-from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_PORT_STRIDE,
+from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_SEGMENT,
                                 ShardServer)
 from .raft.state_machine import MVCCStateMachine, StateMachine
 from .raft.storage import RaftStorage, create_raft_storage
@@ -87,25 +92,27 @@ METADATA_GROUP = 0
 TSO_GROUP = 1
 
 
-def group_port(base_port: int, num_shards: int, group: int) -> int:
+def group_port(base_port: int, group: int) -> int:
     """Where a node's metadata group (0) or TSO group (1) listens.
 
-    The shards take the block from ``base_port`` upwards, one
-    :data:`~oxidedb.raft.shard_server.SHARD_PORT_STRIDE` apart, so the groups sit above
-    the last of them.  One copy of the arithmetic, and one direction of it: a node's
-    block is ``(num_shards + 2) * SHARD_PORT_STRIDE`` ports wide, and every node derives
-    another node's group ports from that node's base port exactly as it derives its own.
+    Above the shard segment, and not above the last shard: the last shard is not a number
+    this function is given, and it is not one a client could know - a node's shards are
+    the segment below its base port, and the two groups are the two ports above it.  One
+    copy of the arithmetic, and one direction of it: every node derives another node's
+    group ports from that node's base port exactly as it derives its own.
     """
-    return base_port + (num_shards + group) * SHARD_PORT_STRIDE
+    return base_port + SHARD_SEGMENT + group
 
 
-def block_width(num_shards: int) -> int:
-    """How many ports one node's block spans: its shards, then its two groups.
+def block_width() -> int:
+    """How many ports one node's block spans: its shard segment, then its two groups.
 
     A program that starts several nodes has to leave this much room between two nodes'
-    base ports.  A block that overlapped the next node's would be two nodes on one port.
+    base ports.  A block that overlapped the next node's would be two nodes on one port,
+    and the width is now the same for every node: it is a property of the layout rather
+    than of what a node was told to serve.
     """
-    return (num_shards + 2) * SHARD_PORT_STRIDE
+    return SHARD_SEGMENT + 2
 
 
 @dataclass(frozen=True)
@@ -120,20 +127,14 @@ class NodePorts:
     """
 
     base: int
-    num_shards: int
 
     def shard(self, shard_id: int) -> int:
         """Where shard ``shard_id`` listens, by the arithmetic ``ShardServer`` binds."""
-        return self.base + shard_id * SHARD_PORT_STRIDE
-
-    @property
-    def shards(self) -> List[int]:
-        """Every shard port, in shard id order."""
-        return [self.shard(shard_id) for shard_id in range(self.num_shards)]
+        return self.base + shard_id
 
     def group(self, group: int) -> int:
         """Where the metadata group (0) or the TSO group (1) listens."""
-        return group_port(self.base, self.num_shards, group)
+        return group_port(self.base, group)
 
     @property
     def metadata(self) -> int:
@@ -148,7 +149,7 @@ class NodePorts:
     @property
     def width(self) -> int:
         """How many ports this node's block covers, from its base port upwards."""
-        return block_width(self.num_shards)
+        return block_width()
 
     @property
     def highest(self) -> int:
@@ -156,14 +157,17 @@ class NodePorts:
         return self.group(TSO_GROUP)
 
 
-def ports_for(base_port: int, num_shards: int) -> NodePorts:
-    """Every port of the node whose shard 0 is at ``base_port``, serving ``num_shards``.
+def ports_for(base_port: int) -> NodePorts:
+    """Every port of the node whose shard 0 is at ``base_port``.
 
     A node id is not an argument because no port depends on one: two nodes told the same
     base port would be two nodes on one port whatever they were called, and a caller that
-    knows a node's addresses already knows its base port.
+    knows a node's addresses already knows its base port.  A shard count is not one
+    either, for the same kind of reason: the shard segment and the two groups are at fixed
+    offsets above the base port, so a client finds the group ports of a cluster it is not
+    part of without being told how that cluster was built.
     """
-    return NodePorts(base=base_port, num_shards=num_shards)
+    return NodePorts(base=base_port)
 
 
 def _address(host: str, port: int) -> str:
@@ -263,11 +267,11 @@ class ClusterConfig:
         uses to bind it.
         """
         host, base = self._base_of(node_id)
-        return _address(host, ports_for(base, self.num_shards).shard(shard_id))
+        return _address(host, ports_for(base).shard(shard_id))
 
     def _group_address(self, group: int, node_id: Optional[int]) -> str:
         host, base = self._base_of(node_id)
-        return _address(host, ports_for(base, self.num_shards).group(group))
+        return _address(host, ports_for(base).group(group))
 
     def metadata_address(self, node_id: Optional[int] = None) -> str:
         return self._group_address(METADATA_GROUP, node_id)
@@ -303,11 +307,20 @@ class ClusterConfig:
                 f"node ids are 1..N with none missing, and this node has {every} - "
                 f"a node that names the wrong peers is a node in a cluster of its own")
 
-        ports = ports_for(self.port, self.num_shards)
+        ports = ports_for(self.port)
         if self.port < 1 or ports.highest > 65535:
             raise ValueError(
                 f"shard 0 at {self.port} needs the {ports.width} ports up to "
                 f"{ports.highest} free, and that is not a port")
+        if self.num_shards > SHARD_SEGMENT:
+            # Refused here rather than discovered when a shard is built: the port above
+            # the segment is the routing table's group's, so a node told to serve more
+            # than this is a node whose last shard would try to bind a port that is
+            # already bound, and binding a port twice raises.
+            raise ValueError(
+                f"a node serves at most {SHARD_SEGMENT} shards - the ports of its shard "
+                f"segment, with the groups' own above them - and this one was told "
+                f"{self.num_shards}")
 
     # -- what this node would print about itself ----------------------------
 

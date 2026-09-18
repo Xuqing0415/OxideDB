@@ -57,22 +57,23 @@ node of one - the address that node's shard 0 listens at - and the same four com
 then travel over gRPC, through the routing table, to whichever shard owns each key:
 
 ```
-oxidedb --server 127.0.0.1:8001 --shards 2 set user:1 alice
-oxidedb --server 127.0.0.1:8001 --shards 2 get user:1            # alice, out of whatever shard owns it
-oxidedb --server 127.0.0.1:8001 --shards 2 scan a: z            # every shard it covers
+oxidedb --server 127.0.0.1:8001 set user:1 alice
+oxidedb --server 127.0.0.1:8001 get user:1            # alice, out of whatever shard owns it
+oxidedb --server 127.0.0.1:8001 scan a: z            # every shard it covers
 ```
 
-`--shards` is how many shards that node was started with, because a node's group
-ports sit above its shard ports - the arithmetic is `ports_for` in
-`oxidedb/launcher.py`, imported by the CLI rather than worked out a second time - and
-it defaults to the launcher's own default of two.  Several nodes may be given,
-comma-separated or repeated, and all of them are used as seeds: no client knows which
-member of the routing table's group leads, so one address it cannot use would
-otherwise end the walk.  `--wait SECONDS` bounds how long a `--server` command asks a
-cluster that has not finished starting before it reports, as one line, the reason it
-could not be routed; it defaults to five, which is ten of the publisher's own poll
-intervals, and `0` asks once.  `--data-dir` and `--server` together are refused, since
-the same key cannot be in two places.
+Nothing else has to be said about the cluster: a node's ports are three fixed
+segments above the address it was given - its shards, then the routing table's
+group, then the timestamp group - so the CLI works the group ports out with
+`ports_for` in `oxidedb/launcher.py` instead of being told how the cluster was
+built.  Several nodes may be given, comma-separated or repeated, and all of them
+are used as seeds: no client knows which member of the routing table's group
+leads, so one address it cannot use would otherwise end the walk.  `--wait SECONDS`
+bounds how long a `--server` command asks a cluster that has not finished starting
+before it reports, as one line, the reason it could not be routed; it defaults to
+five, which is ten of the publisher's own poll intervals, and `0` asks once.
+`--data-dir` and `--server` together are refused, since the same key cannot be in
+two places.
 
 ## Running a node
 
@@ -91,8 +92,11 @@ python -m oxidedb.launcher --node-id 2 --port 8001 --data-dir ./node2 \
     --peers "1@10.0.0.1:8001,3@10.0.0.3:8001"
 ```
 
-A node takes a block of ports from the one it is given: shard `s` at `port + 100 * s`,
-the routing table's group above the last shard, and the timestamp group above that.
+A node takes a block of ports from the one it is given: shard `s` at `port + s`, the
+routing table's group at `port + SHARD_SEGMENT`, and the timestamp group above that.
+Three fixed segments, so nothing about the block depends on how many shards the node was
+started with - and the segment is what bounds that number: a `--num-shards` above it is
+refused when the node is configured rather than discovered when a port is bound.
 That arithmetic is one exported function, `ports_for` in `oxidedb/launcher.py`, and a
 program that starts these nodes - a test, a script - works their ports out by importing it
 rather than by doing the sum again, so the address it waits on is the address that was
@@ -521,9 +525,9 @@ Three environment notes:
   `tmp_path` lives there.  Inside a sandbox that blocks it they fail at fixture
   setup, not in the code under test;
 * the network tests allocate non-overlapping port blocks through
-  `tests/_ports.py`.  `ShardServer` derives shard `s` of a node at
-  `base + 100 * s`, so node bases must be spaced `100 * num_shards` apart or two
-  nodes claim the same port;
+  `tests/_ports.py`.  A node's ports are one block of `block_width()` - its shard
+  segment and the two group ports above it - so node bases must be a whole block
+  apart or two nodes claim the same port;
 * the network tests wait for the condition they care about (`tests/_wait.py`)
   instead of sleeping a fixed number of seconds.  A fixed sleep is a race: the
   suite starts dozens of local gRPC servers, and a loaded machine can spend
@@ -548,9 +552,10 @@ Honest list of what is *not* done, roughly in priority order.
   moving that logic somewhere both start-up paths can call, not adding a call: it is written
   against the cluster's own `_migrations`, `_pending_splits`, `_placed_shards`,
   `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group has
-  none of those.  A split has one further constraint: a node's port block is sized for
-  exactly the shards it was started with, so the group a first split creates wants the port
-  the metadata group already holds - `docs/recovery.md`, section 5.
+  none of those.  A split has one boundary of its own: a node's ports are its shard
+  segment with the two groups above it, so a cluster can serve `SHARD_SEGMENT` shards and
+  a split asking for the shard after that has to be refused - a check the split path does
+  not make yet (`docs/recovery.md`, section 5).
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not

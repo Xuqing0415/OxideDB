@@ -82,10 +82,12 @@ class TestCli:
 def _address_that_answers_nothing(cluster) -> str:
     """The same host, at a port inside a node's block that nothing binds.
 
-    A node takes ``port + 100 * s`` for each shard and puts the two groups above the
-    last shard, so ``+99`` is a hole whatever size the node is.  A command sent there
-    meets the absence of an answer rather than a refusal, which is the state the client
-    reports rather than raises - and the one the wait below is given a deadline for.
+    A node takes ``port + shard_id`` for each shard it serves and puts the two groups at
+    ``port + SHARD_SEGMENT`` and above, so ``+99`` is a hole in its shard segment
+    whatever it was started with - up to ninety-nine shards, which no test here is
+    near.  A command sent there meets the absence of an answer rather than a refusal,
+    which is the state the client reports rather than raises - and the one the wait
+    below is given a deadline for.
     """
     port = int(cluster.bootstrap_address.rsplit(":", 1)[1])
     return cluster.bootstrap_address.rsplit(":", 1)[0] + f":{port + 99}"
@@ -121,8 +123,7 @@ def _cluster_cli(cluster, *args):
     """
     return subprocess.run(
         [sys.executable, "-m", "oxidedb.cli",
-         "--server", cluster.bootstrap_address,
-         "--shards", str(cluster.num_shards), *args],
+         "--server", cluster.bootstrap_address, *args],
         capture_output=True,
         text=True,
         encoding="utf-8",

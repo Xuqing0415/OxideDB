@@ -52,7 +52,7 @@ def _split_with_a_row():
     cluster.start_network(
         state_machine_factory=lambda: MVCCStateMachine(),
         # Two shards' worth of ports: the split binds one for the shard it creates.
-        peer_addresses=free_addresses(num_shards=2),
+        peer_addresses=free_addresses(),
         lock_cleaner_interval=None,
     )
     wait_for_keys_leader(cluster, [MOVED_KEY])
