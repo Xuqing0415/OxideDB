@@ -64,6 +64,18 @@ def wait_for_keys_leader(cluster, keys, timeout: float = DEFAULT_TIMEOUT):
                       message=f"no shard leader for every key in {keys!r}")
 
 
+def wait_for_shard_leaders(cluster, shard_ids, timeout: float = DEFAULT_TIMEOUT):
+    """Wait until every shard in ``shard_ids`` has a leader.
+
+    A key-based wait cannot say this: it is the groups themselves a test is asking
+    about when it has no key in mind, and a sharded cluster elects once per shard.
+    """
+    shard_ids = list(shard_ids)
+    return wait_until(lambda: all(cluster.shard_leader(shard_id) for shard_id in shard_ids),
+                      timeout=timeout,
+                      message=f"no leader for every shard in {shard_ids!r}")
+
+
 def wait_for_tso_client(tso_cluster, timeout: float = DEFAULT_TIMEOUT):
     """Wait until the TSO Raft group has a leader, then return a client for it."""
     return wait_until(tso_cluster.get_client, timeout=timeout,
