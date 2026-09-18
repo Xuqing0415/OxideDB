@@ -809,18 +809,15 @@ class ShardedRaftCluster:
         return True
 
     def move_shard(self, shard_id: int, target_nodes: List[int]) -> bool:
-        """Move ``shard_id`` to a new group on ``target_nodes``: freeze it, copy its rows.
+        """Move ``shard_id`` to a new group on ``target_nodes``: freeze, copy, tell, let go.
 
         Called to start a move and to look again at one that is already under way.
 
-        The first half of a move, in the order the split uses and for the same reason:
-        the source is frozen before its rows are read, the rows are copied into the group
-        that will own them, and only after that could the routing table be told - because
-        the table is what clients route by, and a range it hands out has to be a range
-        whose data is already there.  The last step is not wired yet, and a move that has
-        copied its rows says so rather than pretending: it raises ``NotImplementedError``
-        with the shard left frozen and the move remembered, which is the only state the
-        completion can start from.
+        The order is the split's, and for the same reason: the source is frozen before its
+        rows are read, the rows are copied into the group that will own them, and the
+        routing table is told only after that - because the table is what clients route by,
+        and a range it hands out has to be a range whose data is already there.  Once the
+        table agrees, the group that was left behind is let go (see :meth:`_commit_move`).
 
         ``target_nodes`` is the replica set the shard is to have, named by the caller and
         derived from nothing here: which nodes a shard should end up on is a policy - a
@@ -836,9 +833,15 @@ class ShardedRaftCluster:
         row already in the new group at the same timestamp is the row.  A different target
         set is refused - there is no answer to that which would not lose one of the two.
 
-        A ``False`` answer means nothing was copied and nothing is frozen: the rows are
-        where they were and the shard answers as it did.  Why is in
-        :meth:`migration_error`.
+        A ``True`` answer means the table names the new group and the old one is closed.
+        A ``False`` one means the move did not get there, and there are two ways that
+        happens, told apart by :meth:`migration_error` and by whether the shard is frozen:
+
+        * nothing was copied - the move could not be started, or its rows could not be read
+          at one moment - so the shard is not frozen and answers exactly as it did;
+        * the rows are copied and the table could not be reached, so the shard stays frozen
+          with the move written down.  Asking again with the same target set finishes it,
+          which is the same call: nothing about a move is resumed on its own.
         """
         target_nodes = sorted({int(node_id) for node_id in target_nodes})
         if not target_nodes:
@@ -920,7 +923,7 @@ class ShardedRaftCluster:
                 self._unfreeze_shard(shard_id, node_ids=source_nodes)
 
     def _finish_move(self, state: MigrationState) -> bool:
-        """Copy the rows into the new group, then stop at the proposal that is owed.
+        """Copy the rows into the new group, tell the table, and let the old group go.
 
         Called for the first attempt and for every retry of it, and idempotent for the
         reason the split's is: a row already in the new group at the same timestamp is
@@ -964,9 +967,25 @@ class ShardedRaftCluster:
             return False
 
         state.phase = MigrationPhase.PROPOSING
-        raise NotImplementedError(
-            f"shard {shard_id} has its rows copied into {state.target_nodes} and is still "
-            f"frozen: the proposal that makes that group the shard's is not wired yet")
+        result = self._propose_move(shard_id, state.target_nodes)
+        if result.outcome == ProposalOutcome.REJECTED:
+            # The table answered no, and would answer no again.  The shard goes back to
+            # serving, because a refusal is not a reason to leave a range unserved, and
+            # this is the end of the move rather than a state to retry out of.
+            self._last_migration_error = result.message
+            self._abort_move(state)
+            return False
+
+        if result.outcome == ProposalOutcome.UNREACHABLE:
+            # Nothing answered, so the proposal may or may not have landed, and the one
+            # thing that must not happen is the shard taking rows for a range the table
+            # may already have given away.  Frozen, written down, and waiting for the
+            # caller to ask again - which is where a cluster that comes back finds it too.
+            self._last_migration_error = result.message
+            return False
+
+        self._commit_move(shard_id, state.target_nodes)
+        return True
 
     def _copy_rows(self, source_leader: MemoryRaftNode, target_leader: MemoryRaftNode,
                    state: MigrationState) -> bool:
@@ -1130,6 +1149,31 @@ class ShardedRaftCluster:
         self._forget_migration(shard_id)
         return self._retire_source(shard_id)
 
+    def _abort_move(self, state: MigrationState) -> List[int]:
+        """Give up on a move the routing table refused, and put the shard back.
+
+        A refusal is final - the machine would answer the same command the same way - so
+        this is the end of the move and not a state to retry out of.  What it undoes is
+        everything except the copy: the source goes back to taking rows, because it is the
+        group the table still names and a refusal is not a reason to leave a range
+        unserved; the note goes, because there is no move in flight to find; and the group
+        that was built to receive the rows is closed and put aside like any other storage
+        of a shard that is not served here, so that one shard does not go on having two
+        live groups.
+
+        The rows themselves are kept, under the orphan name.  A caller that means to try
+        again - with a target set the table will take - does not find them, which is right:
+        the new group is built fresh and the copy is the whole of the range rather than
+        part of a move that was refused.  An operator who wants to know what was copied
+        before it was refused does find them, which is the other half of why nothing here
+        deletes anything.
+        """
+        shard_id = state.shard_id
+        self._migrations.pop(shard_id, None)
+        self._forget_migration(shard_id)
+        self._unfreeze_shard(shard_id, node_ids=state.source_nodes)
+        return self._close_group_on(state.target_nodes, shard_id)
+
     def _forget_migration(self, shard_id: int) -> None:
         """Drop a move's note, on every replica that wrote one.
 
@@ -1153,23 +1197,33 @@ class ShardedRaftCluster:
         move in memory and does not need one - the placement is the whole of it.
         """
         target = set(self._placed_shards.get(shard_id, []))
-        retired = []
-        for node_id in sorted(self._shard_servers):
-            if node_id in target:
-                continue
-            server = self._shard_servers[node_id]
-            node = server.get_shard_node(shard_id)
+        left = [node_id for node_id in sorted(self._shard_servers) if node_id not in target]
+        return self._close_group_on(left, shard_id)
+
+    def _close_group_on(self, node_ids: List[int], shard_id: int) -> List[int]:
+        """Stop serving a shard on exactly ``node_ids``, and put their storage aside.
+
+        The nodes are the caller's: the ones a move left, or the ones it built a group on
+        and then gave up on.  What it returns is the ones that actually had a group, which
+        is how a caller tells "I closed it" from "it was already closed" - a group that is
+        not there is an answer rather than an error, because a caller that died in the
+        middle of this comes back and runs the whole of it again.
+        """
+        closed = []
+        for node_id in sorted(set(node_ids)):
+            server = self._shard_servers.get(node_id)
+            node = None if server is None else server.get_shard_node(shard_id)
             if node is None:
                 continue
             # Asked for before the close: the group is where its storage is known.
             directory = node._storage.data_dir if node._storage is not None else None
             if not server.shutdown_shard(shard_id):
                 continue
-            retired.append(node_id)
+            closed.append(node_id)
             orphan = self._rename_storage(directory, shard_id)
             if orphan is not None:
                 self._orphan_dirs.append(orphan)
-        return retired
+        return closed
 
     def _rename_storage(self, directory: Optional[str], shard_id: int) -> Optional[str]:
         """Move a retired shard's directory aside, under a name nothing reads.

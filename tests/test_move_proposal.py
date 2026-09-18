@@ -1,28 +1,30 @@
-"""A move's last two steps, driven by hand: the table told, and the group it left let go.
+"""A move, end to end and at every way it can stop: the table told, and the group let go.
 
-``move_shard`` has the half of a move that has to be right before anything else matters -
-freeze the source, read its rows at one moment, copy them into the group that will own them
-- and stops there on purpose.  What finishes a move is two calls that are not wired into it
-yet, and this file drives both of them the way the rest of the move will: ``_propose_move``
-tells the routing table what the shard's replica set is now, and ``_commit_move`` makes this
-cluster's own answers follow it and lets the group the shard left go.
+``move_shard`` freezes the source, reads its rows at one moment, copies them into the group
+that will own them, and then does the two things that make that group the shard's: it tells
+the routing table, and it lets the group it left go.  The order is the split's - rows first,
+table last - because the table is what clients route by and a range it hands out has to be a
+range whose data is already there.
 
-They are called rather than wired in, because wiring them in changes what ``move_shard``
-means for every test around it, and because each has an answer worth pinning on its own:
+What a proposal can answer, and what each answer does to the freeze, is the whole of what
+these tests are about:
 
-* the set being replaced is read out of the table and not out of this process.  The machine
-  refuses a move whose expectation of the current set is wrong (code 14), so a caller
-  proposing this process's own view would be refused the moment two moves were computed
-  from one table - which is why the table is read on every attempt, and why one of these
-  tests turns the table onto a set the cluster itself would not have said;
-* a table that does not hold the shard at all is a refusal and not a silence, because the
-  two send a caller to different places;
-* a cluster with no table has nothing to propose, which is what an in-process cluster is;
-* finishing a move closes the group the shard left on every node that is not serving it
-  now, keeps that group answering for a window first, puts its directory aside as
-  ``orphan-shard-<id>-<when>`` instead of deleting it, and drops the move's note on the way;
-* finishing a move twice is finishing it once - which is what a cluster that comes back to
-  a move it had already finished will do.
+* it lands - the table names the new group, this cluster's own answers follow it, the old
+  group is closed on every node that held it and its storage is put aside under
+  ``orphan-shard-<id>-<when>`` rather than deleted, and the move's note goes;
+* it is refused, which is final, because the machine would answer the same command the same
+  way - so the shard goes back to serving (it is the group the table names, and a refusal is
+  not a reason to leave a range unserved) and what was copied is kept, closed, out of the
+  way;
+* nothing answers, which is not final, because the proposal may have landed - so the shard
+  stays frozen with the move written down, and asking again with the same target set is how
+  a caller finds out which it was.
+
+The same three shapes decide what the *set being replaced* is: it is read out of the table
+on every attempt and never taken from this process, because the machine refuses a move whose
+expectation of the current set is wrong (code 14) and this process's own view is exactly the
+stale thing that check exists to catch.  One of these tests points the table at a set the
+cluster itself would not have said, which is the only way that decision is visible.
 """
 
 import os
@@ -36,9 +38,10 @@ from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_metadata_client, wait_until
 from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
-from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
-from oxidedb.raft.shard_server import (MigrationPhase, ProposalOutcome, ShardedRaftCluster)
-from oxidedb.raft.state_machine import ApplyResult, CommandType, MVCCStateMachine
+from oxidedb.metadata.service import (PROPOSE_ATTEMPTS, MetadataCluster, RoutingTable,
+                                      ShardPlacement)
+from oxidedb.raft.shard_server import MigrationPhase, ProposalOutcome, ShardedRaftCluster
+from oxidedb.raft.state_machine import (ApplyResult, CommandType, ErrorCode, MVCCStateMachine)
 from oxidedb.raft.storage import EngineRaftStorage
 
 COUNT = 100
@@ -46,7 +49,7 @@ KEYS = [b"key%03d" % index for index in range(COUNT)]
 VALUES = [b"value%03d" % index for index in range(COUNT)]
 
 #: Shard 0 of a one-shard map owns the whole keyspace, so where a key is is not a question
-#: these tests have to ask.  Five nodes and three of them serving the shard: a move needs
+#: these tests have to ask.  Five nodes with the shard on three of them: a move needs
 #: somewhere to go that is not where the shard is, and one node is not a replica set.
 SERVING = [1, 2, 3]
 MOVE_TO = [4, 5]
@@ -103,18 +106,30 @@ def _published(client, shard_ids):
     return wait_until(ready, message="the cluster never published a leader for every shard")
 
 
-def _copy_but_do_not_propose(cluster):
-    """The half of a move ``move_shard`` does, and the state it deliberately leaves."""
-    with pytest.raises(NotImplementedError):
-        cluster.move_shard(0, MOVE_TO)
-    assert cluster.migration_state(0).phase == MigrationPhase.PROPOSING
+def _what_was_put_aside(directory):
+    """The group a move put aside, read back out of its orphan directory.
 
+    Nothing else opens one of these - the name is the whole of why nobody finds it by
+    accident - so a test that wants to know what is still in there has to.
 
-def _finish_the_move(cluster):
-    """The two steps that are not wired in: tell the table, then let the old group go."""
-    result = cluster._propose_move(0, MOVE_TO)
-    assert result.ok, result.message
-    return cluster._commit_move(0, MOVE_TO, drain=0)
+    The rows are read the way a restart reads them - the snapshot first, then whatever
+    entries the log still holds - rather than by counting log entries: a group folds its
+    applied prefix into a snapshot every hundred entries, so the entries that carried
+    these rows may already have been dropped from the log and be inside the snapshot
+    instead.  Those two halves are one state, and that state is the promise: a group that
+    came back to this directory answers with the rows.
+    """
+    storage = EngineRaftStorage(data_dir=directory)
+    try:
+        state_machine = MVCCStateMachine()
+        snapshot = storage.load_snapshot()
+        if snapshot is not None:
+            state_machine.restore(snapshot[2])
+        for entry in storage.load_log():
+            state_machine.apply(entry.command)
+        return state_machine, storage.load_admin(NOTE)
+    finally:
+        storage.close()
 
 
 class _ToldClient:
@@ -135,6 +150,87 @@ class _ToldClient:
         self.calls.append({"shard": shard_id, "from_nodes": list(from_nodes),
                            "nodes": list(nodes), "addresses": dict(addresses)})
         return ApplyResult.success()
+
+
+class _RefusingClient:
+    """A table that answers no, and would answer no again."""
+
+    def __init__(self, inner, message):
+        self._inner = inner
+        self._message = message
+        self.calls = 0
+
+    def table(self, refresh=False):
+        return self._inner.table(refresh)
+
+    def move_shard(self, *args, **kwargs):
+        self.calls += 1
+        return ApplyResult.failure(ErrorCode.ERR_APPLY_ERROR, self._message)
+
+
+class _UnreachableClient:
+    """A table nothing answers for: every proposal comes back empty-handed.
+
+    What the walk of a remote client looks like from the caller - no address answered at
+    all - is the same answer as a group with no leader, which is the point: a caller cannot
+    tell "the command never landed" from "the answer never came back".
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+
+    def table(self, refresh=False):
+        return self._inner.table(refresh)
+
+    def move_shard(self, *args, **kwargs):
+        self.calls += 1
+        return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER,
+                                   "the metadata group has no leader")
+
+
+class _LostAnswerClient:
+    """A table that takes the move, whose answer never arrives.
+
+    The proposal landed and the caller does not know it.  Proposing the same command again
+    is the only thing that can tell the two apart, and it works because the machine
+    recognises a move it has already applied.  Only the first answer is lost.
+    """
+
+    def __init__(self, inner, loses=1):
+        self._inner = inner
+        self._loses = loses
+        self.calls = 0
+
+    def table(self, refresh=False):
+        return self._inner.table(refresh)
+
+    def move_shard(self, *args, **kwargs):
+        self.calls += 1
+        self._inner.move_shard(*args, **kwargs)
+        if self._loses > 0:
+            self._loses -= 1
+            return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER, "the answer was lost")
+        return ApplyResult.success()
+
+
+class _BlindTableClient:
+    """A table whose read fails before it answers: a group mid-election, a lost poll."""
+
+    def __init__(self, inner, blind=1):
+        self._inner = inner
+        self._blind = blind
+        self.reads = 0
+
+    def table(self, refresh=False):
+        self.reads += 1
+        if self._blind > 0:
+            self._blind -= 1
+            raise RuntimeError("the routing table cannot be read: the group has no leader")
+        return self._inner.table(refresh)
+
+    def move_shard(self, *args, **kwargs):
+        return self._inner.move_shard(*args, **kwargs)
 
 
 def test_the_set_a_move_replaces_is_the_tables_and_not_this_processes(tmp_path):
@@ -208,14 +304,8 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
         before = _published(client, (0,))
         assert before.shard(0).nodes == SERVING
 
-        _copy_but_do_not_propose(cluster)
-        assert client.table(refresh=True).shard(0).nodes == SERVING, "the table was not told"
-        assert cluster._serving_nodes(0) == SERVING, "and neither was the cluster"
-        assert cluster._load_migration_record(0) is not None, "the move is written down"
+        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
 
-        retired = _finish_the_move(cluster)
-
-        assert retired == SERVING, "the group it left went, on every node holding it"
         after = client.table(refresh=True)
         assert after.shard(0).nodes == MOVE_TO
         assert after.shard(0).addresses == cluster._addresses_on(MOVE_TO, 0)
@@ -226,6 +316,7 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
         # and the old one is gone from every node that held it - group, port and storage.
         assert cluster._serving_nodes(0) == MOVE_TO
         assert cluster.shard_replica_ids(0) == MOVE_TO
+        assert cluster.migrations() == {}, "the move is not in flight any more"
         for node_id in SERVING:
             assert cluster.get_shard_server(node_id).get_shard_node(0) is None
             with pytest.raises(OSError):
@@ -237,11 +328,10 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
         assert len(orphans) == len(SERVING), "one directory aside per node that held it"
         for orphan in orphans:
             assert os.path.basename(orphan).startswith("orphan-shard-0-")
-            abandoned = EngineRaftStorage(data_dir=orphan)
-            try:
-                assert abandoned.load_admin(NOTE) is None, "the note goes with the move"
-            finally:
-                abandoned.close()
+            state, note = _what_was_put_aside(orphan)
+            assert [state.get(key).value for key in KEYS] == VALUES, \
+                "the rows are still there, in the state a group coming back would read"
+            assert note is None, "the note goes with the move"
         for node_id in SERVING:
             assert not os.path.isdir(str(tmp_path / f"shard0_node{node_id}")), \
                 "the name the shard was stored under is free"
@@ -258,6 +348,134 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
         metadata.shutdown()
 
 
+def test_a_move_the_table_refuses_puts_the_shard_back_and_keeps_what_was_copied(tmp_path):
+    metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
+    try:
+        client = wait_for_metadata_client(metadata)
+        _write_rows(cluster)
+        _published(client, (0,))
+        refuser = _RefusingClient(cluster.metadata_client(),
+                                  "shard 0 is served by [1], not by [1, 2, 3]")
+        cluster._metadata_client = refuser
+
+        assert cluster.move_shard(0, MOVE_TO) is False
+        assert refuser.calls == 1, "a refusal is final: the same command is not asked twice"
+        assert "served by [1]" in cluster.migration_error()
+
+        # The shard is serving as it was.  The group the table names is the group that has
+        # to answer for the range, and a refusal is not a reason to leave it unserved.
+        source = cluster.get_shard_server(SERVING[0]).get_shard_node(0)
+        assert source is not None and not source.writes_frozen
+        assert cluster.migrations() == {}, "no move in flight"
+        assert cluster._load_migration_record(0) is None, "and nothing written down"
+        assert cluster._serving_nodes(0) == SERVING
+        assert client.table(refresh=True).shard(0).nodes == SERVING, "the table did not move"
+
+        # What was copied is closed and put aside: not serving, not routed to, and not
+        # deleted either - an operator asking what was copied before the refusal finds it.
+        for node_id in MOVE_TO:
+            assert cluster.get_shard_server(node_id).get_shard_node(0) is None
+        orphans = cluster.orphan_dirs()
+        assert len(orphans) == len(MOVE_TO)
+        for orphan in orphans:
+            state, note = _what_was_put_aside(orphan)
+            assert [state.get(key).value for key in KEYS] == VALUES, \
+                "the rows that were copied are still there"
+            assert note is None
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+
+def test_a_proposal_whose_answer_never_arrives_is_proposed_again(tmp_path):
+    metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
+    try:
+        client = wait_for_metadata_client(metadata)
+        _write_rows(cluster)
+        _published(client, (0,))
+        loser = _LostAnswerClient(cluster.metadata_client())
+        cluster._metadata_client = loser
+
+        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+
+        # The move landed on the attempt whose answer was lost, and the attempt that
+        # followed it was answered as a success rather than applied a second time - which
+        # is what makes a retry safe, and is pinned against the group directly in
+        # tests/test_move_shard_proposal.py.
+        assert loser.calls == 2
+        assert client.table(refresh=True).shard(0).nodes == MOVE_TO
+        assert cluster._serving_nodes(0) == MOVE_TO
+        assert cluster.migrations() == {}
+        for node_id in SERVING:
+            assert cluster.get_shard_server(node_id).get_shard_node(0) is None
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+
+def test_a_table_that_cannot_be_read_is_tried_again_before_the_move_gives_up(tmp_path):
+    metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
+    try:
+        client = wait_for_metadata_client(metadata)
+        _write_rows(cluster)
+        _published(client, (0,))
+        blind = _BlindTableClient(cluster.metadata_client())
+        cluster._metadata_client = blind
+
+        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+
+        assert blind.reads == 2, "the read that failed was followed by another one"
+        assert client.table(refresh=True).shard(0).nodes == MOVE_TO
+        assert cluster._serving_nodes(0) == MOVE_TO
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+
+def test_a_table_that_cannot_be_reached_leaves_the_shard_frozen_and_retryable(tmp_path):
+    metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
+    try:
+        client = wait_for_metadata_client(metadata)
+        _write_rows(cluster)
+        _published(client, (0,))
+        original = cluster.metadata_client()
+        unreachable = _UnreachableClient(original)
+        cluster._metadata_client = unreachable
+
+        assert cluster.move_shard(0, MOVE_TO) is False
+        assert unreachable.calls == PROPOSE_ATTEMPTS, "three attempts, then the caller is told"
+        assert "no leader" in cluster.migration_error()
+
+        # Frozen, written down, and still the group the table names.  The proposal may have
+        # landed, so this shard taking rows would be rows the table has already given away.
+        for node_id in SERVING:
+            frozen = cluster.get_shard_server(node_id).get_shard_node(0)
+            assert frozen.writes_frozen and frozen.freeze_reason == "migration"
+        assert cluster.migration_state(0).phase == MigrationPhase.PROPOSING
+        assert cluster._load_migration_record(0) is not None
+        assert cluster._serving_nodes(0) == SERVING
+        assert client.table(refresh=True).shard(0).nodes == SERVING, "nothing was proposed"
+
+        # The refusal is asked of the group that would take the row, which is the shard's
+        # leader: a follower answers not-leader whatever else is going on with the shard.
+        leader = cluster.get_leader_for_key(KEYS[0])[1]
+        refusal = leader.propose(_set(leader._state_machine, b"a_later_row", b"v", 10_000))
+        assert not refusal.success and refusal.error_code == ErrorCode.ERR_MIGRATING
+
+        # Asking again is asking to finish that same move, and it does: the copy it had
+        # already made is not made twice, and the table takes the proposal this time.
+        cluster._metadata_client = original
+        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
+        assert client.table(refresh=True).shard(0).nodes == MOVE_TO
+        assert cluster._load_migration_record(0) is None
+        assert cluster._serving_nodes(0) == MOVE_TO
+        for node_id in SERVING:
+            assert cluster.get_shard_server(node_id).get_shard_node(0) is None
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+
 def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_path):
     metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
     try:
@@ -265,7 +483,10 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
         source_address = cluster.shard_addresses(0)[SERVING[0]]
         _write_rows(cluster)
         _published(client, (0,))
-        _copy_but_do_not_propose(cluster)
+        original = cluster.metadata_client()
+        cluster._metadata_client = _UnreachableClient(original)
+        assert cluster.move_shard(0, MOVE_TO) is False, "stopped with the copy made"
+        cluster._metadata_client = original
         assert cluster._propose_move(0, MOVE_TO).ok
 
         # A window long enough to be sampled inside, and a sample taken a tenth of the way
@@ -301,9 +522,8 @@ def test_finishing_a_move_twice_is_finishing_it_once(tmp_path):
     try:
         client = wait_for_metadata_client(metadata)
         _write_rows(cluster)
-        _published(client, (0,))
-        _copy_but_do_not_propose(cluster)
-        assert _finish_the_move(cluster) == SERVING
+        before = _published(client, (0,))
+        assert cluster.move_shard(0, MOVE_TO), cluster.migration_error()
         after = client.table(refresh=True)
 
         # The cluster that comes back to a finished move: the proposal is made again
@@ -315,6 +535,7 @@ def test_finishing_a_move_twice_is_finishing_it_once(tmp_path):
         assert cluster.orphan_dirs() == orphans, "and nothing left to move aside"
 
         assert client.table(refresh=True).version == after.version, "one move, one write"
+        assert before.version < after.version, "and the table did move"
         assert cluster._serving_nodes(0) == MOVE_TO
         assert cluster.shard_replica_ids(0) == MOVE_TO
     finally:

@@ -2,12 +2,15 @@
 
 A move is a split's protocol with the whole range as its subject - freeze the source, read
 its rows at one moment, copy them into the group that will own them, and only then tell the
-routing table - and it stops one step earlier than a split does today: the proposal that
-makes the new group the shard's is not wired, so a move that has copied its rows raises
-rather than pretending it finished.  What is here is the half that has to be right before
-any of that matters: no row is copied out of a shard that can still take writes, no group
-the cluster would route to is built before the table says so, and a move that cannot be
-made leaves the shard exactly as it was.
+routing table.  What is here is the half that has to be right before that last step matters:
+no row is copied out of a shard that can still take writes, no group the cluster would route
+to is built before the table says so, and a move that cannot be made leaves the shard
+exactly as it was.
+
+These tests look at a move stopped after its copy, which is where a caller that could not
+reach the table leaves it: they hand the cluster a table that can be read and cannot be
+written to.  A move that finishes - the table told, the group it left let go - is
+``tests/test_move_proposal.py``'s.
 
 What these tests pin: a shard's rows land in a new group on the nodes it was given, at the
 timestamps they already had, on every node of that group; while it is being moved the shard
@@ -18,11 +21,10 @@ in the range stops a move and thaws the shard it had just frozen; and a move tha
 found by the next start, as a frozen shard and the note it left behind.
 """
 
-import pytest
-
 from _wait import wait_until
+from oxidedb.metadata.service import RoutingTable, ShardPlacement
 from oxidedb.raft.shard_server import MigrationPhase, ShardedRaftCluster
-from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
+from oxidedb.raft.state_machine import (ApplyResult, CommandType, ErrorCode, MVCCStateMachine)
 from oxidedb.raft.storage import EngineRaftStorage
 
 COUNT = 100
@@ -54,6 +56,10 @@ def _started_cluster(tmp_path, shard_nodes=None):
         shard_nodes=shard_nodes,
         lock_cleaner_interval=None,
     )
+    # A move is stopped where the rest of this file wants to look at it - after the copy and
+    # before the table - by a table nothing can be written to.  An in-process cluster has no
+    # metadata group of its own, and this is the shape of one that is out of reach.
+    cluster._metadata_client = _TableThatAnswersNothing(cluster)
     return cluster
 
 
@@ -71,6 +77,34 @@ def _group(cluster, node_id, shard_id):
     return cluster.get_shard_server(node_id).get_shard_node(shard_id)
 
 
+class _TableThatAnswersNothing:
+    """A table that can be read and cannot be written to.
+
+    The freeze and the copy are only visible while the move is still standing, so the move
+    has to stop after them: every proposal here comes back as "no leader", which is what a
+    table that cannot be reached says, and what every other write to an in-process cluster
+    answers with too.
+    """
+
+    def __init__(self, cluster, shard_id=0):
+        self._cluster = cluster
+        self._shard_id = shard_id
+        self.calls = 0
+
+    def table(self, refresh=False):
+        shard_id = self._shard_id
+        start, end = self._cluster._range_map[shard_id]
+        return RoutingTable(version=1, shards={shard_id: ShardPlacement(
+            shard_id, start, end,
+            nodes=self._cluster.shard_replica_ids(shard_id),
+            addresses=self._cluster.shard_addresses(shard_id))})
+
+    def move_shard(self, *args, **kwargs):
+        self.calls += 1
+        return ApplyResult.failure(ErrorCode.ERR_NOT_LEADER,
+                                   "the metadata group has no leader")
+
+
 def test_a_shards_rows_land_in_a_new_group_on_the_nodes_it_was_given(tmp_path):
     """The copy, and the two things about it that a table entry will depend on.
 
@@ -85,8 +119,8 @@ def test_a_shards_rows_land_in_a_new_group_on_the_nodes_it_was_given(tmp_path):
         source_storage = leader._state_machine._storage
         committed = {key: source_storage.get_latest_version(key).timestamp for key in KEYS}
 
-        with pytest.raises(NotImplementedError):
-            cluster.move_shard(0, MOVE_TO)
+        assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
+        assert cluster.migration_error() == "the metadata group has no leader"
 
         state = cluster.migration_state(0)
         assert state.phase == MigrationPhase.PROPOSING, "the copy is done and the switch owed"
@@ -138,8 +172,8 @@ def test_the_shard_is_frozen_while_its_rows_are_copied(tmp_path, monkeypatch):
     monkeypatch.setattr(ShardedRaftCluster, "_move_row", spy_move_row)
     try:
         _write_rows(cluster, count=3)
-        with pytest.raises(NotImplementedError):
-            cluster.move_shard(0, MOVE_TO)
+        assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
+        assert cluster.migration_error() == "the metadata group has no leader"
     finally:
         cluster.shutdown()
 
@@ -204,8 +238,8 @@ def test_a_move_that_died_comes_back_as_a_frozen_shard(tmp_path):
     cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
     try:
         _write_rows(cluster, count=2)
-        with pytest.raises(NotImplementedError):
-            cluster.move_shard(0, MOVE_TO)
+        assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
+        assert cluster.migration_error() == "the metadata group has no leader"
 
         note = _group(cluster, 1, 0)._storage.load_admin(NOTE)
         assert note is not None, "the move is written down before a row is moved"
@@ -228,8 +262,7 @@ def test_a_move_that_died_comes_back_as_a_frozen_shard(tmp_path):
         # A caller picks the move up by asking for it again.  The rows are read out of the
         # source - the note does not carry them - and the copy skips what the new group
         # already has, which is what makes asking twice safe to do at all.
-        with pytest.raises(NotImplementedError):
-            revived.move_shard(0, MOVE_TO)
+        assert revived.move_shard(0, MOVE_TO) is False, "the table was never reached"
         assert len(state.rows) == 2, "the rows are read out of the source again"
         assert state.copied_keys == [], "the new group already had every row"
         assert _group(revived, 2, 0) is not None, "and there is a group to switch to"
@@ -247,8 +280,8 @@ def test_a_shard_that_is_already_moving_refuses_a_different_move(tmp_path):
     cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
     try:
         _write_rows(cluster, count=2)
-        with pytest.raises(NotImplementedError):
-            cluster.move_shard(0, MOVE_TO)
+        assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
+        assert cluster.migration_error() == "the metadata group has no leader"
 
         assert cluster.move_shard(0, [2]) is False
         assert "already moving to [2, 3]" in cluster.migration_error()

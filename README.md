@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 282 tests, roughly seven minutes
+pytest tests -q             # 286 tests, roughly seven minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -188,11 +188,12 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   copies the rows into the new shard's group as the versions they already were, proposes
   the split to the table, and re-ranges the servers locally before thawing the source -
   and a split that dies before its proposal is finished on the next start.  A move of a
-  shard to another group has the half that has to be right first: `move_shard` freezes the
-  source, copies its rows into a group on the nodes the caller named - at the timestamps
-  they already had - and then stops, because the proposal that would make that group the
-  shard's is not wired.  See Known gaps for what is still missing: a move that finishes,
-  and follower reads.
+  shard to another group is wired end to end too: `move_shard` freezes the source, copies
+  its rows into a group on the nodes the caller named - at the timestamps they already had,
+  so a snapshot read still finds them - tells the routing table, and then lets the group the
+  shard left go, keeping its storage under an orphan name rather than deleting it.  See
+  Known gaps for what is still missing: something that decides to move a shard in the first
+  place, and follower reads.
 
 ## Storage engines (plan E)
 
@@ -286,7 +287,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-282 tests.  `tests/test_durability.py` covers the correctness properties that
+286 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -630,8 +631,8 @@ Honest list of what is *not* done, roughly in priority order.
   replica set at an address something answers at, a one-node cluster names itself for every
   shard, and a client outside the cluster can write the table through a member that does not
   lead it.
-* **Sharding is experimental, and frozen wherever it would have to move by itself: no
-  move that finishes, no follower read.**  Every component routes
+* **Sharding is experimental, and nothing moves a shard by itself: no rebalancing, no
+  follower read.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
   set and the leaders that reported themselves, and `MetadataClient` reads it with the
@@ -668,16 +669,17 @@ Honest list of what is *not* done, roughly in priority order.
   shard again, copies only what the new shard is missing, and proposes the split.
   What is still missing around it: it does not coordinate with a write that resolved to the
   old shard just before the range moved, so the copy can end up behind such a write; the
-  copies left in the old shard are never reclaimed; nothing chooses split points; and a move
-  of a shard between nodes stops before the proposal that would make it a move, so there is
-  no automatic splitting and no follower reads either - every read goes to the leader.
-  A move has the half that has to be right first.  `move_shard(shard_id, target_nodes)`
-  freezes the source - refusing its writes with `ERR_MIGRATING`, which is deliberately not
-  the split's answer, because a caller told a shard is moving has to look the range up
-  again - reads its rows at that one moment, builds a group on the nodes the caller named,
-  copies the rows into it as the versions they already were, and then raises
-  `NotImplementedError`, with the shard left frozen and the move written into the source
-  shard's own storage before the first row moves.  The target set is the caller's to name
+  copies left in the old shard are never reclaimed; nothing chooses split points, and nothing
+  chooses where a shard should live; and there are no follower reads - every read goes to the
+  leader.
+  A move is wired end to end.  `move_shard(shard_id, target_nodes)` freezes the source -
+  refusing its writes with `ERR_MIGRATING`, which is deliberately not the split's answer,
+  because a caller told a shard is moving has to look the range up again - reads its rows at
+  that one moment, builds a group on the nodes the caller named, copies the rows into it as
+  the versions they already were, and tells the table.  Nothing is copied out of a shard
+  that can still take a row: the freeze comes first, and the move is written into the source
+  shard's own storage before the first row moves, so a process that dies part way through
+  the copy comes back knowing which shard was moving and where it was going.  The target set is the caller's to name
   and has to be disjoint from the one serving the shard: a node cannot hold two groups for
   one shard, and a set that overlapped would need a member changed in place, which is not
   something this project's Raft does.  Until the proposal lands the table keeps naming the
@@ -685,12 +687,19 @@ Honest list of what is *not* done, roughly in priority order.
   `shard_replica_ids`, `shard_addresses`, `shard_leader`, `get_leader_for_key` - is answered
   with that group (`_serving_nodes`), so a group nothing routes to yet is not published.  A
   cluster that comes back finds the note and freezes the shard again, and waits for a
-  caller: nothing resumes a move on its own.  The two calls that finish one exist and are
-  tested on their own, and are deliberately not wired in yet.  `_propose_move` tells the
-  table the shard's new replica set, reading the set being replaced out of the table on
-  every attempt rather than proposing this process's own view of it: the machine refuses a
-  move whose expectation of the current set is wrong (code 14), so a guessed one is refused
-  every time two moves were computed from one table.  `_commit_move` then makes the
+  caller: nothing resumes a move on its own.  What the cluster can answer it with is the
+  whole of what happens to the freeze next.  It landed - the table names the new group, this
+  cluster's own answers follow it, and the group the shard left is closed and put aside.  It
+  was refused, which is final, because the machine would answer the same command the same
+  way: the shard goes back to serving, because it is still the group the table names and a
+  refusal is not a reason to leave a range unserved, and the group built to receive the rows
+  is closed and put aside without being deleted.  Or nothing answered, which is not final,
+  because the proposal may have landed: the shard stays frozen with the move written down,
+  and asking again with the same target set is how a caller finds out which of the two it
+  was.  `_propose_move` tells the table the shard's new replica set, reading the set being
+  replaced out of the table on every attempt rather than proposing this process's own view
+  of it: the machine refuses a move whose expectation of the current set is wrong (code 14),
+  so a guessed one is refused every time two moves were computed from one table.  `_commit_move` then makes the
   cluster's own answers follow the table, keeps the group the shard left answering for a
   fixed window - `MIGRATION_DRAIN_SECONDS`, because a client routes by a table it cached and
   the node it was sent to a moment ago is one it may still ask - closes that group on every
@@ -698,7 +707,12 @@ Honest list of what is *not* done, roughly in priority order.
   is still open, and renames the storage it leaves behind to `orphan-shard-<id>-<when>`
   rather than deleting it: a table that has to be put back - after a bug in the machine that
   holds it, or an operator - finds the rows still on disk, and a leaked directory costs disk
-  where a lost range costs the data.  See `tests/test_move_proposal.py`.
+  where a lost range costs the data.  What a move still does not have: nothing decides that
+  a shard should move - there is no rebalancer here and no node reports its load - so the
+  target set is a caller's to choose, and no client is driven through the window a move
+  opens: the window is pinned by a test that asks the group the shard left, and a client
+  holding the old table is not walked through the reroute.  See
+  `tests/test_move_proposal.py`.
   A client can reach a shard it was never handed a handle on, by the address the table names
   for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
