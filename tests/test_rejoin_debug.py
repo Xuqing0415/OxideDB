@@ -1,4 +1,4 @@
-import time
+from _wait import wait_for_leader, wait_for_replication, wait_until
 from oxidedb.raft import RaftCluster, MVCCStateMachine, CommandType, NodeState, MemoryRaftNode
 
 
@@ -6,9 +6,7 @@ def test_rejoin_debug():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
     
-    time.sleep(2)
-    
-    leader_id = cluster.get_leader()
+    leader_id = wait_for_leader(cluster)
     print(f"Initial leader: Node {leader_id}")
     
     leader = cluster.get_node(leader_id)
@@ -18,7 +16,8 @@ def test_rejoin_debug():
         command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
         leader.propose(command)
     
-    time.sleep(0.5)
+    wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                  if node_id != leader_id])
     
     for node_id, node in cluster._nodes.items():
         print(f"Node {node_id}: term={node._current_term}, voted_for={node._voted_for}, log_len={len(node._log)}")
@@ -32,7 +31,8 @@ def test_rejoin_debug():
         command = state_machine.serialize_command(CommandType.SET, key=f"key{i}".encode(), value=f"value{i}".encode())
         leader.propose(command)
     
-    time.sleep(0.5)
+    wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                  if node_id != peer_id])
     
     print(f"\nAfter more entries:")
     for node_id, node in cluster._nodes.items():
@@ -53,11 +53,14 @@ def test_rejoin_debug():
     
     print(f"\nNew node {peer_id} joined: term={new_peer._current_term}, voted_for={new_peer._voted_for}, log_len={len(new_peer._log)}")
     
-    for _ in range(3):
+    def poke_until_caught_up():
+        # The rejoined node holds nothing, so the leader has to walk its next_index
+        # back until a heartbeat lands - one round of that per poke, and the print
+        # below is about the node once it has the entries rather than mid-catch-up.
         leader._send_heartbeats()
-        time.sleep(0.1)
-    
-    time.sleep(2)
+        return new_peer.log_length >= leader.log_length
+
+    wait_until(poke_until_caught_up, message="the rejoined node never caught up")
     
     final_leader_id = cluster.get_leader()
     print(f"\nFinal leader: Node {final_leader_id}")
