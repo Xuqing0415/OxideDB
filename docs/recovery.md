@@ -278,17 +278,35 @@ and the placement the node publishes follows from the group it holds.  That is a
 the method is idempotent and why it is one call rather than two: in a process, "the set
 changed" and "my holding changed" are the same event.
 
-Two constraints found while writing this section, both of which the implementation has
+Four constraints found while writing this section, all of which the implementation has
 to respect:
 
 * `ShardServer.add_shard` must not be called for a shard the server already holds: it
   builds a fresh node and a fresh gRPC server on the same address.  `_ensure_group_on`
   guards on `get_shard_node(shard_id) is None` and `ensure_serving` has to keep that
   guard; the `add_shard` that already carries `members=` is otherwise exactly right.
-* A process does not learn its shards from the table.  It serves what it was started
-  with (`--shards`), which is also why `_ensure_shard` exists for a split's new shard:
-  the shard the recovery is finishing may not be one this node was started with.  The
-  process side needs the same step, and `shard_ids()` cannot be the table's list.
+* A process does not learn its shards from the table.  It serves the `--num-shards` shards
+  it was started with, every node serving all of them, which is also why `_ensure_shard`
+  exists for a split's new shard: the shard the recovery is finishing may not be one this
+  node was started with.  The process side needs the same step, and `shard_ids()` cannot be
+  the table's list.
+* A group a process was started with holds every node of the cluster.  `start_shards` is
+  called without `shard_nodes`, so `_get_peer_nodes` answers "every other node" and
+  `shard_replica_ids` is the whole cluster - which is what the publisher has been sending,
+  and what `tests/test_group_clients.py` asserts.  So `ensure_serving` on the process side
+  cannot be the build-or-close the cluster side gets away with: a shard the node already
+  holds, whose members are not the set the table now names, has to be torn down and built
+  again with those members, because `MemoryRaftNode` takes its peers once and keeps them.
+* A node's port block has room for exactly the shards it was started with, and that is a
+  hard stop for a split in a process.  Shard `s` listens at `base + 100 * s` and the
+  metadata group at `base + 100 * num_shards`, so the shard a first split creates wants the
+  port the metadata group is already holding: with one shard, both are `base + 100`.
+  `grpc` raises out of `add_insecure_port` for a port that is already bound rather than
+  reporting a failure, so a recovery wired in as it stands would not come up - and
+  `_resume_split` builds the new shard's group *after* freezing the source, so this is a
+  start that dies with the shard frozen.  Making room - a wider block, or group ports that
+  do not come out of the shard count - changes `ports_for` and every address a client or a
+  peer derives from it, which is why it is a decision for this work and not a detail of it.
 
 ## 6. Order, failure, tests
 
@@ -331,13 +349,16 @@ intermediate state the mover left it in - the one state that cannot lose a row.
    `tests/test_split_recovery.py`) are the behavior contract for the refactor: they
    drive `ShardedRaftCluster`, and they must pass unchanged.  If they need editing, the
    move of the bodies went wrong.
-2. A hand-made note in a real process: write a move's note into a launcher node's
-   `raft_admin.json` (the key is `MIGRATION_RECORD_PREFIX/{shard_id}`, the value is the
-   msgpack record `_remember_migration` writes), start three nodes, and assert the move
-   is finished - the table names the target set, the source is closed and set aside.
-   This is deterministic in a way a kill is not, and it drives the same path: a node
-   that comes up with a note is a node whose predecessor died.  The split's note gets
-   the same test through `SPLIT_RECORD_PREFIX/{shard_id}`.
+2. A hand-made note in a real process - `tests/_notes.py` writes one, and
+   `tests/test_recovery_over_processes.py` is the test that starts a node over it, marked
+   `xfail` until this work lands.  The note goes into the shard's own storage
+   (`<data-dir>/shard-N`, through `RaftStorage.save_admin`: a node's bookkeeping is a note
+   by name and not a file), under `MIGRATION_RECORD_PREFIX/{shard_id}` or
+   `SPLIT_RECORD_PREFIX/{shard_id}`, holding the msgpack record `_remember_migration` or
+   `_remember_split` writes.  Start the node and assert the job is finished - the table
+   names the target set, the source is closed and set aside.  This is deterministic in a
+   way a kill is not, and it drives the same path: a node that comes up with a note is a
+   node whose predecessor died.
 3. A kill, for the part the hand-made note cannot show: start a real cluster through
    `tests/_cluster.py`, begin a move, `kill()` one node between its copy and its
    proposal, start it again, and assert that the move ends and a client can write the

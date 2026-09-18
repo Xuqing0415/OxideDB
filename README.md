@@ -548,7 +548,9 @@ Honest list of what is *not* done, roughly in priority order.
   moving that logic somewhere both start-up paths can call, not adding a call: it is written
   against the cluster's own `_migrations`, `_pending_splits`, `_placed_shards`,
   `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group has
-  none of those.
+  none of those.  A split has one further constraint: a node's port block is sized for
+  exactly the shards it was started with, so the group a first split creates wants the port
+  the metadata group already holds - `docs/recovery.md`, section 5.
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not
