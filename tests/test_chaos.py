@@ -4,6 +4,8 @@ import random
 import multiprocessing
 from typing import Dict, List
 
+from _wait import wait_for_replication, wait_for_single_leader
+
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 
@@ -161,9 +163,7 @@ class TransferClient:
 def test_transfer_no_chaos():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
-    time.sleep(3)
-    
-    leader = cluster.get_node(cluster.get_leader())
+    leader = cluster.get_node(wait_for_single_leader(cluster))
     
     initial_balances = {
         b"account_a": b"1000",
@@ -181,8 +181,6 @@ def test_transfer_no_chaos():
             timestamp=100,
         )
         leader.propose(command)
-    
-    time.sleep(1)
     
     total_initial = sum(int(v.decode()) for v in initial_balances.values())
     print(f"Initial total: {total_initial}")
@@ -208,8 +206,6 @@ def test_transfer_no_chaos():
     
     for t in threads:
         t.join()
-    
-    time.sleep(1)
     
     leader = cluster.get_node(cluster.get_leader())
     total_final = 0
@@ -237,9 +233,7 @@ def test_transfer_no_chaos():
 def test_leader_failure_recovery():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
-    time.sleep(3)
-    
-    leader = cluster.get_node(cluster.get_leader())
+    leader = cluster.get_node(wait_for_single_leader(cluster))
     original_leader_id = cluster.get_leader()
     
     command = leader._state_machine.serialize_command(
@@ -249,16 +243,15 @@ def test_leader_failure_recovery():
         timestamp=100,
     )
     leader.propose(command)
-    time.sleep(0.5)
+    wait_for_replication(leader, [node for node_id, node in cluster._nodes.items()
+                                  if node_id != original_leader_id])
     
     print(f"Original leader: {original_leader_id}")
     
     leader.shutdown()
     print(f"Leader {original_leader_id} shut down")
     
-    time.sleep(3)
-    
-    new_leader_id = cluster.get_leader()
+    new_leader_id = wait_for_single_leader(cluster)
     print(f"New leader: {new_leader_id}")
     
     new_leader = cluster.get_node(new_leader_id)
