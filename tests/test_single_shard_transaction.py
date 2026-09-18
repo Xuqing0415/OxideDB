@@ -1,5 +1,5 @@
-import time
 from _ports import allocate_port
+from _wait import wait_for_leader
 from oxidedb.raft.node import RaftCluster, NodeState
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ApplyResult
 
@@ -18,10 +18,7 @@ def test_single_shard_prewrite_commit():
     cluster = RaftCluster(num_nodes=3)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    leader_id = cluster.get_leader()
-    assert leader_id is not None
+    leader_id = wait_for_leader(cluster)
     leader = cluster.get_node(leader_id)
     
     key = b"txn_key"
@@ -41,8 +38,6 @@ def test_single_shard_prewrite_commit():
     prewrite_result = leader.propose(prewrite_cmd)
     assert prewrite_result.success, f"Prewrite should succeed: {prewrite_result.error_msg}"
     
-    time.sleep(0.5)
-    
     lock_status = leader._state_machine.get_lock_status(key)
     assert lock_status is not None, "Lock should exist after prewrite"
     assert lock_status["start_ts"] == start_ts
@@ -60,8 +55,6 @@ def test_single_shard_prewrite_commit():
     
     commit_result = leader.propose(commit_cmd)
     assert commit_result.success, f"Commit should succeed: {commit_result.error_msg}"
-    
-    time.sleep(0.5)
     
     lock_status = leader._state_machine.get_lock_status(key)
     assert lock_status is None, "Lock should be released after commit"
@@ -95,10 +88,7 @@ def test_single_shard_prewrite_rollback():
     cluster = RaftCluster(num_nodes=3)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    leader_id = cluster.get_leader()
-    assert leader_id is not None
+    leader_id = wait_for_leader(cluster)
     leader = cluster.get_node(leader_id)
     
     key = b"rollback_key"
@@ -112,8 +102,6 @@ def test_single_shard_prewrite_rollback():
         timestamp=50,
     )
     leader.propose(set_cmd)
-    time.sleep(0.5)
-    
     start_ts = 100
     primary_key = key
     
@@ -128,8 +116,6 @@ def test_single_shard_prewrite_rollback():
     prewrite_result = leader.propose(prewrite_cmd)
     assert prewrite_result.success, f"Prewrite should succeed: {prewrite_result.error_msg}"
     
-    time.sleep(0.5)
-    
     lock_status = leader._state_machine.get_lock_status(key)
     assert lock_status is not None, "Lock should exist after prewrite"
     
@@ -141,8 +127,6 @@ def test_single_shard_prewrite_rollback():
     
     rollback_result = leader.propose(rollback_cmd)
     assert rollback_result.success, f"Rollback should succeed: {rollback_result.error_msg}"
-    
-    time.sleep(0.5)
     
     lock_status = leader._state_machine.get_lock_status(key)
     assert lock_status is None, "Lock should be released after rollback"
@@ -173,10 +157,7 @@ def test_single_shard_lock_conflict():
     cluster = RaftCluster(num_nodes=3)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    leader_id = cluster.get_leader()
-    assert leader_id is not None
+    leader_id = wait_for_leader(cluster)
     leader = cluster.get_node(leader_id)
     
     key = b"conflict_key"
@@ -193,8 +174,6 @@ def test_single_shard_lock_conflict():
     
     prewrite_result_1 = leader.propose(prewrite_cmd_1)
     assert prewrite_result_1.success, f"First prewrite should succeed: {prewrite_result_1.error_msg}"
-    
-    time.sleep(0.5)
     
     prewrite_cmd_2 = leader._state_machine.serialize_command(
         CommandType.PREWRITE,
@@ -231,10 +210,7 @@ def test_single_shard_write_conflict():
     cluster = RaftCluster(num_nodes=3)
     cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    leader_id = cluster.get_leader()
-    assert leader_id is not None
+    leader_id = wait_for_leader(cluster)
     leader = cluster.get_node(leader_id)
     
     key = b"write_conflict_key"
@@ -246,8 +222,6 @@ def test_single_shard_write_conflict():
         timestamp=200,
     )
     leader.propose(set_cmd)
-    time.sleep(0.5)
-    
     start_ts = 100
     
     prewrite_cmd = leader._state_machine.serialize_command(
