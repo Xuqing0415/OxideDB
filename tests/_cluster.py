@@ -455,37 +455,37 @@ def _spawn(config: ClusterConfig, root: str) -> NodeProcess:
 def _indent(text: str) -> str:
     lines = text.splitlines()
     return "\n".join(f"    {line}" for line in lines) if lines else "    (nothing)"
-def write_when_ready(client, command: bytes, timeout: float = CLIENT_TIMEOUT) -> ApplyResult:
-    """Propose ``command`` until a shard has a leader, and return the last answer.
-
-    A node prints READY once its ports are bound and its groups have begun electing, so the
-    first proposal of a test can arrive before there is a leader to take it.  The answer
-    then is NOT_LEADER rather than a failure, and retrying it is what a client does with it
-    - so a test that goes over the wire retries it too, rather than being a test about how
-    fast one machine elects.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        result = client.propose(command)
-        if result.success or result.error_code != ErrorCode.ERR_NOT_LEADER:
-            return result
-        if time.monotonic() >= deadline:
-            return result
-        time.sleep(CLIENT_INTERVAL)
-
-
-def read_when_ready(client, key: bytes, timeout: float = CLIENT_TIMEOUT) -> ReadResult:
-    """Read ``key``, retrying the same NOT_LEADER a write would, and return the answer.
-
-    Only that one answer is retried.  A key that is not there comes back as a successful
-    read of nothing, and a test that treated that as "not ready yet" would pass by waiting.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        result = client.get(key)
-        if result.success or result.error_code != ErrorCode.ERR_NOT_LEADER:
-            return result
-        if time.monotonic() >= deadline:
-            return result
-        time.sleep(CLIENT_INTERVAL)
+def write_when_ready(client, command: bytes, timeout: float = CLIENT_TIMEOUT) -> ApplyResult:
+    """Propose ``command`` until a shard has a leader, and return the last answer.
+
+    A node prints READY once its ports are bound and its groups have begun electing, so the
+    first proposal of a test can arrive before there is a leader to take it.  The answer
+    then is NOT_LEADER rather than a failure, and retrying it is what a client does with it
+    - so a test that goes over the wire retries it too, rather than being a test about how
+    fast one machine elects.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = client.propose(command)
+        if result.success or result.error_code != ErrorCode.ERR_NOT_LEADER:
+            return result
+        if time.monotonic() >= deadline:
+            return result
+        time.sleep(CLIENT_INTERVAL)
+
+
+def read_when_ready(client, key: bytes, timeout: float = CLIENT_TIMEOUT) -> ReadResult:
+    """Read ``key``, retrying the same NOT_LEADER a write would, and return the answer.
+
+    Only that one answer is retried.  A key that is not there comes back as a successful
+    read of nothing, and a test that treated that as "not ready yet" would pass by waiting.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = client.get(key)
+        if result.success or result.error_code != ErrorCode.ERR_NOT_LEADER:
+            return result
+        if time.monotonic() >= deadline:
+            return result
+        time.sleep(CLIENT_INTERVAL)
 
