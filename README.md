@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 297 tests, roughly four minutes
+pytest tests -q             # 298 tests, roughly two minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -292,7 +292,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-297 tests.  `tests/test_durability.py` covers the correctness properties that
+298 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
