@@ -106,7 +106,13 @@ class MetadataPublisher:
         if not self._routes_published:
             return
 
+        moving = self._moving_shards()
         for shard_id in sorted(self._cluster.shard_ids()):
+            if shard_id in moving:
+                # Both halves of the loop, because both describe the group that serves the
+                # shard, and while a move is in flight that group is not this thread's to
+                # describe: see :meth:`_moving_shards`.
+                continue
             self._publish_nodes(shard_id)
             self._publish_leader(shard_id)
 
@@ -147,6 +153,29 @@ class MetadataPublisher:
         if possible is None:
             return routes == self._cluster.range_map()
         return routes in possible()
+
+    def _moving_shards(self) -> set:
+        """The shards a move in this cluster is in charge of, when it can say.
+
+        A shard being moved has two groups for a moment, and which of them the routing table
+        names is the move\'s to decide and to write.  This cluster\'s own answer for a shard
+        in flight is deliberately the one it is leaving (see
+        ``ShardedRaftCluster._serving_nodes``), which is where clients are still being sent
+        and is not what the table is owed once the proposal lands - so a publisher that wrote
+        it would be undoing a proposal rather than describing anything, and a table that was
+        already told about the new group would be put back on the old one.
+
+        A restarted cluster is where this shows: its first pass runs while the note it just
+        read has the shard frozen and still answering with the group the move is leaving, and
+        the table may already name the group it went to.  Which is why the notes are read
+        before this thread starts - see ``ShardedRaftCluster.start_network``.
+
+        Asked the way ``possible_ranges`` is, of a cluster that may not have an answer: a
+        caller that is not a ``ShardedRaftCluster`` - the view one node of the launcher has,
+        a test stand-in - simply has no shards in flight and publishes as it always did.
+        """
+        migrations = getattr(self._cluster, "migrations", None)
+        return set() if migrations is None else set(migrations())
 
     def _publish_nodes(self, shard_id: int) -> None:
         if shard_id in self._nodes_published:

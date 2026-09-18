@@ -11,7 +11,9 @@ term, at an address that is really listening; the publisher writes on change and
 timer, because every write is a reason for every client's cache to refresh; a leader that
 dies is replaced in the table by the node that took over; a cluster that restarts and
 re-proposes the same ranges is not a disagreement; and a table that holds *different*
-ranges is not overwritten.
+ranges is not overwritten; and a shard a move is in flight for is left to the move rather
+than described by the publisher, because the two of them would disagree about which group
+serves it.
 """
 
 import socket
@@ -30,14 +32,17 @@ KEY_B = b"\x80key1"  # first byte 0x80 -> shard 1
 
 
 class _FakeCluster:
-    """The publisher's whole view of a cluster - five methods, and that is all.
+    """The publisher's whole view of a cluster - five methods, plus two it may not have.
 
     Having them in one place is the point: this is the entire coupling between the
     publisher and ``ShardedRaftCluster``, so a test can swap the cluster for this and
-    still exercise every branch of the publishing logic.
+    still exercise every branch of the publishing logic.  ``possible_ranges`` and
+    ``migrations`` are the two the publisher asks for only if the cluster can answer them,
+    and both are about a placement in flight rather than the one in force.
     """
 
-    def __init__(self, ranges, nodes=(1, 2, 3), addresses=None, possible=None):
+    def __init__(self, ranges, nodes=(1, 2, 3), addresses=None, possible=None,
+                 moving=()):
         self._ranges = dict(ranges)
         self._nodes = list(nodes)
         self._addresses = dict(addresses or {})
@@ -45,6 +50,9 @@ class _FakeCluster:
         #: is in the middle of will produce.  Absent is the ordinary cluster, which has
         #: only the map it routes by.
         self._possible = [dict(entry) for entry in (possible or [])]
+        #: The shards a move in this cluster is in charge of, as ``migrations`` returns
+        #: them - the ids, which is all the publisher asks about.
+        self.moving = list(moving)
         self.leaders = {}
 
     def range_map(self):
@@ -64,6 +72,9 @@ class _FakeCluster:
 
     def possible_ranges(self):
         return [self.range_map()] + [dict(entry) for entry in self._possible]
+
+    def migrations(self):
+        return {shard_id: None for shard_id in self.moving}
 
 
 def _started_metadata():
@@ -132,6 +143,43 @@ def test_the_publisher_writes_on_change_and_not_on_a_timer():
 
         assert publisher.error is None
         assert publisher.leaders() == {0: (2, 5), 1: (2, 4)}
+    finally:
+        metadata.shutdown()
+
+
+def test_a_shard_a_move_is_in_flight_for_is_left_to_the_move():
+    """Which group serves a moving shard is the move's to write, not the publisher's.
+
+    A shard being moved has two groups for a moment.  The cluster's own answer for it is the
+    one it is leaving - that is where clients are still being routed - while the table may
+    already name the group the rows went to, because the proposal landed and the rest of the
+    move did not.  A publisher that wrote the cluster's answer would undo that proposal, and
+    would do it on the first pass of a process that has just come back.
+    """
+    metadata = _started_metadata()
+    try:
+        client = wait_for_metadata_client(metadata)
+        cluster = _FakeCluster(default_range_map(2), addresses={1: "127.0.0.1:50051"},
+                               moving=[0])
+        cluster.leaders = {0: (1, 4), 1: (2, 4)}
+        publisher = MetadataPublisher(metadata.get_client(), cluster, poll_interval=0.05)
+
+        publisher.publish_once()
+
+        table = client.table(refresh=True)
+        assert sorted(table.routes()) == [0, 1], "the ranges are published all the same"
+        assert table.shard(0).nodes == [], "but not a set a move is still deciding"
+        assert table.shard(0).leader_id is None
+        assert table.shard(1).nodes == [1, 2, 3], "the shard that is not moving is described"
+        assert table.shard(1).leader_id == 2
+
+        # Not a permanent silence either: once the move is finished with the shard, the
+        # publisher describes it like any other.
+        cluster.moving = []
+        publisher.publish_once()
+        table = client.table(refresh=True)
+        assert table.shard(0).nodes == [1, 2, 3]
+        assert table.shard(0).leader_id == 1 and table.shard(0).leader_term == 4
     finally:
         metadata.shutdown()
 
