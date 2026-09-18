@@ -2,14 +2,46 @@ import time
 import threading
 import random
 
+import pytest
+
 from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_leader, wait_for_tso_client
+from oxidedb.client import LocalNodeClientFactory
+from oxidedb.metadata.cache import RoutingCache
+from oxidedb.metadata.service import RoutingTable
 from oxidedb.raft.node import RaftCluster
 from oxidedb.raft.shard_server import ShardedRaftCluster as ShardedCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 from oxidedb.tso.tso import TSOCluster
 from oxidedb.transaction.coordinator import TransactionCoordinator
 from oxidedb.transaction.smart_client import SmartClient
+
+
+class _ClockWithoutAGroup:
+    """A clock that hands out timestamps with no group behind it.
+
+    What a write needs from a cluster to be attempted at all, and nothing more: the
+    subject of the test below is what the client says when there is nowhere to send the
+    write, so the clock is the one part that does not have to be real.
+    """
+
+    def __init__(self, first: int = 100):
+        self._next = first
+
+    def get_timestamp(self) -> int:
+        self._next += 1
+        return self._next
+
+
+class _TableThatCoversNothing:
+    """A table read before the cluster had published a range: no shard holds any key.
+
+    What a client holds in the moment between its first read of the routing table and
+    the publisher's first write to it, which is what the CLI was hitting.
+    """
+
+    def table(self, refresh=False):
+        return RoutingTable(version=1, shards={})
 
 
 def test_readonly_transaction():
@@ -77,6 +109,24 @@ def test_smart_client_retry():
     print("SmartClient retry test passed!")
 
 
+def test_a_write_with_nowhere_to_send_it_says_why():
+    """``put`` may not answer False and keep the reason to itself.
+
+    A client whose table covers no such key is where the CLI was: it was told "Key not
+    written", and nothing said that the table it held had been read before the cluster
+    published a range.  What the caller gets now is the reason, because that is the only
+    thing it can act on - read the table again, or ask again in a moment - and "not
+    written" reads the same for a table read too early, a group mid-election and a key
+    that is not this client's to write.
+    """
+    factory = LocalNodeClientFactory(None)
+    cache = RoutingCache(None, _TableThatCoversNothing(), factory=factory)
+    client = SmartClient(_ClockWithoutAGroup(), None, router=cache, factory=factory)
+
+    with pytest.raises(RuntimeError, match="No shard holds"):
+        client.put(b"user:1", b"alice")
+
+
 def test_read_index_consistency():
     cluster = RaftCluster(num_nodes=3)
     cluster.start(lambda: MVCCStateMachine())
@@ -104,5 +154,7 @@ if __name__ == "__main__":
     test_readonly_transaction()
     print("\n" + "="*60 + "\n")
     test_smart_client_retry()
+    print("\n" + "="*60 + "\n")
+    test_a_write_with_nowhere_to_send_it_says_why()
     print("\n" + "="*60 + "\n")
     test_read_index_consistency()

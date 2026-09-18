@@ -108,11 +108,20 @@ class SmartClient:
         self._coordinator.add_write(txn_id, key, value)
     
     def commit(self, txn_id: int) -> Tuple[bool, Optional[int]]:
-        """Commit, or report that it could not be committed.
+        """Commit, or say why it could not be committed.
 
         A transaction aborted by read-set validation raises ``SerializationError``
         instead of returning False: it is retryable, and only by running the work
         again, so it must not look like the other failures.  ``run`` catches it.
+
+        A commit that could not be *made* raises as well, with the reason it got: no
+        shard this client can find for a key, a group with no leader, a shard that
+        refused the prewrite.  It used to answer ``False`` and keep the reason, and
+        that is the one answer a caller cannot do anything with: "not written" reads
+        the same whether the table was read before the cluster published a range, a
+        group is mid-election, or the key is not this client's to write - and each of
+        those is a different next move.  A read has raised for these failures since it
+        was written; a write does now, which is also what the CLI prints.
         """
         def _do_commit():
             success, commit_ts = self._coordinator.commit(txn_id)
@@ -127,12 +136,9 @@ class SmartClient:
 
             return success, commit_ts
 
-        try:
-            return self._retry_with_backoff(_do_commit)
-        except SerializationError:
-            raise
-        except RuntimeError:
-            return False, None
+        # No ``except`` for the two failures: ``_retry_with_backoff`` already re-raises a
+        # refusal without retrying it, and lets a failure it could not retry away out.
+        return self._retry_with_backoff(_do_commit)
 
     def run(self, work: Callable[[int], None], attempts: int = 3) -> bool:
         """Run ``work`` in a transaction, and run it again if the commit is refused.
@@ -144,8 +150,10 @@ class SmartClient:
         commit.  A fresh transaction gets a fresh start_ts, so the work sees the
         commits that invalidated it.
 
-        Returns whether the work committed.  A commit that failed for any other
-        reason is not retried; if every attempt was refused, the last
+        Returns whether the work committed.  A commit that could not be made is not
+        this loop's to absorb - it raises out of ``commit`` with its reason, because
+        running the same work again would not tell the caller anything the first
+        attempt did not.  If every attempt was refused, the last
         ``SerializationError`` is raised.
         """
         last_error = None
@@ -159,8 +167,6 @@ class SmartClient:
                 # Nothing the aborted attempt wrote survives, so running the same
                 # work again is safe by construction.
                 last_error = error
-                continue
-            return False
 
         raise last_error
     
@@ -168,6 +174,12 @@ class SmartClient:
         return self._coordinator.rollback(txn_id)
     
     def put(self, key: bytes, value: bytes) -> bool:
+        """Write ``key``, as a transaction of one key.
+
+        True means it committed.  A commit that could not be made raises with its reason
+        rather than answering False (see :meth:`commit`), which is the difference a shell
+        sees: ``set: No shard holds b'user:1'`` instead of "Key not written".
+        """
         txn_id = self.begin()
         self.add_write(txn_id, key, value)
         success, _ = self.commit(txn_id)
@@ -192,8 +204,12 @@ class SmartClient:
         the wire, and until it does, the honest thing is the command the shard already
         has and a caller that knows what it costs.
 
-        False means the shard never took it - no leader this client can reach, or a
-        refusal - which is how ``put`` reports the same kind of nothing.
+        False means the shard never took it: no leader of it this client could reach, or
+        a shard that refused the command.  That is not the answer ``put`` gives any more
+        - a commit that could not be made raises, with its reason - and the difference is
+        deliberate: there is no transaction here to abort and no reason gathered on the
+        way to a decision, so a refusal is an answer rather than a failure, and the
+        caller's next move is the same either way.
         """
         timestamp = self._tso_client.get_timestamp()
         command = serialize_command(CommandType.DELETE, key=key, timestamp=timestamp)
@@ -206,8 +222,9 @@ class SmartClient:
             result = ask_shard(self._leaders, shard_id,
                                lambda client: client.propose(command))
             if result is None or not result.success:
-                # False rather than an error, the way ``put`` reports a commit it
-                # could not land: the caller's next move is the same either way.
+                # False rather than an error: the caller's next move - read the table
+                # again, ask again in a moment - is the same either way, and there is no
+                # transaction here whose reason would have to come with it.
                 return False
             return True
 
