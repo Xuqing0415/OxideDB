@@ -1,6 +1,6 @@
-import time
 from _ports import allocate_port, free_addresses
-from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
+from _wait import (wait_for_keys_leader, wait_for_shard_leaders,
+                   wait_for_tso_client, wait_until)
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType, ErrorCode
 from oxidedb.shard.router import locate
@@ -75,10 +75,8 @@ def test_cross_shard_prewrite():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=shard_peer_addresses)
     
-    time.sleep(5)
-    
-    tso_client = tso_cluster.get_client()
-    assert tso_client is not None
+    wait_for_shard_leaders(shard_cluster, range(2))
+    tso_client = wait_for_tso_client(tso_cluster)
     
     coordinator = TransactionCoordinator(tso_client, shard_cluster)
     
@@ -102,8 +100,6 @@ def test_cross_shard_prewrite():
     
     commit_success, commit_ts = coordinator.commit(txn_id)
     assert commit_success, "Cross-shard commit should succeed"
-    
-    time.sleep(1)
     
     for key in [key1, key2]:
         leader_info = shard_cluster.get_leader_for_key(key)
@@ -144,10 +140,8 @@ def test_cross_shard_rollback():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=shard_peer_addresses)
     
-    time.sleep(5)
-    
-    tso_client = tso_cluster.get_client()
-    assert tso_client is not None
+    wait_for_shard_leaders(shard_cluster, range(2))
+    tso_client = wait_for_tso_client(tso_cluster)
     
     coordinator = TransactionCoordinator(tso_client, shard_cluster)
     
@@ -171,8 +165,6 @@ def test_cross_shard_rollback():
 
     set_cmd2 = leader2._state_machine.serialize_command(CommandType.SET, key=key2, value=b"original_b", timestamp=seed_ts)
     leader2.propose(set_cmd2)
-    
-    time.sleep(0.5)
     
     txn_id, start_ts = coordinator.begin()
     coordinator.add_write(txn_id, key1, b"new_value_a")
@@ -250,10 +242,9 @@ def test_coordinator_begin():
     shard_cluster = ShardedRaftCluster(num_nodes=3, num_shards=2)
     shard_cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(), peer_addresses=shard_peer_addresses)
     
-    time.sleep(5)
-    
-    tso_client = tso_cluster.get_client()
-    assert tso_client is not None
+    # This test only ever asks the TSO: a transaction that has written no key is
+    # PENDING, and begin() resolves a timestamp and touches no shard.
+    tso_client = wait_for_tso_client(tso_cluster)
     
     coordinator = TransactionCoordinator(tso_client, shard_cluster)
     
