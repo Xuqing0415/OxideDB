@@ -1,6 +1,6 @@
-import time
 import threading
 from _ports import allocate_port
+from _wait import wait_for_tso_client
 from oxidedb.tso.tso import TSOCluster, TSOClient
 
 
@@ -18,10 +18,7 @@ def test_tso_single_client():
     tso_cluster = TSOCluster(num_nodes=3)
     tso_cluster.start(peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    client = tso_cluster.get_client()
-    assert client is not None, "TSO client should be available"
+    client = wait_for_tso_client(tso_cluster)
     
     timestamps = []
     for i in range(100):
@@ -47,10 +44,7 @@ def test_tso_concurrent_requests():
     tso_cluster = TSOCluster(num_nodes=3)
     tso_cluster.start(peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    client = tso_cluster.get_client()
-    assert client is not None
+    client = wait_for_tso_client(tso_cluster)
     
     timestamps = []
     lock = threading.Lock()
@@ -90,10 +84,7 @@ def test_tso_batch_allocation():
     tso_cluster = TSOCluster(num_nodes=3)
     tso_cluster.start(peer_addresses=peer_addresses)
     
-    time.sleep(5)
-    
-    client = tso_cluster.get_client()
-    assert client is not None
+    client = wait_for_tso_client(tso_cluster)
     
     client._batch_size = 10
     
