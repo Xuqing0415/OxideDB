@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 296 tests, roughly ten minutes
+pytest tests -q             # 297 tests, roughly ten minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -68,8 +68,11 @@ ports sit above its shard ports - the arithmetic is `ports_for` in
 it defaults to the launcher's own default of two.  Several nodes may be given,
 comma-separated or repeated, and all of them are used as seeds: no client knows which
 member of the routing table's group leads, so one address it cannot use would
-otherwise end the walk.  `--data-dir` and `--server` together are refused, since the
-same key cannot be in two places.
+otherwise end the walk.  `--wait SECONDS` bounds how long a `--server` command asks a
+cluster that has not finished starting before it reports, as one line, the reason it
+could not be routed; it defaults to five, which is ten of the publisher's own poll
+intervals, and `0` asks once.  `--data-dir` and `--server` together are refused, since
+the same key cannot be in two places.
 
 ## Running a node
 
@@ -289,7 +292,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-296 tests.  `tests/test_durability.py` covers the correctness properties that
+297 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -749,14 +752,19 @@ Honest list of what is *not* done, roughly in priority order.
   to, the same lookup that finds that shard's leader, so nothing above the client needs a
   cluster object at all - but a client *without* one still routes by the cluster's own
   nodes, and the cross-shard transaction test is still driven in the cluster's own process.
-  What the CLI cannot do is read from a follower; every read goes to a leader.  Neither the
-  CLI nor any other client here waits for a cluster that has only just started: a group with
-  no leader yet answers with an error rather than a refusal, and a table the publisher has
-  not written yet covers no key at all, so a command run in the first second of a cluster's
-  life fails - `the clock cannot allocate a timestamp`, or `No shard holds` for a key the
-  cluster is about to serve - instead of waiting it out.  Every test waits for those two
-  things before it writes (`_wait.py`, `_cluster.py`); a person at a shell waits a moment
-  and asks again.
+  What the CLI cannot do is read from a follower; every read goes to a leader.  What it does
+  that no other client here does is wait for a cluster that has only just started: a
+  `--server` command asks first - for a timestamp, and for a table naming every shard it was
+  started with and a leader for each - and sends the command only once both answer, so a run
+  in the first moments of a cluster's life is slow rather than failed (`READY` is a promise
+  about ports, not about elections or the publisher's first pass).  `--wait SECONDS` is the
+  deadline: five by default, which is ten of the publisher's poll intervals, and `0` asks
+  once and reports the reason it could not.  The wait is the CLI's rather than the client's
+  because it is a property of a process with one shot at its command: a client answers or
+  raises with its reason and a caller holding state decides what to do next - and a command
+  that retried itself would be answering, on every caller's behalf, a question the design
+  notes leave open about a write refused while its range is moving.  Every test that routes
+  now goes through this wait rather than a fixture's own loop (`tests/test_cli.py`).
 * **A refusal from a state machine loses its own code on the way to a client.**  The
   machine answers a refused command with a code of its own - a split point outside the
   range is 8, a move whose expectation of the replica set does not hold is 14 - and the
