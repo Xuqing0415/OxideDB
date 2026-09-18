@@ -189,16 +189,17 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   table is read again.
   `split_shard` is wired end to end: it freezes the range,
   copies the rows into the new shard's group as the versions they already were, proposes
-  the split to the table, and re-ranges the servers locally before thawing the source -
-  and a split that dies before its proposal is finished on the next start.  A move of a
-  shard to another group is wired end to end too: `move_shard` freezes the source, copies
-  its rows into a group on the nodes the caller named - at the timestamps they already had,
-  so a snapshot read still finds them - tells the routing table, and then lets the group the
-  shard left go, keeping its storage under an orphan name rather than deleting it.  A move
-  that dies part way through is finished on the next start, out of the note it left in the
-  source shard and the answer the routing table gives.  See
-  Known gaps for what is still missing: something that decides to move a shard in the first
-  place, and follower reads.
+  the split to the table, and re-ranges the servers locally before thawing the source.
+  A move of a shard to another group is wired end to end too: `move_shard` freezes the
+  source, copies its rows into a group on the nodes the caller named - at the timestamps
+  they already had, so a snapshot read still finds them - tells the routing table, and then
+  lets the group the shard left go, keeping its storage under an orphan name rather than
+  deleting it.  A split or a move that died part way through is picked up on the next start
+  out of the note the source shard left and the answer the routing table gives - by
+  `ShardedRaftCluster`, which is the cluster object the tests start, and not yet by a node
+  started through `launcher.py`; that is the first entry under Known gaps.  See Known gaps
+  too for what is still missing around all of this: something that decides to move a shard
+  in the first place, and follower reads.
 
 ## Storage engines (plan E)
 
@@ -291,6 +292,12 @@ embedded tests rely on.
 pip install -e ".[test]"
 python -m pytest tests -q
 ```
+
+The suite takes 133.70s measured, down from 557.79s, and none of that is a test that got
+weaker: fixed sleeps became waits on an observable condition (`tests/_wait.py`), and the
+`LockCleaner` now wakes on an event instead of a shutdown being joined out of a `sleep` of
+its poll interval.  The second one was a product bug - every stop of a sharded cluster cost
+five seconds - found by measuring rather than by reading.
 
 298 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
@@ -524,6 +531,22 @@ Three environment notes:
 
 Honest list of what is *not* done, roughly in priority order.
 
+* **Recovery is not wired into `launcher.py`, so a process that dies mid-move does not pick
+  it up.**  `recover_splits` and `recover_migrations`, and the notes they read through
+  `_load_pending_splits` and `_load_pending_migrations`, live on `ShardedRaftCluster` and are
+  called from its `start` and `start_network` and nowhere else, so the cluster object the
+  tests start recovers and a node started as a process does not.  A process killed between a
+  move's copy and its proposal comes back with the note unread and, worse, with the source
+  shard unfrozen: the freeze is a flag in memory, nothing puts it back, and the group the
+  table has already given away takes new rows again - a double write and a range served by
+  one group whose rows are in another.  A split killed before its proposal has the same hole
+  without the double-write half, because a split copies rather than moves.  The tests for
+  this - `tests/test_migration_recovery.py` and `tests/test_split_recovery.py` - both drive
+  `ShardedRaftCluster`, so no test here covers the path a deployed node takes.  Fixing it is
+  moving that logic somewhere both start-up paths can call, not adding a call: it is written
+  against the cluster's own `_migrations`, `_pending_splits`, `_placed_shards`,
+  `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group has
+  none of those.
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not
@@ -705,9 +728,11 @@ Honest list of what is *not* done, roughly in priority order.
   entry for it is the move's to write, and a first pass that wrote the cluster's own answer
   would undo a proposal that had landed.  A cluster that comes back finds the note, freezes
   the shard again - the freeze is a local fact, and it died with the process that set it - and
-  finishes the move itself: `recover_migrations`, which the cluster calls as it starts and
-  which a caller may call again, because every step of it is a no-op the second time.  The
-  routing table is what says how much of the move is left, and its three answers are the three
+  finishes the move itself: `recover_migrations`, which `ShardedRaftCluster` calls as it
+  starts - a node started through `launcher.py` runs none of this yet, which is the first
+  entry under Known gaps - and which a caller may call again, because every step of it is a
+  no-op the second time.  The routing
+  table is what says how much of the move is left, and its three answers are the three
   below read backwards: the set the move was going to means the proposal landed and only the
   half after it is left, the set it was leaving means the copy is where the move stopped and
   the proposal is still owed, and anything else means somebody else has moved the shard -
