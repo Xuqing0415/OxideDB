@@ -411,7 +411,7 @@ leader if the node that claimed it is not in the new set.
 
 **Why the client caches it.**  Routing is on the hot path; the table changes when a
 shard splits or a leader moves, which is to say rarely.  So a client reads the table once
-and hands out `get_shard_for` / `get_shard_leader` from that read, refreshing when a shard
+and hands out `shard_for` and `leader_for_shard` from that read, refreshing when a shard
 tells it the answer was stale.  The cost is one linearizable read per refresh instead of
 one per key, and the thing that makes it safe is that the cached table was a decision
 when it was read - not that it is still current.  A stale cached table routes a key to a
@@ -453,47 +453,190 @@ different replica set is a different proposal and is refused.  The left half kee
 old shard's id: it is the same group with less to answer for, and giving it a new one
 would mean standing up a second group to hold a copy of a shard that is already there.
 
-**What is not covered.**  The publishing half of the join is in place: the cluster starts a
-`MetadataPublisher`, which proposes the ranges once, each shard's replica set and addresses
-once, and a leader report only when the leader or its term moves.  That restraint is the
-design, not an optimisation - every write to the table is a reason for every client's
-cache to refresh, so a pass that found nothing has to say nothing, and the publisher
-compares before it proposes rather than rewriting the table on a timer.  A refused report
-is normal, because two reports racing is what terms are for; a table holding ranges the
-cluster cannot account for is not, and the publisher stops with the disagreement attached
-rather than overwrite a keyspace belonging to another cluster.  The maps it can account for
-are the one it routes by and the one its own split in flight will produce, which it asks
-the cluster for rather than guessing: a split reaches the group from the shard's own
-thread, so the publisher's first pass can find the table a step ahead of the cluster, and
-a map of one's own is not a reason to stop.
-The other end is wired too.  `split_shard` freezes the range, waits out the writes admitted
-before the freeze, refuses rather than copy out from under a lock that may be an unapplied
-commit, moves the rows above the split point into the new shard's group *as the versions
-they already were* - a copy stamped with the moment of the move is newer than any timestamp
-the TSO will hand out, so the row would be present and unreadable at once - and only then
-proposes the split, so the range the table hands out is a range whose data is there.  It
-re-ranges its own servers before thawing the source, because until the thaw the shard still
-answers for a range it is no longer allowed to add to, and a thaw without the table would
-send clients to a shard whose right half has been copied away.  A refused proposal leaves
-the shard frozen and the split remembered, and asking again finishes that same split
-instead of starting a second one.  The intent is written into the source shard's own
-storage before the first row moves, so a cluster that dies between the copy and the
-proposal comes back, freezes the shard again, copies only what the new shard is missing -
-read back out of the source's state, not out of the note, because a note carrying rows is a
-second copy of the shard taken at some earlier moment - and makes the proposal, which the
-group recognises as the split it already applied.  The new shard's leader is asked for
-those rows only once it has committed an entry of its own term: a node that has just been
-elected cannot yet tell which of the entries in its log ever committed, and taking "not
-there" for an answer at that moment would copy a row that had already arrived.
-What that split still cannot do: coordinate with a write that resolved to the old shard
-just before the range moved, so the copy can end up behind such a write - it refuses while
-a lock is held in the range, because that lock may be a commit that has not been applied,
-but it cannot see one that committed somewhere else first; reclaim the copies left behind
-in the old shard, which are simply stale from then on; or start itself, since nothing
-chooses split points and two splits of different shards are not serialised against each
-other.  What the client still is not is a client on the far side of a socket: it resolves
-the node the table names to an object it already holds, so it is a client inside the
-cluster, and dialling the address the table publishes is what the unimplemented client
-service would be.  The lock resolver - the other thing in the transaction path that looks
-for a leader - still scans the cluster's own nodes.  Migration and follower reads do not
-exist at all: a shard cannot move between nodes, and every read goes to the leader.
+**The half that tells the table.**  The publishing half of the join is in place: the
+cluster starts a `MetadataPublisher`, which proposes the ranges once, each shard's replica
+set and addresses once, and a leader report only when the leader or its term moves.  That
+restraint is the design, not an optimisation - every write to the table is a reason for
+every client's cache to refresh, so a pass that found nothing has to say nothing, and the
+publisher compares before it proposes rather than rewriting the table on a timer.  A
+refused report is normal, because two reports racing is what terms are for; a table holding
+ranges the cluster cannot account for is not, and the publisher stops with the disagreement
+attached rather than overwrite a keyspace belonging to another cluster.  The maps it can
+account for are the one it routes by and the one its own split in flight will produce,
+which it asks the cluster for rather than guessing: a split reaches the group from the
+shard's own thread, so the publisher's first pass can find the table a step ahead of the
+cluster, and a map of one's own is not a reason to stop.
+
+**The half that moves the rows.**  A split and a move are one protocol with different
+subjects - a point inside a range, and the whole range - and the order is the whole of it:
+freeze the range, read its rows at one moment, copy them into the group that will own them,
+and propose to the table last, because the table is what clients route by and a range it
+hands out has to be a range whose data is already there.  The rows are copied *as the
+versions they already were*: a copy stamped with the moment of the move is newer than any
+timestamp the TSO will hand out, so the row would be present and unreadable at once, and
+every prewrite against it refused as a write conflict.  `split_shard` freezes the range,
+waits out the writes admitted before the freeze, refuses rather than copy out from under a
+lock that may be an unapplied commit, moves the rows above the split point, and only then
+proposes the split.  It re-ranges its own servers before thawing the source, because until
+the thaw the shard still answers for a range it is no longer allowed to add to, and a thaw
+without the table would send clients to a shard whose right half has been copied away.  A
+refused proposal leaves the shard frozen and the split remembered, and asking again
+finishes that same split instead of starting a second one.  The intent is written into the
+source shard's own storage before the first row moves, so a cluster that dies between the
+copy and the proposal comes back, freezes the shard again, copies only what the new shard
+is missing - read back out of the source's state, not out of the note, because a note
+carrying rows is a second copy of the shard taken at some earlier moment - and makes the
+proposal, which the group recognises as the split it already applied.  The new shard's
+leader is asked for those rows only once it has committed an entry of its own term: a node
+that has just been elected cannot yet tell which of the entries in its log ever committed,
+and taking "not there" for an answer at that moment would copy a row that had already
+arrived.
+
+**Why a move replaces a whole group.**  The Raft here does not change a group's membership,
+so there is no way to put one replica of a shard somewhere else: a move builds the group
+the shard is going to on nodes that do not already serve it, copies the range into it, and
+lets the old group go.  The set being replaced is read out of the table on every attempt
+and never taken from this process, because the metadata group refuses a move whose
+expectation of the current set is wrong (code 14) and this process's own view is exactly
+the stale thing that check exists to catch.  The set being moved to is the caller's to
+name: which nodes a shard should end up on is a policy, and a mover that derived one would
+also be choosing a replica count.  A target set that overlaps the one serving the shard is
+refused before anything is frozen - a node cannot hold two groups for one shard - and
+asking again with the same target set is a retry that finishes the move in flight, while a
+different target set is refused, because there is no answer to that which would not lose
+one of the two.
+
+**The window: what the group the shard left is still for.**  Once the table names the new
+group, the group the shard left stays up for a fixed window (`MIGRATION_DRAIN_SECONDS`)
+before it is closed and its storage put aside.  It is there for one caller: a client routes
+by a table it cached, so the node it was sent to a moment ago is a node it may still ask.
+What it meets in that window is one of three things.  A read is answered, and the answer is
+the shard's - the group has taken no new rows since before the copy, so what it holds is
+what the copy carried away.  A command that would bring it new rows - a set, a delete, a
+prewrite - is refused (`ERR_MIGRATING`, "the shard is moving to another group"), because
+that has been true since before its rows were read; a commit or a rollback is not, since
+neither adds anything to the range.  And nothing in the refusal says where the shard went,
+because this group does not know: it was told to stop taking rows, not where they were
+going.  Over the wire that refusal is the one code the client service has for "the shard
+said no", with the shard's words left in the message and no address to follow - which is
+the open decision at the end of this section.
+
+**After the window: the walk, and what it costs.**  When the window is over, the group and
+its port are gone, so a client still holding the old table asks an address that nothing
+accepts a call on.  That is the same evidence a refusal is - not the node to ask - so the
+walk is the one this section already describes for a leader change: the address the table
+named, then the shard's other replicas one at a time, and the table only after they run
+out.  The table is where the group the shard moved to comes from, so the reread a refusal
+buys is what finds it, and nothing had to tell the client anything.  The cost is one call
+timeout per address of the set the client cached - the set is finite and the table is read
+once, so it does not grow with how long the shard is gone.  What is not settled is that
+bound: it grows with the size of a replica set, so a placement with more replicas makes
+recovering by walk more expensive, and a client that could tell a shard that moved from a
+node that is down would spend no timeouts at all.  Whether it should be able to is the same
+question as the wire code below.
+
+**Coming back to a move that was in flight.**  A move writes down what it is doing before
+it does it, in the source shard's own storage: the shard, the set it is leaving, the set it
+is going to.  The note goes only once the table names the new group and the one it left has
+gone, so a cluster that comes back and finds one was moving a shard when the process
+stopped, and the table is what says how far it got:
+
+* the table names the set the move was going to, so the proposal landed and what is left
+  is the half after it: the group the shard is moving to is built if this cluster does not
+  already serve it, the note goes, and the group it left is let go;
+* the table still names the set the move was leaving, so nothing was proposed, and the
+  move is finished the way a retry of it is - copy what the new group is missing, and
+  propose;
+* the table names neither, or cannot be read: the shard stays frozen, the note stays, and
+  the caller is told what the table said.  An operator who moved the shard by hand and a
+  second move computed from the same table look the same from here, and guessing between
+  two live groups is how a range ends up served by one of them while its rows are in the
+  other.
+
+The source goes back to being frozen before any of that, because a freeze is a local fact
+and it died with the process that set it: a row let into the old group while the move is
+half done is a row nothing will carry across.
+
+And it does not wait the window out.  A window is what lets a client that cached the old
+table finish the read it arrived with, and a process that has just started has no such
+client: the move is committed with no drain, and the group it left is gone by the end of
+the call.  A split that died is finished the same way, out of its own note.
+
+**What the client service changed here.**  Two things this section used to say are no
+longer true, and both of them were about the distance between a client and a shard.  A
+client outside the cluster exists now: `ClientService` serves six node-level primitives -
+get, scan, propose, the lock record, the write record and the read index a follower would
+ask for - on the port a node already listens on for Raft, with no transaction among them,
+because the primary key of a transaction and its timestamp are the client's to choose;
+`RemoteNodeClient` dials an address the table published, and the client that routes by the
+table is the same one either way, since what a lookup hands out is a client and not a node.
+And the lock resolver is not a second placement any more: it asks `ShardLeaders`, like the
+coordinator and the SQL executor, so the transaction path has one lookup and one placement.
+What the classification does to a refusal is what the open decision is about.
+
+### Open decision: the refusal a moving shard gives, over the wire
+
+A shard frozen because its range is moving refuses a write, and what it refuses with does
+not survive the client service: the shard's own code is flattened into the one code for
+"the shard said no", with the shard's words in the message and nothing to follow.  This one
+matters more than the other flattened codes, because it is evidence about *placement*
+rather than about the command: the table the caller holds is old - the range is not this
+shard's any more - and the answer is knowable, one read away.  Today `ask_shard` walks on a
+refusal to lead and on nothing else, so a write that arrives in the window is handed back
+to the caller, whose only usable next move is to read the table itself.
+
+So the decision that has to come first is what the caller should be told to do, and the
+wire change follows from it:
+
+* **Read the table again.**  The group the shard moved to already owns the range, so a
+  write routed by a fresh table lands; the refusal is evidence about placement and not a
+  reason to wait, and a caller told to wait cannot tell "wait" from "give up" without
+  knowing how long the window is.  This is what the metadata machine already says about a
+  stale placement: a move whose expectation of the current set is wrong is answered with
+  "read the table again before believing yourself" (code 14), and this refusal is the same
+  news one layer down.
+* **Wait and retry.**  Cheaper for a caller with nothing else to do, and it needs no new
+  code, but it spins on the same refusal until something reads the table anyway, and it
+  turns the window's length into a promise a client depends on.
+
+If the first, the wire has to carry it, and there are two shapes: a code of its own beside
+`LOCKED` and `NOT_LEADER`, which widens the client service contract and would make this the
+first of the shard's own codes to be named rather than flattened - so how that family is
+treated is part of the decision, not a detail of it - or `REFUSED` carrying something to
+act on, which is a smaller change to the enum and a larger change to what a refusal means,
+because the field that carries "somewhere else to ask" is an address and a group that is
+moving has none to give.
+
+**Milestone.**  Nothing writes to the wrong place today - the refusal is honest and the
+caller can read the table - so this is not a correctness debt.  It is due with the next
+widening of `ClientService`, and before follower reads: follower reads put a second
+decision about placement in the client, and a caller that has to read prose to act on a
+refusal is a caller that cannot be anything but this repository's own code.  Until then it
+is written down in the README as well as here.
+
+### What is not covered.
+
+The split can end up behind a write that resolved to the old shard just before the range
+moved: it refuses while a lock is held in the range, because that lock may be a commit that
+has not been applied, but it cannot see one that committed somewhere else first.  The
+copies it leaves in the old shard are stale from then on and nothing reclaims them, and
+neither does anything reclaim the directory a move puts aside (`orphan-shard-<id>-<when>`):
+both are kept deliberately, and a leaked directory costs disk where a lost range costs the
+data.
+
+Nothing chooses a split point or a move.  There is no rebalancer and no node reports its
+load, a move's target set is the caller's, and two splits of different shards are not
+serialised against each other.  A move in flight is not coordinated with a write that
+resolved to the old shard just before it started, either, which is the split's hole under
+another name.
+
+There is no membership change, so a move is a whole group replaced rather than a replica
+swapped: a shard cannot be given a replica on a node that already serves it, and the group
+it leaves is gone rather than shrunk.
+
+The write that arrives in the window is still the caller's to act on - see the open
+decision above for what a client would need in order not to be.
+
+Follower reads do not exist.  The read index a follower would ask for is implemented on the
+node and nothing routes a read through it, so every read goes to a leader, including the
+ones the CLI's `--server` makes.
