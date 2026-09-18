@@ -16,7 +16,7 @@ Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
 pip install -e ".[test]"     # runtime dependencies, plus pytest
-pytest tests -q             # 293 tests, roughly ten minutes
+pytest tests -q             # 296 tests, roughly ten minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
@@ -289,7 +289,7 @@ pip install -e ".[test]"
 python -m pytest tests -q
 ```
 
-293 tests.  `tests/test_durability.py` covers the correctness properties that
+296 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
@@ -409,6 +409,13 @@ tests are all real:
 a three-node cluster, a live metadata group, and a leader whose node is shut down
 while the client holds a table naming it.  The read still returns what was committed, and a
 write reaches the leader that replaced it without the table being read at all.
+`tests/test_client_across_a_move.py` puts a client on the far side of a move's window.  A
+read that arrived before the move is answered by the group the shard left, because that group
+is still up and its rows are the ones the copy carried away; a write to it is refused with the
+shard's words and no leader to follow, since the shard's own code for a frozen range does not
+cross the wire; and once the window closes the client asks the addresses it holds - one
+timeout each, which is what the walk costs - and reads the table again, which is what finds
+the group the shard moved to.
 `tests/test_serializable.py` is the write-skew story: two transactions read the same
 snapshot and write disjoint keys, which snapshot isolation alone lets through.  With
 the read set validated the second commit is refused and one doctor stays on call;
@@ -724,11 +731,14 @@ Honest list of what is *not* done, roughly in priority order.
   holds it, or an operator - finds the rows still on disk, and a leaked directory costs disk
   where a lost range costs the data.  What a move still does not have: nothing decides that
   a shard should move - there is no rebalancer here and no node reports its load - so the
-  target set is a caller's to choose, and no client is driven through the window a move
-  opens: the window is pinned by a test that asks the group the shard left, and a client
-  holding the old table is not walked through the reroute.  See
-  `tests/test_move_proposal.py`, and `tests/test_migration_recovery.py` for a move killed in
-  each of the three states a restart can find it in, and the half of the move each one leaves.
+  target set is a caller's to choose.  What the window is for has a client on both sides of
+  it now: a read that arrived before the move is answered by the group the shard left, a
+  write to it is refused, and a client whose table is old is walked to the group the shard
+  moved to once the window is over.  See
+  `tests/test_move_proposal.py` for the window's two ends and
+  `tests/test_client_across_a_move.py` for a client between them, and
+  `tests/test_migration_recovery.py` for a move killed in each of the three states a restart
+  can find it in, and the half of the move each one leaves.
   A client can reach a shard it was never handed a handle on, by the address the table names
   for it (`client/remote_node_client.py`), and a
   cluster for that client to connect to is something the repository starts on its own
@@ -767,14 +777,18 @@ Honest list of what is *not* done, roughly in priority order.
   that the command arrives as itself and is checked by the machine
   (`tests/test_group_clients.py`).  What is still owed is a cluster driven end to end
   through the remote client.
-* **No client has been driven across a move's window.**  The table is rewritten under a
-  client that cached the one before it, and the group it was routed to goes on answering for
-  a fixed window and then stops - that window exists for a client, and no test has one on
-  the other side of it.  What is verified is the two ends: the table names the new group
-  once the move is committed, and the old group's port is closed when the window is over
-  (`tests/test_move_proposal.py`).  Whether a client that was routed to the old group meets
-  a refusal it can act on or a connection it can recover from is the question, and it is
-  owed a test with a client and a move happening at the same time.
+* **A write from a client that is still routing to the old group is refused in words, and
+  the words are all the client gets.**  A move's window has a client on the other side of it
+  now (`tests/test_client_across_a_move.py`): a read that arrived before the move is answered
+  by the group the shard left, a write to it is refused, and once the window closes the client
+  walks the addresses it holds - one timeout each - and reads the table again, which is what
+  finds the group the shard moved to.  What is not fixed is what the client does with the
+  refused write.  That the range is frozen *because it is moving* is a reason to read the
+  table again, but the shard's own code for it (`ERR_MIGRATING`) does not cross the wire - a
+  caller is told `REFUSED`, with the shard's prose and no leader to follow - so `ask_shard`
+  does not walk on it, and the caller is the one that has to.  Closing that wants the same
+  widening the gap above about a refusal's own code is waiting for: a code on the wire for a
+  range that is frozen, beside the one for a lock and the one for a lost leadership.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
