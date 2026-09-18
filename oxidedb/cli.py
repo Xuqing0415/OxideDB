@@ -20,16 +20,36 @@ that node was started with, since the two group ports sit above the shards; it
 defaults to the launcher's own default.  Several nodes may be named, comma-separated
 or repeated, and all of them are used as seeds: no client knows which member of either
 group leads, so one address it cannot use would otherwise be the end of the walk.
+
+A node is READY before it can be written to, so a ``--server`` command asks before it
+sends: a timestamp from the clock's group, and a table naming every shard and its
+leader.  Nothing else here waits, and that wait is this file's rather than the
+client's for a reason ``wait_until_routable`` gives.
 """
 
 import argparse
 import sys
+import time
 
 from oxidedb.client import RemoteNodeClientFactory
 from oxidedb.database import Database
 from oxidedb.launcher import DEFAULT_NUM_SHARDS, ports_for
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.transaction.smart_client import SmartClient
+
+
+#: How long a ``--server`` command waits for a cluster that is still starting, and how
+#: often it asks while it waits.  A node says READY once its ports are bound, and what a
+#: first command needs after that is a clock group that has elected and a publisher that
+#: has written every shard's placement - placement arrives a command at a time and the
+#: publisher writes on its own poll interval
+#: (``metadata.publisher.DEFAULT_PUBLISH_INTERVAL``, half a second), so the lag is a few
+#: of those intervals rather than a number about the machine.  Five seconds is ten of
+#: them: long enough that a cluster which is merely starting is never reported as a
+#: failure, short enough that a command against an address with nothing behind it fails
+#: rather than hangs.  ``--wait 0`` asks once and reports.
+CLUSTER_WAIT_SECONDS = 5.0
+CLUSTER_WAIT_INTERVAL = 0.1
 
 
 class ClusterStore:
@@ -44,16 +64,84 @@ class ClusterStore:
 
     def __init__(self, servers, num_shards):
         metadata_seeds, tso_seeds = _group_seeds(servers, num_shards)
+        #: How many shards the cluster behind ``--server`` was started with.  The wait
+        #: below asks the table for that many, which is the only way it can tell a
+        #: table nobody has finished writing from one that is complete.
+        self._num_shards = num_shards
         self._factory = RemoteNodeClientFactory(metadata_seeds=metadata_seeds,
                                                 tso_seeds=tso_seeds)
+        #: The group's client, held here rather than only inside the cache: the wait
+        #: asks the same one, and asking the factory twice would be asking for the same
+        #: object anyway - so this is where it is kept rather than a second channel.
+        self._metadata = self._factory.metadata_client()
         #: The placement, read from the group the first time it is needed and kept
         #: for the life of the command.  ``None`` where a cluster would go because
         #: there is no cluster object here to ask: what this client knows about
         #: placement is the table, which is the point of the table.
-        self._table = RoutingCache(None, self._factory.metadata_client(),
-                                   factory=self._factory)
+        self._table = RoutingCache(None, self._metadata, factory=self._factory)
         self._client = SmartClient(self._factory.tso_client(), None,
                                    router=self._table, factory=self._factory)
+
+    def wait_until_routable(self, timeout=CLUSTER_WAIT_SECONDS):
+        """Wait for a cluster that has only just started, and say why if it never is.
+
+        A CLI invocation is one shot.  With no second attempt and no caller holding
+        state for it, "not yet" and "not there" arrive as the same failure, and the
+        difference is the whole of what the user needs to know: a cluster that is still
+        electing is a reason to wait, an address with nothing behind it is a reason to
+        look at the command.  So the command asks the two questions a command needs
+        answered - see ``_why_not_routable`` - and reports the last answer it got.
+
+        The wait is here rather than in the client because of what it would mean there:
+        a client answers or raises with its reason, and a caller with state to keep
+        decides what to do next.  A command that retried itself would be deciding, on
+        every caller's behalf, a question the design notes deliberately leave open -
+        what to make of a write refused because its range is moving - and a shell has no
+        business answering that one.  What this does is narrower: it waits for the
+        cluster to exist, and then sends the command exactly once.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        reason = None
+        while True:
+            reason = self._why_not_routable()
+            if reason is None:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(CLUSTER_WAIT_INTERVAL)
+
+        raise RuntimeError(
+            f"the cluster behind --server was not ready within {timeout:.1f}s: "
+            f"{reason}.  If it is still starting, give it longer with --wait; if "
+            f"nothing is listening at that address, that is the reason.")
+
+    def _why_not_routable(self):
+        """What a command still lacks, or ``None`` once a command could be routed.
+
+        The two things READY does not promise, asked the way any client has to ask for
+        them: a timestamp from the clock's group, and a table - read fresh, since the
+        cache can only hold what an earlier read found - that names every shard and a
+        leader for each.  A sentence comes back rather than a flag because giving up
+        reports the last one it met, and the sentence is what a person can act on.
+        """
+        try:
+            self._factory.tso_client().get_timestamp()
+        except RuntimeError as failure:
+            return f"the clock group has no leader yet ({failure})"
+
+        try:
+            table = self._metadata.table(refresh=True)
+        except RuntimeError as failure:
+            return f"the routing table cannot be read yet ({failure})"
+
+        if len(table.shards) < self._num_shards:
+            return (f"the table names {len(table.shards)} of the {self._num_shards} "
+                    f"shards the cluster was started with")
+        nameless = [shard_id for shard_id, placement in table.shards.items()
+                    if placement.leader_id is None]
+        if nameless:
+            return f"the table names no leader for shard {nameless[0]}"
+        return None
 
     def get(self, key):
         return self._client.get(key)
@@ -120,6 +208,16 @@ def _parser():
              "is what locates its group ports (default: %(default)s, the launcher's "
              "own default)",
     )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=CLUSTER_WAIT_SECONDS,
+        metavar="SECONDS",
+        help="how long a --server command waits for a cluster that is still starting "
+             "before it reports the reason it could not be routed (default: "
+             "%(default)s, which is a few of the publisher's poll intervals; "
+             "0 asks once and reports)",
+    )
     subparsers = parser.add_subparsers(dest="command")
 
     get_parser = subparsers.add_parser("get", help="Get a value by key")
@@ -159,7 +257,16 @@ def _open(parser, args):
         if not host or not port.isdigit():
             parser.error(f"--server wants host:port, and {address!r} is not that")
 
-    return ClusterStore(servers, args.shards)
+    store = ClusterStore(servers, args.shards)
+    try:
+        store.wait_until_routable(args.wait)
+    except RuntimeError:
+        # The wait failed, so no command will be sent: the channels this store opened
+        # are closed here rather than left to the caller's ``finally``, which has no
+        # store to close.
+        store.close()
+        raise
+    return store
 
 
 def _run(args, store):
@@ -197,17 +304,20 @@ def main():
         parser.print_help()
         return 0
 
-    store = _open(parser, args)
+    store = None
     try:
+        store = _open(parser, args)
         return _run(args, store)
     except RuntimeError as failure:
         # What a cluster says no with arrives as the client's own errors - no leader
-        # this client can reach, a placement that covers no such key - and a shell
-        # wants that on one line rather than as a traceback.
+        # this client can reach, a placement that covers no such key, a cluster that
+        # never became ready - and a shell wants that on one line rather than as a
+        # traceback.
         print(f"{args.command}: {failure}")
         return 1
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 if __name__ == "__main__":

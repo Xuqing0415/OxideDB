@@ -14,12 +14,11 @@ real node and run the CLI against it the way a person would.
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
 from _cluster import start_cluster
-from _wait import wait_until
-from oxidedb.client import RemoteNodeClientFactory
 
 
 def _cli(*args):
@@ -80,46 +79,16 @@ class TestCli:
         assert "host:port" in result.stderr
 
 
-def _wait_until_the_cluster_can_be_written_to(cluster) -> None:
-    """Wait for the two things a first write needs and ``READY`` does not promise.
+def _address_that_answers_nothing(cluster) -> str:
+    """The same host, at a port inside a node's block that nothing binds.
 
-    READY is a promise about ports rather than about elections (see ``tests/_cluster.py``),
-    and the routing table is a third thing with a delay of its own: the publisher writes
-    the ranges and each shard's replica set at its own poll interval, so a client arriving
-    in the first moments of a cluster's life is told that the cluster holds no such key.
-    That is what the CLI said before this wait was here.  A timestamp is the other half,
-    and it comes from a group that elects on its own schedule.
-
-    So the wait is the test's, and it is for two observable things - a timestamp, and a
-    published leader for every shard - rather than for a number of seconds.  Both are
-    asked for in one loop, and the ask that fails is a retry rather than an error: a
-    client that has just arrived has no other way to say "not yet".  The CLI is one shot
-    and has no such loop, which is a gap of its own; see the Known gaps in the README.
+    A node takes ``port + 100 * s`` for each shard and puts the two groups above the
+    last shard, so ``+99`` is a hole whatever size the node is.  A command sent there
+    meets the absence of an answer rather than a refusal, which is the state the client
+    reports rather than raises - and the one the wait below is given a deadline for.
     """
-    factory = RemoteNodeClientFactory(metadata_seeds=cluster.metadata_seeds,
-                                      tso_seeds=cluster.tso_seeds)
-    try:
-        client = factory.metadata_client()
-
-        def writable():
-            # One try around both asks: a group with no leader answers with an error
-            # rather than a refusal, and "not yet" is the only thing it can mean here.
-            try:
-                factory.tso_client().get_timestamp()
-                table = client.table(refresh=True)
-            except RuntimeError:
-                return None
-            if len(table.shards) < cluster.num_shards:
-                return None
-            nameless = [shard_id for shard_id, placement in table.shards.items()
-                        if placement.leader_id is None]
-            return None if nameless else table
-
-        wait_until(writable,
-                   message="the cluster never became writable: no timestamp, or a shard "
-                           "with no published leader")
-    finally:
-        factory.close()
+    port = int(cluster.bootstrap_address.rsplit(":", 1)[1])
+    return cluster.bootstrap_address.rsplit(":", 1)[0] + f":{port + 99}"
 
 
 @pytest.fixture(scope="module")
@@ -128,10 +97,17 @@ def cluster(tmp_path_factory):
 
     Module-wide because a node costs a process and an election to start, and no test
     here reads a key another one wrote.
+
+    Nothing waits here for the cluster to become writable: the fixture returns as soon
+    as the node says READY, which is a promise about ports rather than about elections
+    or the publisher's first pass.  A command that arrives in that gap is what the CLI's
+    own wait is for, so a fixture that waited would be hiding the thing these tests
+    should go through - and a command run this soon after READY is exactly the case the
+    wait exists for.  The wait itself is asserted below, on a cluster nothing can
+    reach.
     """
     with start_cluster(num_nodes=1, num_shards=2,
                        base_dir=str(tmp_path_factory.mktemp("oxidedb-cli-cluster"))) as running:
-        _wait_until_the_cluster_can_be_written_to(running)
         yield running
 
 
@@ -217,15 +193,13 @@ class TestCliAgainstACluster:
     def test_a_cluster_that_answers_nothing_says_so_on_one_line(self, cluster):
         """A client that cannot reach the table reports it, rather than raising.
 
-        The address is a node's own block with the group ports moved below the
-        shards, where nothing is listening: what a shell sees has to be one line and
-        an exit code, the way every other command in this file does.
+        Nothing is listening at the address, and --wait 0 asks that question once:
+        what a shell sees has to be one line and an exit code, the way every other
+        command in this file does, without a wait in front of the answer.
         """
-        port = int(cluster.bootstrap_address.rsplit(":", 1)[1])
-        nowhere = cluster.bootstrap_address.rsplit(":", 1)[0] + f":{port + 99}"
-
         result = subprocess.run(
-            [sys.executable, "-m", "oxidedb.cli", "--server", nowhere, "get", "user:1"],
+            [sys.executable, "-m", "oxidedb.cli", "--server",
+             _address_that_answers_nothing(cluster), "--wait", "0", "get", "user:1"],
             capture_output=True, text=True,
         )
 
@@ -233,24 +207,34 @@ class TestCliAgainstACluster:
         assert "Traceback" not in result.stdout + result.stderr
         assert result.stdout.strip().startswith("get:")
 
-    def test_a_write_that_could_not_be_made_says_why(self, cluster):
-        """No "Key not written": a write that did not happen carries its reason.
+    def test_a_command_that_finds_no_cluster_waits_and_then_says_why(self, cluster):
+        """A command asks until its deadline, and reports what it kept being told.
 
-        ``put`` cannot answer False and keep the reason to itself, so the branch that
-        printed "Key not written" went with the behaviour behind it.  What a shell gets
-        for a cluster whose table it cannot read is the client's own words, which is the
-        difference between a next move and a retry that cannot help.
+        A CLI invocation is one shot.  With no second attempt and no caller holding
+        state for it, "not yet" and "not there" arrive as the same failure, so the
+        command is the only place that can tell a cluster which is still electing from
+        an address with nothing behind it - by waiting, for a bounded time, and then
+        reporting the last thing it was told.
+
+        The write rides along with the wait because both claims are about the one
+        invocation: a write that did not happen exits 1 and says why, and it never
+        says "Key not written".  The clock is asserted too, because a command that
+        gave up immediately would satisfy every other line of this test and be exactly
+        the bug it is here for.
         """
-        port = int(cluster.bootstrap_address.rsplit(":", 1)[1])
-        nowhere = cluster.bootstrap_address.rsplit(":", 1)[0] + f":{port + 99}"
-
+        start = time.monotonic()
         result = subprocess.run(
-            [sys.executable, "-m", "oxidedb.cli", "--server", nowhere,
+            [sys.executable, "-m", "oxidedb.cli", "--server",
+             _address_that_answers_nothing(cluster), "--wait", "1",
              "set", "user:1", "alice"],
             capture_output=True, text=True,
         )
+        waited = time.monotonic() - start
 
         assert result.returncode == 1, "a write that could not be made exited 0"
         assert "Traceback" not in result.stdout + result.stderr
         assert result.stdout.strip().startswith("set:")
+        assert "was not ready within 1.0s" in result.stdout, result.stdout
+        assert "no address answered" in result.stdout, result.stdout
         assert "Key not written" not in result.stdout
+        assert waited >= 1.0, f"the wait was over after {waited:.1f}s"
