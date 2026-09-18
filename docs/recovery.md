@@ -50,6 +50,15 @@ real:
   the two start-up paths recovers, so a reader is not told a guarantee the product does
   not keep.
 
+**A split's range has to move in one call, and that is the router's doing rather than a
+preference about names.**  `locate` (`oxidedb/shard/router.py`) routes a key that falls
+outside every range to shard 0 rather than refusing it, so a split applied in two steps -
+the new group built, then the range handed over, or the same two the other way round - has
+a window between the calls where a key in the range being handed over is outside every
+range and is routed back to the shard that just gave it away.  That is a silent wrong
+answer rather than a failure, and it is why the interface in section 2 has one
+`apply_split_locally` and why it is asked of whichever side is holding the table.
+
 ## 2. The interface
 
 **The interface is per process, and that is not a preference.**  `_remember_split`
