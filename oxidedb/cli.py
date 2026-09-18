@@ -171,9 +171,10 @@ def _run(args, store):
             return 1
         print(value.decode())
     elif args.command == "set":
-        if store.set(args.key.encode(), args.value.encode()) is False:
-            print("Key not written")
-            return 1
+        # No check: a write that could not be committed raises with its reason, so
+        # the only failure this command has is one main() already prints.  A delete
+        # is not in that position - it writes no value, and a refusal is its answer.
+        store.set(args.key.encode(), args.value.encode())
         print("OK")
     elif args.command == "delete":
         if store.delete(args.key.encode()) is False:

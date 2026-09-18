@@ -176,9 +176,10 @@ class SmartClient:
     def put(self, key: bytes, value: bytes) -> bool:
         """Write ``key``, as a transaction of one key.
 
-        True means it committed.  A commit that could not be made raises with its reason
-        rather than answering False (see :meth:`commit`), which is the difference a shell
-        sees: ``set: No shard holds b'user:1'`` instead of "Key not written".
+        True means it committed - and it is the only answer this method gives: a commit
+        that could not be made raises with its reason (see :meth:`commit`), which is the
+        difference a shell sees, ``set: No shard holds b'user:1'`` rather than an exit
+        code with nothing behind it.
         """
         txn_id = self.begin()
         self.add_write(txn_id, key, value)

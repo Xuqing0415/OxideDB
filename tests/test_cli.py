@@ -232,3 +232,25 @@ class TestCliAgainstACluster:
         assert result.returncode == 1, "a client that reached nothing exited 0"
         assert "Traceback" not in result.stdout + result.stderr
         assert result.stdout.strip().startswith("get:")
+
+    def test_a_write_that_could_not_be_made_says_why(self, cluster):
+        """No "Key not written": a write that did not happen carries its reason.
+
+        ``put`` cannot answer False and keep the reason to itself, so the branch that
+        printed "Key not written" went with the behaviour behind it.  What a shell gets
+        for a cluster whose table it cannot read is the client's own words, which is the
+        difference between a next move and a retry that cannot help.
+        """
+        port = int(cluster.bootstrap_address.rsplit(":", 1)[1])
+        nowhere = cluster.bootstrap_address.rsplit(":", 1)[0] + f":{port + 99}"
+
+        result = subprocess.run(
+            [sys.executable, "-m", "oxidedb.cli", "--server", nowhere,
+             "set", "user:1", "alice"],
+            capture_output=True, text=True,
+        )
+
+        assert result.returncode == 1, "a write that could not be made exited 0"
+        assert "Traceback" not in result.stdout + result.stderr
+        assert result.stdout.strip().startswith("set:")
+        assert "Key not written" not in result.stdout
