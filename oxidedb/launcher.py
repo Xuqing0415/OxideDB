@@ -375,23 +375,48 @@ class NodeClusterView:
     # -- what the publisher asks a cluster ----------------------------------
 
     def shard_ids(self) -> List[int]:
+        """Every shard this node is responsible for: the keys of its range map.
+
+        Not "the shards it holds a group for", which is a different question and the
+        one :meth:`shard_replica_ids` answers.  The range map is what a node routes by
+        and what it reads its own pending-split notes by, and the shard a split creates
+        is in the table before this node has built the group for it - which is exactly
+        the shard a recovery is there to build.
+        """
         return sorted(self._range_map)
 
     def shard_replica_ids(self, shard_id: int) -> List[int]:
-        """Every node serving ``shard_id``, from the group this node keeps for it."""
+        """Every node serving ``shard_id``, from the group this node keeps for it.
+
+        Empty when this node holds no group for the shard.  This is the replica set
+        the table is owed, and a node that closed its group is not in it - while the
+        shard server's own answer always names itself, because that is the group it
+        would build.  The question is asked of the group rather than of the server for
+        that reason.
+        """
         server = self._shard_servers.get(self._config.node_id)
-        return [] if server is None else server.shard_replica_ids(shard_id)
+        if server is None or server.get_shard_node(shard_id) is None:
+            return []
+        return server.shard_replica_ids(shard_id)
 
     def shard_addresses(self, shard_id: int) -> Dict[int, str]:
         """Where each replica of ``shard_id`` listens, for the table to publish.
 
-        This node's own address is the one its server actually bound; a peer's is derived
-        from that peer's base address, because there is no object here to ask.  Both sides
-        of that are :func:`ports_for`, so the derived address is the one the peer bound
-        rather than a second guess at it.
+        Empty when this node holds no group for the shard: an address a client is sent
+        to has to be one that is accepting connections, and this node closed the one it
+        had.  See :meth:`shard_replica_ids`.
+
+        A shard this node does hold is answered for the way it always was.  Its own
+        address comes from the port arithmetic; a peer's is derived from that peer's
+        base address, because there is no object here to ask.  Both sides of that are
+        :func:`ports_for`, so the derived address is the one the peer bound rather than
+        a second guess at it.
         """
+        nodes = self.shard_replica_ids(shard_id)
+        if not nodes:
+            return {}
         addresses = {self._config.node_id: self._config.shard_address(shard_id)}
-        for node_id in self.shard_replica_ids(shard_id):
+        for node_id in nodes:
             if node_id != self._config.node_id:
                 addresses[node_id] = self._config.shard_address(shard_id, node_id)
         return addresses

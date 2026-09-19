@@ -11,6 +11,12 @@ adds is that a group is also a bound port and a storage directory, and there is 
 below of the half of that a rebuild depends on: the port coming back after the close.
 The storage of a shard this node stops serving is not covered - nothing sets a directory
 aside yet.
+
+Two of the tests are about the other half of a close, which is not a decision but a
+reading: what the view says it holds, for the publisher that asks it.  They are here
+because that is where a closed group went wrong - the range map still named the shard
+and the shard server still named this node, so a node that had just stopped serving a
+shard would have been written into the table as a replica of it.
 """
 
 import pytest
@@ -175,3 +181,40 @@ def test_a_group_built_again_comes_back_on_the_same_port(a_node_that_binds_ports
 
     assert server.shard_address(SHARD) == bound
     assert server.shard_replica_ids(SHARD) == [1, 2]
+
+
+def test_a_group_this_node_closed_is_no_longer_answered_for(a_node):
+    """What the view says after a close, for the publisher that asks it.
+
+    ``shard_ids`` still names the shard and that is not a bug: the range map is what
+    this node routes by and what it reads its pending-split notes by, so it is the
+    shard's own note that a restart finds.  The other two answers are the ones the
+    table is written from, and after the close there is no group here to serve the
+    shard and no address here to send a client to.
+    """
+    view, server = a_node(node_id=3)
+    assert view.shard_replica_ids(SHARD) == [1, 2, 3]
+    assert view.shard_addresses(SHARD)
+
+    view.ensure_serving(SHARD, [1, 2])
+
+    assert view.shard_ids() == [SHARD]
+    assert view.shard_replica_ids(SHARD) == []
+    assert view.shard_addresses(SHARD) == {}
+
+
+def test_a_shard_this_node_was_not_started_with_is_claimed_only_once_it_is_built(a_node):
+    """The same two answers before a group exists, which is what keeps a split's new
+    shard from being published before anybody has built it: the range map has it - it
+    came from the table - and this node does not, so there is nothing to say about it
+    until ``ensure_serving`` builds one.
+    """
+    view, server = a_node()
+    assert view.shard_ids() == [SHARD]
+
+    assert view.shard_replica_ids(A_SHARD_NOBODY_STARTED_WITH) == []
+    assert view.shard_addresses(A_SHARD_NOBODY_STARTED_WITH) == {}
+
+    view.ensure_serving(A_SHARD_NOBODY_STARTED_WITH, [1, 2])
+
+    assert view.shard_replica_ids(A_SHARD_NOBODY_STARTED_WITH) == [1, 2]

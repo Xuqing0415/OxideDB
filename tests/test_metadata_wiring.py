@@ -13,16 +13,18 @@ dies is replaced in the table by the node that took over; a cluster that restart
 re-proposes the same ranges is not a disagreement; and a table that holds *different*
 ranges is not overwritten; and a shard a move is in flight for is left to the move rather
 than described by the publisher, because the two of them would disagree about which group
-serves it.
+serves it; and a shard a node has closed is not written into the table as one of its own,
+which is the reading a view has to make of its groups rather than of its range map.
 """
 
 import socket
 
-from _ports import free_addresses
+from _ports import allocate_port, free_addresses
 from _wait import wait_for_keys_leader, wait_for_metadata_client, wait_until
+from oxidedb.launcher import ClusterConfig, NodeClusterView, Peer, block_width
 from oxidedb.metadata.publisher import MetadataPublisher
 from oxidedb.metadata.service import MetadataCluster
-from oxidedb.raft.shard_server import ShardedRaftCluster
+from oxidedb.raft.shard_server import ShardServer, ShardedRaftCluster
 from oxidedb.raft.state_machine import MVCCStateMachine
 from oxidedb.shard.router import default_range_map, locate
 from oxidedb.tso.tso import TSOCluster
@@ -181,6 +183,54 @@ def test_a_shard_a_move_is_in_flight_for_is_left_to_the_move():
         assert table.shard(0).nodes == [1, 2, 3]
         assert table.shard(0).leader_id == 1 and table.shard(0).leader_term == 4
     finally:
+        metadata.shutdown()
+
+
+def test_a_node_that_closed_a_shard_does_not_publish_itself_for_it():
+    """The table a node that stopped serving a shard leaves alone.
+
+    This is a recovery's other end: the shard was moved to other nodes, so this node's
+    group for it goes, and what stays is the range map - which is this node's own and
+    still names the shard, so the publisher reaches it on every pass.  There is nothing
+    true to say about it, and a view that answered from the range map would write this
+    node into the replica set of a shard it had just stopped serving.  The publisher
+    below is a new one, which is what a node that has just come back runs, so it has
+    published nothing yet and has every licence to write.
+    """
+    metadata = _started_metadata()
+    server = None
+    try:
+        client = wait_for_metadata_client(metadata)
+        ranges = default_range_map(1)
+        own = allocate_port()
+        config = ClusterConfig(
+            node_id=3, port=own, num_shards=1,
+            peers=(Peer(1, "127.0.0.1", own - 2 * block_width()),
+                   Peer(2, "127.0.0.1", own - block_width())))
+        view = NodeClusterView(config, ranges)
+        server = ShardServer(config.node_id, config.num_shards, len(config.node_ids()))
+        server.set_range_map(ranges)
+        server.start_shards(state_machine_factory=MVCCStateMachine)
+        view.serve(server)
+
+        # Somebody else told the table who serves shard 0, which is what a move that
+        # took the shard off this node leaves behind.
+        assert client.init_routes(ranges).success
+        taken = {1: "127.0.0.1:50052", 2: "127.0.0.1:50053"}
+        assert client.set_shard_nodes(0, [1, 2], taken).success
+
+        view.ensure_serving(0, [1, 2])
+
+        publisher = MetadataPublisher(client, view, poll_interval=0.05)
+        publisher.publish_once()
+
+        placement = client.table(refresh=True).shard(0)
+        assert placement.nodes == [1, 2], "a shard this node closed is not this node's"
+        assert placement.addresses == taken, "nor is its port one of this node's"
+        assert publisher.error is None
+    finally:
+        if server is not None:
+            server.shutdown()
         metadata.shutdown()
 
 
