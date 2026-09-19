@@ -158,6 +158,17 @@ class RecoveryView(Protocol):
   holds is the difference between a recovery that only works where it leads the group and
   one that works anywhere.
 
+One boundary worth writing down beside these calls, because it costs a walk through the
+code to find again: `NodeClient.follower_read_index` answers with an index and a reason,
+and not with the address a `NOT_LEADER` refusal carries on the wire.  So walking a set
+of nodes and asking each whether it leads is what a caller holding clients can do, which
+is what `leader_client_for_nodes` does - and following a hint to a node outside that set
+is what it cannot: the address never reaches the caller.  Nothing here needs it to.  It
+is the same kind of fact as a state machine built without being told which shard it is,
+or a refusal whose code is flattened on the way to a client: not a gap this work opens,
+but a limit on what the seam can say, written down so the next caller reads it instead
+of finding it.
+
 Everything else the recovery does - reading the source's rows, deciding which row the
 target is missing, building the command, retrying a proposal whose answer never came -
 is written once, in the recovery, against `NodeClient` and `metadata()`.  That is why
@@ -212,14 +223,21 @@ thirteen and the three land like this:
   over a set of nodes with the client handed back instead of the object.
 * `_rows_above`, `_committed_rows`, `_locks_in_range` - internal, over
   `leader_client(shard_id).scan(...)`.
-* `_move_row`, `_copy_rows` - internal, over `leader_client(...).propose(...)` and
-  `leader_client(...).get_write_record(...)`.  For now each is written twice,
-  `_move_row_via_wire` and `_copy_rows_via_wire` beside the original, and the two
-  have been shown to propose the same bytes for the same rows
-  (`tests/test_copy_row_via_wire.py`); the callers still reach the originals.
+* `_move_row`, `_copy_rows`, `_copy_what_is_missing` - internal, over
+  `leader_client(...).propose(...)`, `leader_client(...).get_write_record(...)` and
+  `leader_client(...).scan_versions(...)`.  Each was written a second time beside
+  the body that reached through node objects, to show the seam could carry a copy
+  at all and that the two proposed the same bytes for the same rows
+  (`tests/test_copy_row.py`).  The proof is spent and the node-object body is gone:
+  what is left is the one the callers reach, which is the one a process can run.
+* `_client_for_node` - the cluster side's way of handing the copy a client, and
+  deliberately not an interface method.  Its argument is a node object, which is the
+  one thing a process does not have, so the rule at the top of this section excludes
+  it; a process asks a factory for a pair of ids instead.  Both hand back the same
+  wrapper around the same node, so nothing downstream can tell which produced it.
 * `_addresses_on` - not needed by the recovery: the addresses a move proposes are the ones
   the nodes it is proposing to serve at, and whoever holds those nodes works them out.
-* `_finish_split`, `_publish_split`, `_copy_what_is_missing` - internal to the recovery.
+* `_finish_split`, `_publish_split` - internal to the recovery.
   `_apply_split_locally` is the exception: it is the view's, under the name
   `apply_split_locally`.
 * `_finish_move`, `_propose_move`, `_commit_move`, `_abort_move` - internal to the
@@ -370,7 +388,8 @@ a copy.  The hint is not followed, because every member of the group is in the s
 set is what the caller answered "which group" with - so walking it is the whole answer.
 One thing the hint does not do on the other path either: `NodeClient.follower_read_index`
 returns an index and a reason, and drops the address, so a caller holding only clients
-cannot follow a hint through that call.  Nothing here needs it to.
+cannot follow a hint through that call.  Nothing here needs it to; the boundary is
+written down with the rest of the interface, in section 2.
 
 **3. The local answer for who serves a shard.**  This is the one that changed the
 interface, and the change is in the *verb*: the process side cannot be told to "set the

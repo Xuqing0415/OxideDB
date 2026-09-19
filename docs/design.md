@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Three habits, both of them learned by getting something wrong first, and both of them the
+Four habits, each of them learned by getting something wrong first, and between them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -33,6 +33,16 @@ a probe inside a docstring, a patch against a path the test does not take - the 
 green and nothing was proved, and green is exactly what a proof looks like.  So the
 removal has to be verified to have taken effect, by the run rather than by the source: the
 wall time, the failure count, or a probe that raises where the injection was meant to land.
+
+**A second implementation is switched away from as soon as it has proved its point.**  A
+shadow body exists to answer one question - can this seam carry the work at all - and it
+answers it by producing what the first one produced.  That proof expires at the switch:
+kept past it, the two bodies are every later change made twice, and the test that compares
+them stops meaning anything, because the thing it compares against has no reason to stay
+still.  The copy a move makes was written twice for exactly this, the two were shown to
+propose the same bytes for the same rows, and the body that reached through node objects
+is gone - the one that remains is the second, and `tests/test_copy_row.py` pins it against
+commands written out in the test rather than against its own answer.
 
 ## Invariants
 
