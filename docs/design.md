@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Four habits, each of them learned by getting something wrong first, and between them the
+Five habits, each of them learned by getting something wrong first, and between them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -43,6 +43,18 @@ still.  The copy a move makes was written twice for exactly this, the two were s
 propose the same bytes for the same rows, and the body that reached through node objects
 is gone - the one that remains is the second, and `tests/test_copy_row.py` pins it against
 commands written out in the test rather than against its own answer.
+
+**A signature change moves a spy; an assertion change is the regression.**  A test that
+watches a piece of work from inside it - a wrapper around one call, counting what went
+through - is written against the shape of that call, and when the shape changes the
+wrapper has to change with it or it raises instead of watching: the run turns red with
+errors, which looks like a red test and is not evidence about anything.  What may not
+change is what the test asserts.  The switch of the copy onto the client seam took an
+argument on `_move_row` and moved three spies onto `source._node` to read a freeze that
+lives on the node a client wraps; every assertion in those files stood as it was, and that
+is what makes them evidence that the behaviour did not move with the code.  Read the other
+way, it is the answer to "did this change the tests?": adding an argument to a spy is not
+changing a test, and relaxing what it claims is.
 
 ## Invariants
 
