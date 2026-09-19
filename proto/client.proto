@@ -49,6 +49,10 @@ message GetResponse {
     // Unset when the key has no version at that snapshot, which is a successful read of
     // a key that is not there rather than a failure.
     optional bytes value = 4;
+    // See KeyValuePair.commit_ts: one key is the same value as a range is a row of
+    // them, so a read of one carries the same thing a scan carries beside each row.
+    // It says nothing unless value is set.
+    int64 commit_ts = 5;
 }
 
 message ScanRequest {
@@ -60,6 +64,21 @@ message ScanRequest {
 message KeyValuePair {
     bytes key = 1;
     bytes value = 2;
+    // The timestamp the value was written at, carried out beside it.  A value and
+    // the version it is are one fact, and a reader that got the value without it
+    // could not put that value anywhere else and still be right - a row copied to
+    // another group has to keep the timestamp it already had, or the copy becomes
+    // the newest thing that has ever happened to the key, which no snapshot read
+    // sees and every prewrite against it is refused by.
+    //
+    // It is not the moment of the read and not a transaction's start_ts: it is the
+    // version's own timestamp, which for a version a transaction published is that
+    // transaction's commit_ts.  GetWriteRecordResponse.commit_ts == this means the
+    // value is the one that transaction published; a value written outside the
+    // transaction path - a DELETE, a SET from the SQL layer - has a timestamp here
+    // and no write record at all.  0 says there is no version to stamp, and is also
+    // what a writer that does not fill this field sends.
+    int64 commit_ts = 3;
 }
 
 message ScanResponse {

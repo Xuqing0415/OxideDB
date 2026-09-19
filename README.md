@@ -612,7 +612,12 @@ Honest list of what is *not* done, roughly in priority order.
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 * **A node can be a process, but a client outside one cannot do everything yet.**
   The contract is six node-level primitives in
-  `proto/client.proto`, with a four-value `error_code` and a leader hint.
+  `proto/client.proto`, with a four-value `error_code` and a leader hint.  Two of its
+  fields are declared and not filled yet: `KeyValuePair.commit_ts` and
+  `GetResponse.commit_ts` are where a value says which version it is, and no servicer
+  sets either.  Recovery needs them before it can copy a row out of another process
+  (`docs/recovery.md`, section 5), and the shape was worth settling before the
+  filling - `tests/test_client_wire_versions.py` is what holds it.
   `oxidedb/client/node_client.py` is the protocol a caller meets a shard through,
   `LocalNodeClient` implements it over a node in this process and `RemoteNodeClient` over
   a channel, `raft/client_servicer.py` serves it from the same port a shard's Raft traffic
@@ -856,8 +861,11 @@ Honest list of what is *not* done, roughly in priority order.
   generator does not make: `from . import x_pb2`, so that the module is importable as
   part of the package rather than as a top-level module.  Nothing fails if someone
   regenerates them with another toolchain until the version stamp is *newer* than the
-  installed runtime, and a diff of a regenerated file is unreadable.  A test that pins the
-  four files' sha256 is owed.
+  installed runtime, and a diff of a regenerated file is unreadable - though
+  regenerating all three protos with the toolchain this checkout has (libprotoc 35.0
+  against the installed `grpcio`) reproduces them byte for byte up to that hand edit,
+  so the accident is narrower than the paragraph makes it sound.  A test that pins the
+  six files' sha256 is owed.
 * **A delete is a tombstone written outside the transaction path.**  What the CLI's
   `delete` sends is the shard's own `DELETE` command - one command to the leader, stamped
   from the same clock the transactions take their timestamps from, which is what puts the
