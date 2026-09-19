@@ -1,9 +1,15 @@
 """What a client may ask one node, and the way to ask the node in this process.
 
 Everything that talks to a shard - the transaction coordinator, the lock resolver,
-the SQL executor - talks to it through these six calls, because these are the six
-things a node can answer without being handed a decision that is not its to make.
+the SQL executor - talks to it through these calls, because these are the things a
+node can answer without being handed a decision that is not its to make.
 ``proto/client.proto`` carries the same six over a wire, in the same shapes.
+
+One of the six answers twice, and it is the range read: ``scan`` for the rows and
+``scan_versions`` for the rows with the version each one is at.  The wire has one call
+for it and the client has two ways to read what it brought back, so nothing was added
+to the protocol to make a copy of a row possible - a second view of one answer, which
+is not a second answer.
 
 Two things follow from the seam.
 
@@ -58,7 +64,23 @@ class NodeClient(Protocol):
         """Every key in ``[start_key, end_key)`` at ``timestamp``.
 
         Rows only, so an empty list means the range is empty and a range read that
-        cannot answer raises ``ScanRefused`` instead of coming back short.
+        cannot answer raises ``ScanRefused`` instead of coming back short.  Which
+        version each value is at is :meth:`scan_versions`, which is the same read.
+        """
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+        """The rows of :meth:`scan`, each with the version it is at.
+
+        Not a second walk: the same rows, with the timestamp each value was written
+        at beside it, because a row copied into another group has to keep the version
+        it already had or it arrives there as the newest thing that has ever happened
+        to that key.  Asking for the version separately would be a second question
+        with a second answer, since the version can move in between.
+
+        0 is a row with no version, which is one that came from this reader's own
+        write intent: an intent is a lock the node holds, and no timestamp published
+        it.
         """
 
     def propose(self, command: bytes) -> ApplyResult:
@@ -109,7 +131,7 @@ class NodeUnreachable(RuntimeError):
 
 
 class LocalNodeClient:
-    """The node in this process, behind those six calls.
+    """The node in this process, behind those calls.
 
     Not a test double and not a shortcut past the seam: this is what the coordinator
     and the resolver hold, so the day a node is a channel away is a day a second class
@@ -129,6 +151,10 @@ class LocalNodeClient:
     def scan(self, start_key: bytes, end_key: bytes,
              timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
         return self._node.scan(start_key, end_key, timestamp)
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+        return self._node.scan_versions(start_key, end_key, timestamp)
 
     def propose(self, command: bytes) -> ApplyResult:
         return self._node.propose(command)

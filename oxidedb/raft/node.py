@@ -1274,6 +1274,25 @@ class MemoryRaftNode:
         owed but that is behind a lock, and a read on a replica that is not the
         leader, both raise ``ScanRefused`` rather than come back with rows: an
         empty list means the range is empty, never that this replica could not say.
+
+        Rows only.  Which version each one is at is :meth:`scan_versions`, and a
+        caller that copies a row into another group needs that rather than this.
+        """
+        return [(key, value)
+                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+        """Every key in ``[start_key, end_key)``, each with the version it is at.
+
+        The rows of :meth:`scan` and the same walk - the read index, the wait, the
+        leader check - with the timestamp each value was written at kept beside it,
+        because a row put into another group has to keep the version it already had
+        or it arrives there as the newest thing that has ever happened to it.
+
+        0 says a row has no version, which is a row that came from this reader's own
+        write intent: an intent is a lock the node is holding, and not a version any
+        timestamp has published.
         """
         read_index, failure = self._read_index()
         if read_index is None:
@@ -1285,7 +1304,7 @@ class MemoryRaftNode:
             if self._state != NodeState.LEADER:
                 raise ScanRefused(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
-            return self._state_machine.scan(start_key, end_key, timestamp)
+            return self._state_machine.scan_versions(start_key, end_key, timestamp)
 
     def shutdown(self) -> None:
         self._cancel_election_timer()

@@ -1,4 +1,4 @@
-"""A node across a wire: the same six primitives, asked over a channel.
+"""A node across a wire: the same primitives, asked over a channel.
 
 The seam ``node_client.py`` draws says a caller should not know whether the node it is
 talking to is in this process; this is the side of it that is not.  Every call is one
@@ -36,7 +36,7 @@ from .remote_group_client import RemoteMetadataClient, RemoteTSOClient
 
 
 class RemoteNodeClient:
-    """One node's six primitives, over a channel to the address that node listens on."""
+    """One node's primitives, over a channel to the address that node listens on."""
 
     def __init__(self, address: str, timeout: float = DEFAULT_TIMEOUT, channel=None):
         self._address = address
@@ -58,11 +58,29 @@ class RemoteNodeClient:
         response = self._call(self._stub.Get, request)
         if response.error_code == client_pb2.OK:
             return ReadResult.success(
-                response.value if response.HasField("value") else None)
+                response.value if response.HasField("value") else None,
+                commit_ts=response.commit_ts)
         return ReadResult.failure(*self._failure(response))
 
     def scan(self, start_key: bytes, end_key: bytes,
              timestamp: Optional[int] = None) -> list:
+        """The rows of :meth:`scan_versions`, with the version dropped.
+
+        One call to the node and two ways to read what came back, so a caller that
+        wants rows does not take a different path from one that wants versions.
+        """
+        return [(key, value)
+                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: Optional[int] = None) -> list:
+        """The same rows, each with the version it is at - which is what a copy needs.
+
+        The version is the timestamp the value was written at, and it survives the
+        wire because the response's rows carry it.  0 means the row has none, which
+        is the case for a row that came from this reader's own write intent: an
+        intent is a lock rather than a version.
+        """
         request = client_pb2.ScanRequest(start_key=start_key, end_key=end_key)
         if timestamp is not None:
             request.timestamp = timestamp
@@ -77,7 +95,7 @@ class RemoteNodeClient:
             locked_key = response.locked_key if response.HasField("locked_key") else None
             raise ScanRefused(code, message, key=locked_key, leader_address=hint)
 
-        return [(entry.key, entry.value) for entry in response.entries]
+        return [(entry.key, entry.value, entry.commit_ts) for entry in response.entries]
 
     def propose(self, command: bytes) -> ApplyResult:
         response = self._call(self._stub.Propose,

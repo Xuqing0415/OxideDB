@@ -4,7 +4,7 @@ Everything in this file talks to a shard the way a process outside the cluster w
 a channel to an address, through RemoteNodeClient, with the cluster itself in this process
 only because a test has to start one somewhere.
 
-Three things are pinned.  The first is sameness: a client across a wire answers the same six
+Three things are pinned.  The first is sameness: a client across a wire answers the same
 questions as one holding the node, field for field, because a caller that can tell them
 apart is a caller that has to be rewritten to cross the wire.  The second is what is left
 when a node does not answer at all - a named failure and not a refusal, since there is
@@ -87,7 +87,8 @@ def _leader_client(cluster, factory, shard_id: int = 0):
 
 def _read_shape(result):
     """Every field a read answers with, so equality is field by field."""
-    return (result.success, result.value, result.error_code, result.error_msg)
+    return (result.success, result.value, result.commit_ts, result.error_code,
+            result.error_msg)
 
 
 def _table_over(cluster, leader_of, version: int = 1) -> RoutingTable:
@@ -127,7 +128,7 @@ def _cache_over(cluster, table, factory) -> RoutingCache:
     return RoutingCache(cluster, _FixedTable(table), factory=factory)
 
 
-# -- the same six answers, across a wire ---------------------------------------
+# -- the same answers, across a wire -------------------------------------------
 
 def test_a_client_across_a_wire_answers_the_same_as_one_in_this_process():
     """Call by call, on a real shard with a lock and a committed version in it.
@@ -169,11 +170,16 @@ def test_a_client_across_a_wire_answers_the_same_as_one_in_this_process():
     assert committed.index is not None, "a landed write says where it landed"
     assert remote.scan(b"a", b"z") == local.scan(b"a", b"z"), (
         "with the lock committed away, the range reads the same on both sides")
+    assert remote.scan_versions(b"a", b"z") == local.scan_versions(b"a", b"z")
     assert remote.get_write_record(KEY_A) == local.get_write_record(KEY_A)
     assert remote.get_write_record(KEY_A) == {"start_ts": 100, "commit_ts": 200}
 
     assert _read_shape(remote.get(KEY_A)) == _read_shape(local.get(KEY_A))
     assert remote.get(KEY_A).value == b"v1"
+    # The version crosses too, and it is the one the commit published rather than a number
+    # the two sides happened to agree on: this is what a copy cannot do without.
+    assert remote.get(KEY_A).commit_ts == 200
+    assert remote.scan_versions(b"a", b"z") == [(KEY_A, b"v1", 200)]
     assert remote.follower_read_index()[0] == local.follower_read_index()[0]
 
 

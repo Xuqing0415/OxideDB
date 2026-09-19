@@ -116,6 +116,7 @@ def test_the_six_primitives_cross_a_wire():
     assert missing.error_code == client_pb2.OK
     assert not missing.HasField("value")
     assert missing.message == ""
+    assert missing.commit_ts == 0, "a key with no value has no version either"
 
     written = _propose(stub, cmd_type=CommandType.SET, key=KEY, value=b"v1", timestamp=5)
     assert written.error_code == client_pb2.OK
@@ -126,13 +127,17 @@ def test_the_six_primitives_cross_a_wire():
 
     read = stub.Get(client_pb2.GetRequest(key=KEY), timeout=TIMEOUT)
     assert read.error_code == client_pb2.OK and read.value == b"v1"
+    assert read.commit_ts == 5, "and which version it is, so a copy can keep it"
 
     older = stub.Get(client_pb2.GetRequest(key=KEY, timestamp=4), timeout=TIMEOUT)
     assert older.error_code == client_pb2.OK and not older.HasField("value")
+    assert older.commit_ts == 0, "not visible yet is not a version either"
 
     rows = stub.Scan(client_pb2.ScanRequest(start_key=b"a", end_key=b"z"), timeout=TIMEOUT)
     assert rows.error_code == client_pb2.OK
     assert [(entry.key, entry.value) for entry in rows.entries] == [(KEY, b"v1")]
+    assert [entry.commit_ts for entry in rows.entries] == [5], (
+        "the stamp rides on the row, so no row arrives without it")
 
     assert not stub.GetLock(
         client_pb2.GetLockRequest(key=KEY), timeout=TIMEOUT).HasField("lock")
@@ -163,6 +168,16 @@ def test_a_lock_and_a_write_record_cross_a_wire_field_for_field():
         stored["value"])
     assert lock.lock_time == stored["lock_time"], (
         "the moment the lock was taken is what a TTL is measured from, so it travels")
+
+    # Read back by the transaction that left it, the intent is a value with no version: 0
+    # in the field, because an intent is a lock rather than a row any commit published.
+    intent = stub.Get(client_pb2.GetRequest(key=LOCKED, timestamp=10), timeout=TIMEOUT)
+    assert (intent.value, intent.commit_ts) == (b"v2", 0)
+
+    scanned = stub.Scan(client_pb2.ScanRequest(start_key=b"a", end_key=b"z",
+                                               timestamp=10), timeout=TIMEOUT)
+    assert [(entry.key, entry.value, entry.commit_ts)
+            for entry in scanned.entries] == [(LOCKED, b"v2", 0)]
 
     assert _propose(stub, cmd_type=CommandType.COMMIT, key=LOCKED, start_ts=10,
                     commit_ts=20).error_code == client_pb2.OK

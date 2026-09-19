@@ -1,6 +1,6 @@
-"""The six primitives, and the claim that wrapping a node does not change it.
+"""The primitives, and the claim that wrapping a node does not change it.
 
-`NodeClient` is the seam every caller meets a shard through: six calls, none of which
+`NodeClient` is the seam every caller meets a shard through: these calls, none of which
 is "be the client", so the node in this process and the node across a process can be
 the same node to a coordinator.  What is easy to get wrong is the in-process
 implementation - one that quietly answers differently from the object it wraps, or one
@@ -99,7 +99,8 @@ def _with_a_committed_and_a_locked_key(node):
 
 def _read_shape(result):
     """Every field a read answers with, so equality is field by field."""
-    return (result.success, result.value, result.error_code, result.error_msg)
+    return (result.success, result.value, result.commit_ts, result.error_code,
+            result.error_msg)
 
 
 def _apply_shape(result):
@@ -108,7 +109,7 @@ def _apply_shape(result):
 
 
 def test_the_client_is_the_protocol_and_nothing_else():
-    """Six calls, and no way through to the node behind them.
+    """The calls, and no way through to the node behind them.
 
     A passthrough attribute would be the end of the seam: code that reaches the state
     machine works in this process and stops working silently the moment the node is a
@@ -118,7 +119,7 @@ def test_the_client_is_the_protocol_and_nothing_else():
 
     assert isinstance(client, NodeClient)
     assert {name for name in dir(client) if not name.startswith("_")} == {
-        "get", "scan", "propose", "get_lock", "get_write_record",
+        "get", "scan", "scan_versions", "propose", "get_lock", "get_write_record",
         "follower_read_index"}
 
 
@@ -146,6 +147,13 @@ def test_a_read_answers_the_same_through_the_client_as_it_does_directly():
         assert _read_shape(client.get(key, timestamp)) == _read_shape(
             node.get(key, timestamp)), (key, timestamp)
 
+    # And equality is not enough for the version, or two implementations that both dropped
+    # it would pass: a committed row says which version it is, a key that is not there says
+    # nothing, and a reader's own write intent is a value with no version at all.
+    assert client.get(COMMITTED_KEY).commit_ts == 5
+    assert client.get(b"missing").commit_ts == 0
+    assert client.get(LOCKED_KEY, 10).commit_ts == 0
+
 
 def test_a_range_read_answers_the_same_rows_and_refuses_the_same_way():
     """Rows where it can answer, `ScanRefused` where it cannot - on both sides.
@@ -162,6 +170,13 @@ def test_a_range_read_answers_the_same_rows_and_refuses_the_same_way():
     for start_key, end_key in ranges:
         assert client.scan(start_key, end_key) == node.scan(start_key, end_key), (
             start_key, end_key)
+        assert client.scan_versions(start_key, end_key) == \
+            node.scan_versions(start_key, end_key), (start_key, end_key)
+
+    # The same rows, with the version each value was written at - which is what a copy
+    # into another group has to carry with it, or the row arrives as the newest thing
+    # that has ever happened to the key.
+    assert client.scan_versions(b"", b"zzz") == [(COMMITTED_KEY, b"v1", 5)]
 
     for scan in (node.scan, client.scan):
         with pytest.raises(ScanRefused) as caught:
@@ -193,11 +208,11 @@ def test_a_write_is_the_same_write_whichever_side_makes_it():
 
     assert client.propose(serialize_command(
         CommandType.SET, key=b"via_client", value=b"1", timestamp=7)).success
-    assert _read_shape(node.get(b"via_client")) == (True, b"1", None, None)
+    assert _read_shape(node.get(b"via_client")) == (True, b"1", 7, None, None)
 
     assert node.propose(serialize_command(
         CommandType.SET, key=b"via_node", value=b"2", timestamp=8)).success
-    assert _read_shape(client.get(b"via_node")) == (True, b"2", None, None)
+    assert _read_shape(client.get(b"via_node")) == (True, b"2", 8, None, None)
 
 
 def test_the_two_reads_a_lock_resolver_needs_answer_the_same_way():

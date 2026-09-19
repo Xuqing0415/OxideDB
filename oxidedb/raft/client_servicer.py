@@ -56,13 +56,19 @@ class ClientServicer(ClientServiceServicer):
         # that answered, and the caller tells it from a failure by the error code.
         if result.success and result.value is not None:
             response.value = result.value
+            # And which version it is, so that a caller carrying the value somewhere
+            # else carries its identity too.  0 is the answer for the one value that
+            # is not a version - a reader's own write intent - and for a key that is
+            # not there, which has no version for the same reason it has no value.
+            response.commit_ts = result.commit_ts
         self._add_leader_hint(response, result.error_code)
         return response
 
     def Scan(self, request, context):
         timestamp = request.timestamp if request.HasField("timestamp") else None
         try:
-            rows = self._client.scan(request.start_key, request.end_key, timestamp)
+            rows = self._client.scan_versions(request.start_key, request.end_key,
+                                              timestamp)
         except ScanRefused as refusal:
             response = client_pb2.ScanResponse(
                 error_code=self._wire_code(refusal.error_code),
@@ -73,10 +79,11 @@ class ClientServicer(ClientServiceServicer):
             return response
 
         response = client_pb2.ScanResponse(error_code=client_pb2.OK)
-        for key, value in rows:
+        for key, value, commit_ts in rows:
             entry = response.entries.add()
             entry.key = key
             entry.value = value
+            entry.commit_ts = commit_ts
         return response
 
     def Propose(self, request, context):

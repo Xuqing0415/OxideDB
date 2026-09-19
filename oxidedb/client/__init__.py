@@ -1,6 +1,6 @@
 """The client side's view of a node, and of which node leads which shard.
 
-``node_client`` holds the six primitives a client may ask one node, the protocol a factory
+``node_client`` holds the primitives a client may ask one node, the protocol a factory
 of handles answers, and the in-process implementation of both; ``remote_node_client`` is the
 other implementation, over a channel, and ``raft/client_servicer.py`` is the other end of
 it.  ``routing`` turns a placement into one of those handles, so that the coordinator, the
