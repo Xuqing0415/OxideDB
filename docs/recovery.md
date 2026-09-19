@@ -287,7 +287,7 @@ and the placement the node publishes follows from the group it holds.  That is a
 the method is idempotent and why it is one call rather than two: in a process, "the set
 changed" and "my holding changed" are the same event.
 
-Four constraints found while writing this section, all of which the implementation has
+Five constraints found while writing this section, all of which the implementation has
 to respect:
 
 * `ShardServer.add_shard` must not be called for a shard the server already holds: it
@@ -320,6 +320,18 @@ to respect:
   bound is `SHARD_SEGMENT`, which `ClusterConfig.validate` refuses a configuration above.
   What is still missing is the same check on the split itself: it is the split that would
   want shard `SHARD_SEGMENT` and find the routing table's group there.
+* **A group `ensure_serving` closes does not change what the view says it holds.**  The
+  members half of the call follows: `add_shard(members=...)` writes them down and
+  `shard_replica_ids` reads them back.  The holding half does not.  With shard 0 closed on
+  node 3 and the call told `[1, 2]`, `NodeClusterView` still answers `shard_ids() == [0]`,
+  `shard_replica_ids(0) == [3]` (a closed group leaves no peers to list, and the shard
+  server's own answer always names itself) and `shard_addresses(0)` still naming this node
+  at the port it just stopped listening on.  A publisher running on that node would put it
+  in the table as a replica of a shard it does not serve, which is the one thing section 1
+  says a routing table must not do.  This is the part of the constraint above that is
+  still open rather than a detail of `ensure_serving`: either the view answers from the
+  groups it actually holds, or whoever closes a group also stops routing to its range, and
+  one of the two has to be in place before a recovery can close anything.
 
 ## 6. Order, failure, tests
 
