@@ -3,8 +3,6 @@
 import os
 import time
 
-import msgpack
-
 from dataclasses import dataclass, field
 
 from typing import Any, Dict, List, Optional, Callable, Tuple
@@ -13,15 +11,11 @@ from ..metadata.service import PROPOSE_ATTEMPTS, RETRY_BACKOFF
 from ..shard.router import default_range_map, locate
 from ..transaction.lock_cleaner import LockCleaner
 from ..transaction.lock_resolver import DEFAULT_LOCK_TTL
+from .recovery_notes import (MIGRATION_RECORD_PREFIX, SPLIT_RECORD_PREFIX, PendingNote,
+                             forget_note, read_note, write_note)
 
 #: How often the cluster's own lock cleaner looks for abandoned locks, in seconds.
 DEFAULT_LOCK_CLEANER_INTERVAL = 30.0
-
-#: Where a shard's in-progress split is written down, within that shard's storage.
-SPLIT_RECORD_PREFIX = "split"
-
-#: The same, for a shard that is being moved to another group.
-MIGRATION_RECORD_PREFIX = "migrate"
 
 #: How long a split waits for the shard it created to elect a leader, in seconds.
 #: An election takes a few hundred milliseconds; a group that has not held one by
@@ -1203,10 +1197,7 @@ class ShardedRaftCluster:
         matter what it says.  Deleting one that is not there is a no-op, which is what the
         second run of a commit finds.
         """
-        key = self._migration_record_key(shard_id)
-        for node in self._shard_nodes(shard_id):
-            if node._storage is not None:
-                node._storage.delete_admin(key)
+        forget_note(self._storages_of(shard_id), shard_id, MIGRATION_RECORD_PREFIX)
 
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]:
         """Make every node that serves ``shard_id`` one of ``nodes``, and no other.
@@ -1538,45 +1529,24 @@ class ShardedRaftCluster:
         Every replica writes its own copy.  The note says which shard is being split,
         and any replica holding that shard can be the one that finds it.
         """
-        record = msgpack.packb({"shard_id": pending["shard_id"],
-                                "split_key": pending["split_key"],
-                                "new_shard_id": pending["new_shard_id"]},
-                               use_bin_type=True)
-        key = self._split_record_key(pending["shard_id"])
-        for node in self._shard_nodes(pending["shard_id"]):
-            if node._storage is not None:
-                node._storage.save_admin(key, record)
+        note = PendingNote.split(pending["shard_id"], bytes(pending["split_key"]),
+                                 int(pending["new_shard_id"]))
+        write_note(self._storages_of(pending["shard_id"]), note)
 
     def _forget_split(self, pending: Dict[str, Any]) -> None:
         """Drop the note: the table has the range, so there is nothing to pick up."""
-        key = self._split_record_key(pending["shard_id"])
-        for node in self._shard_nodes(pending["shard_id"]):
-            if node._storage is not None:
-                node._storage.delete_admin(key)
+        shard_id = pending["shard_id"]
+        forget_note(self._storages_of(shard_id), shard_id, SPLIT_RECORD_PREFIX)
 
     def _load_split_record(self, shard_id: int) -> Optional[Dict[str, Any]]:
         """The split this shard was in the middle of, as one of its replicas wrote it."""
-        key = self._split_record_key(shard_id)
-        for node in self._shard_nodes(shard_id):
-            if node._storage is None:
-                continue
-            raw = node._storage.load_admin(key)
-            if raw is None:
-                continue
-            record = msgpack.unpackb(raw, raw=False)
-            if int(record["shard_id"]) != shard_id:
-                # A note for another shard, which is what a storage reused by id would
-                # look like.  Nothing here can act on it.
-                continue
-            return {"shard_id": shard_id,
-                    "split_key": bytes(record["split_key"]),
-                    "new_shard_id": int(record["new_shard_id"]),
-                    "rows": []}
-        return None
-
-    @staticmethod
-    def _split_record_key(shard_id: int) -> str:
-        return f"{SPLIT_RECORD_PREFIX}/{shard_id}"
+        note = read_note(self._storages_of(shard_id), shard_id, SPLIT_RECORD_PREFIX)
+        if note is None:
+            return None
+        return {"shard_id": shard_id,
+                "split_key": note.split_key,
+                "new_shard_id": note.new_shard_id,
+                "rows": []}
 
     def _remember_migration(self, state: MigrationState) -> None:
         """Write a move down, on every replica of the shard being moved.
@@ -1592,38 +1562,17 @@ class ShardedRaftCluster:
         knows is that the move did not finish, and what it does about that is freeze the
         source and copy again, which is what a retry does anyway.
         """
-        record = msgpack.packb({"shard_id": state.shard_id,
-                                "source_nodes": list(state.source_nodes),
-                                "target_nodes": list(state.target_nodes)},
-                               use_bin_type=True)
-        key = self._migration_record_key(state.shard_id)
-        for node in self._nodes_on(state.source_nodes, state.shard_id):
-            if node._storage is not None:
-                node._storage.save_admin(key, record)
+        note = PendingNote.move(state.shard_id, state.source_nodes, state.target_nodes)
+        write_note(self._storages_of(state.shard_id, state.source_nodes), note)
 
     def _load_migration_record(self, shard_id: int) -> Optional[MigrationState]:
         """The move this shard was in the middle of, as one of its replicas wrote it."""
-        key = self._migration_record_key(shard_id)
-        for node in self._shard_nodes(shard_id):
-            if node._storage is None:
-                continue
-            raw = node._storage.load_admin(key)
-            if raw is None:
-                continue
-            record = msgpack.unpackb(raw, raw=False)
-            if int(record["shard_id"]) != shard_id:
-                # A note for another shard, which is what a storage reused by an id would
-                # look like.  Nothing here can act on it.
-                continue
-            return MigrationState(
-                shard_id=shard_id,
-                target_nodes=[int(node_id) for node_id in record["target_nodes"]],
-                source_nodes=[int(node_id) for node_id in record["source_nodes"]])
-        return None
-
-    @staticmethod
-    def _migration_record_key(shard_id: int) -> str:
-        return f"{MIGRATION_RECORD_PREFIX}/{shard_id}"
+        note = read_note(self._storages_of(shard_id), shard_id, MIGRATION_RECORD_PREFIX)
+        if note is None:
+            return None
+        return MigrationState(shard_id=shard_id,
+                              target_nodes=list(note.target_nodes),
+                              source_nodes=list(note.source_nodes))
 
     def _rows_above(self, leader: MemoryRaftNode, shard_id: int, split_key: bytes):
         """The rows of ``shard_id``'s range that belong to the shard above the point."""
@@ -1741,6 +1690,20 @@ class ShardedRaftCluster:
         nodes = [self._shard_servers[node_id].get_shard_node(shard_id)
                  for node_id in node_ids if node_id in self._shard_servers]
         return [node for node in nodes if node is not None]
+
+    def _storages_of(self, shard_id: int,
+                     node_ids: Optional[List[int]] = None) -> List[RaftStorage]:
+        """The storages of the replicas this cluster holds for ``shard_id``.
+
+        The note layer takes storages rather than nodes: a note is written into a
+        replica's storage and read back out of it, and the one thing the two start-up
+        paths agree on is that there is a storage per replica.  A replica whose storage
+        has been closed for good is dropped rather than failing at the call - a note on
+        a group that is gone cannot be reached, whatever it says.
+        """
+        nodes = (self._shard_nodes(shard_id) if node_ids is None
+                 else self._nodes_on(node_ids, shard_id))
+        return [node._storage for node in nodes if node._storage is not None]
 
     def _leader_on(self, node_ids: List[int], shard_id: int) -> Optional[MemoryRaftNode]:
         """The node among ``node_ids`` leading ``shard_id``, if one of them does.
