@@ -118,11 +118,27 @@ class MVCCStorage:
         return MVCCRecord(payload, timestamp=timestamp, deleted=(flag == 0))
 
     def get(self, key: bytes, timestamp: int) -> Optional[bytes]:
+        version = self.get_version(key, timestamp)
+        return None if version is None else version.value
+
+    def get_version(self, key: bytes, timestamp: int) -> Optional[MVCCRecord]:
+        """The version visible at ``timestamp``, or None: the value and the moment it is.
+
+        What :meth:`get` answers, without throwing the moment away.  A caller that has to
+        put the value somewhere else and have it still be the same row - a split or a move
+        copying it into another group - needs the timestamp it already had, and asking the
+        storage for that afterwards would be a second question with a second answer.
+
+        None for a key that is not there at that snapshot, which includes a key whose
+        newest visible version is a tombstone: a delete is the absence of a value, and so
+        it is the absence of a version too.  A caller that wants the tombstone itself is
+        asking about the key's history rather than about what it reads as.
+        """
         with self._lock:
             record = self._get_version_at(key, timestamp)
             if record is None or record.deleted:
                 return None
-            return record.value
+            return record
 
     def _get_version_at(self, key: bytes, timestamp: int) -> Optional[MVCCRecord]:
         key = _check_user_key(key)
@@ -151,30 +167,53 @@ class MVCCStorage:
             # every read at or after `timestamp`.
             self._engine.put(_version_prefix(key) + _ts_bytes(timestamp), b"\x00")
 
-    def scan(self, start_key: bytes, end_key: bytes, timestamp: int) -> List[Tuple[bytes, bytes]]:
+    def scan(self, start_key: bytes, end_key: bytes,
+             timestamp: int) -> List[Tuple[bytes, bytes]]:
+        """Every key in ``[start_key, end_key)`` at ``timestamp``, as rows of two.
+
+        The rows of :meth:`scan_versions` with the version dropped, for the many readers
+        that want the rows and not the moment they are - and not a second implementation
+        of the same walk, so the two cannot disagree about which version wins.
+        """
+        return [(key, value)
+                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: int) -> List[Tuple[bytes, bytes, int]]:
+        """Every key in ``[start_key, end_key)`` at ``timestamp``, with the version it is.
+
+        The newest version at or before ``timestamp`` wins, and a tombstone hides the key
+        rather than coming back as one - so a key that is here is a key that has a value,
+        and the third element says which version that value is.  That is what a copy needs
+        and what a plain read does not: a row put somewhere else has to keep the timestamp
+        it already had, or it becomes the newest thing that has happened to the key.
+        """
         start_key = _check_user_key(start_key)
         end_key = _check_user_key(end_key)
         with self._lock:
             rows = self._engine.scan(_VERSION + start_key, _VERSION + end_key)
 
-            result: List[Tuple[bytes, bytes]] = []
+            result: List[Tuple[bytes, bytes, int]] = []
             current_key: Optional[bytes] = None
             current_value: Optional[bytes] = None
+            current_ts = 0
 
             for row_key, raw in rows:
                 user_key, version_ts = self._split_version_key(row_key)
                 if user_key != current_key:
                     if current_key is not None and current_value is not None:
-                        result.append((current_key, current_value))
-                    current_key, current_value = user_key, None
+                        result.append((current_key, current_value, current_ts))
+                    current_key, current_value, current_ts = user_key, None, 0
 
                 if version_ts <= timestamp:
                     record = self._decode_version(raw)
                     # Newest visible version wins; a tombstone hides the key.
-                    current_value = None if record is None or record.deleted else record.value
+                    visible = record is not None and not record.deleted
+                    current_value = record.value if visible else None
+                    current_ts = version_ts if visible else 0
 
             if current_key is not None and current_value is not None:
-                result.append((current_key, current_value))
+                result.append((current_key, current_value, current_ts))
 
             return result
 

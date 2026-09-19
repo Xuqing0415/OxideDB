@@ -113,9 +113,15 @@ class ApplyResult:
 
 class ReadResult:
     def __init__(self, success: bool, value: Optional[bytes] = None, error_code: Optional[int] = None,
-                 error_msg: Optional[str] = None, leader_address: Optional[str] = None):
+                 error_msg: Optional[str] = None, leader_address: Optional[str] = None,
+                 commit_ts: int = 0):
         self.success = success
         self.value = value
+        #: The version ``value`` is, when it is one: the timestamp that version was
+        #: written at, which is what a caller that carries the value somewhere else has
+        #: to carry with it.  0 says there is no version - the key is not there, or the
+        #: value is the reader's own write intent, which is a lock rather than a row.
+        self.commit_ts = commit_ts
         self.error_code = error_code
         self.error_msg = error_msg
         #: Where the leader is, when the node answering this read is not it and knows
@@ -123,8 +129,8 @@ class ReadResult:
         self.leader_address = leader_address
     
     @staticmethod
-    def success(value: Optional[bytes]):
-        return ReadResult(True, value)
+    def success(value: Optional[bytes], commit_ts: int = 0):
+        return ReadResult(True, value, commit_ts=commit_ts)
     
     @staticmethod
     def failure(error_code: int, error_msg: str, leader_address: Optional[str] = None):
@@ -372,14 +378,18 @@ class MVCCStateMachine(StateMachine):
             lock_ts = lock["start_ts"]
 
             if timestamp is not None and lock_ts == timestamp:
+                # The reader's own write intent, which has no version yet: it is a value
+                # this state machine is holding, and 0 is what says it is not a row.
                 return ReadResult.success(lock["value"])
 
             if timestamp is None or lock_ts < timestamp:
                 return ReadResult.locked()
 
         read_timestamp = self._last_applied_timestamp if timestamp is None else timestamp
-        value = self._storage.get(key, read_timestamp)
-        return ReadResult.success(value)
+        version = self._storage.get_version(key, read_timestamp)
+        if version is None:
+            return ReadResult.success(None)
+        return ReadResult.success(version.value, commit_ts=version.timestamp)
     
     def scan(self, start_key: bytes, end_key: bytes,
              timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
@@ -396,8 +406,27 @@ class MVCCStateMachine(StateMachine):
         intent, so its value is the answer; a newer one cannot have committed into
         this snapshot and is ignored.
         """
+        return [(key, value)
+                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+
+    def scan_versions(self, start_key: bytes, end_key: bytes,
+                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+        """Every key in the range, read the way :meth:`get` reads one key, with its
+        version.
+
+        The rows of :meth:`scan` with the timestamp each value was written at kept beside
+        it - see :meth:`MVCCStorage.scan_versions` - and the same rules about locks, since
+        it is the same walk: a lock the snapshot cannot be judged against refuses the
+        range rather than being left out of it.
+
+        A row that comes from the reader's own write intent carries 0, because an intent
+        is not a version: it is a value this state machine is holding for a transaction
+        that has not committed at any timestamp yet.
+        """
         read_timestamp = self._last_applied_timestamp if timestamp is None else timestamp
-        rows = dict(self._storage.scan(start_key, end_key, read_timestamp))
+        rows = {key: (value, commit_ts)
+                for key, value, commit_ts
+                in self._storage.scan_versions(start_key, end_key, read_timestamp)}
 
         for key, lock in self._storage.iter_locks():
             if not start_key <= key < end_key:
@@ -409,9 +438,10 @@ class MVCCStateMachine(StateMachine):
                     key=key,
                 )
             if lock["start_ts"] == timestamp:
-                rows[key] = lock["value"]
+                rows[key] = (lock["value"], 0)
 
-        return sorted(rows.items())
+        return [(key, value, commit_ts)
+                for key, (value, commit_ts) in sorted(rows.items())]
     
     def serialize_command(self, cmd_type: bytes, **kwargs) -> bytes:
         return serialize_command(cmd_type, **kwargs)
