@@ -26,8 +26,9 @@ the half of the move each of them leaves to be done:
 What these tests pin: a move killed before the proposal is finished on the next start, with
 the rows readable out of the group the table now names; a move whose proposal landed before
 the process died is only cleaned up, and is neither copied nor proposed again; a move that
-finished leaves no note to pick up; and a table that names a third set, or cannot be read at
-all, leaves the shard frozen and still remembered.
+finished leaves no note to pick up; a table that names a third set, or cannot be read at
+all, leaves the shard frozen and still remembered; and a lock in the range a move would copy
+stops it in the same way, because that read is the read the call that began the move made.
 """
 
 import os
@@ -39,6 +40,7 @@ from _wait import wait_for_metadata_client, wait_until
 from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
+from oxidedb.raft.recovery_notes import PendingNote, write_note
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
 from oxidedb.raft.storage import EngineRaftStorage
@@ -393,5 +395,60 @@ def test_a_table_that_cannot_be_read_leaves_the_move_frozen_and_retryable(
             _the_rows_are_where_the_table_says(cluster, client)
         finally:
             cluster.shutdown()
+    finally:
+        metadata.shutdown()
+
+
+def test_a_move_that_finds_a_lock_keeps_its_note_and_waits(tmp_path):
+    """The refusal a split makes, for the same read: a move copies rows, and one is changing.
+
+    A move that comes back out of a note reads the source's whole range, which is where the
+    call that began the move read it from, so a lock in there stops it in the same place.  A
+    lock is not the table: it is a transaction, so it clears by itself, and what is left for
+    the next call is the note and the freeze - neither of which this refusal gives up.
+
+    The note is written by hand for the split test's reason, which
+    `tests/test_split_recovery.py` spells out: no call leaves one behind with a lock in the
+    same range, and what needs pinning is the refusal rather than a way in.
+    """
+    addresses = free_addresses(num_nodes=5)
+    metadata = _start_metadata()
+    try:
+        opened = []
+        cluster = _start_cluster(tmp_path, addresses, metadata, shard_nodes={0: SERVING},
+                                 storages=opened)
+        try:
+            client = wait_for_metadata_client(metadata)
+            leader = _write_rows(cluster)
+            table = _published(client, (0,))
+            assert table.shard(0).nodes == SERVING, (
+                "so that the refusal is the lock and not a table naming another set")
+
+            assert leader.propose(leader._state_machine.serialize_command(
+                CommandType.PREWRITE, key=KEYS[0], value=VALUES[0], start_ts=100,
+                primary_key=KEYS[0])).success
+
+            write_note(cluster._storages_of(0), PendingNote.move(0, SERVING, MOVE_TO))
+        finally:
+            cluster.shutdown()
+            _close(opened)
+
+        revived = _start_cluster(tmp_path, addresses, metadata, shard_nodes={0: SERVING})
+        try:
+            assert list(revived.migrations()) == [0], "the note is there for the start to read"
+            assert revived.recover_migrations() == [], (
+                "a move that would copy across a lock is refused")
+            assert list(revived.migrations()) == [0], "and the note is kept for the next call"
+            assert "lock" in (revived.migration_error() or ""), (
+                "refused over the lock, and not for some other reason")
+            assert revived._load_migration_record(0) is not None, "the note is still on disk"
+            assert revived.get_shard_server(SERVING[0]).get_shard_node(0).writes_frozen, (
+                "and the shard stays frozen while that is true")
+            assert revived.get_shard_server(MOVE_TO[0]).get_shard_node(0) is None, (
+                "no group was built for rows that were not copied")
+            assert client.table(refresh=True).shard(0).nodes == SERVING, (
+                "and the table still names the group the shard is in")
+        finally:
+            revived.shutdown()
     finally:
         metadata.shutdown()

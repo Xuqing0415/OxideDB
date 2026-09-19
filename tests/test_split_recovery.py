@@ -15,8 +15,10 @@ recognises if it already applied it.
 
 What these tests pin: a split killed between the copy and the proposal is finished on the
 next start, with the table showing two ranges and the rows where the table says they are;
-a split killed in the middle of the copy copies only what is missing and loses nothing;
-and a split that finished leaves no note behind, so the next start has nothing to pick up.
+a split killed in the middle of the copy copies only what is missing and loses nothing; a
+split that finished leaves no note behind, so the next start has nothing to pick up; and a
+split that finds a lock in the range it would copy refuses, keeping its note and leaving the
+shard frozen until the lock clears.
 """
 
 import pytest
@@ -24,6 +26,7 @@ import pytest
 from _ports import free_addresses
 from _wait import wait_for_metadata_client, wait_until
 from oxidedb.metadata.service import MetadataCluster
+from oxidedb.raft.recovery_notes import PendingNote, write_note
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, MVCCStateMachine
 from oxidedb.raft.storage import EngineRaftStorage
@@ -237,6 +240,64 @@ def test_a_split_that_finished_leaves_nothing_to_pick_up(tmp_path):
     try:
         assert revived.recover_splits() == [], "there is nothing to recover"
         assert not revived.pending_splits()
+    finally:
+        revived.shutdown()
+        metadata.shutdown()
+
+
+def test_a_split_that_finds_a_lock_keeps_its_note_and_waits(tmp_path):
+    """A lock in the range is a copy that must not be taken, and a note that must not go.
+
+    The call that begins a split refuses over one because the row behind that lock is a row
+    a transaction is in the middle of changing, and the version space the copy is read out of
+    holds the old version of it.  The call that finishes a split out of a note reads the same
+    frozen range, so it refuses for the same reason - and that is not a failure: the note is
+    what the next call picks up, once the lock has cleared on its own.
+
+    The note is written by hand, because no call leaves a note and a lock behind together:
+    both of them check for a lock before they write one, and a frozen shard refuses the
+    prewrite that would make one.  It is still the state a reader owes an answer about - the
+    check costs one walk of the locks, and a copy taken over one cannot be undone.
+    """
+    addresses = free_addresses()
+    metadata = _start_metadata(tmp_path)
+    cluster = _start_cluster(tmp_path, addresses, metadata)
+    try:
+        leader = _write_rows(cluster)
+        client = wait_for_metadata_client(metadata)
+        _wait_for_the_table_to_know_the_shard(client)
+
+        # A transaction that prewrote above the split point and never committed: the row is
+        # there, and the lock on it is what makes copying that row unsafe right now.
+        assert leader.propose(leader._state_machine.serialize_command(
+            CommandType.PREWRITE, key=MOVED_KEYS[0], value=b"v0", start_ts=100,
+            primary_key=MOVED_KEYS[0])).success
+
+        # The note a split leaves when it dies before the table is told, written the way the
+        # split writes it - into every replica of the shard it is about.  Nothing else of the
+        # split is here: the rows are still in the source, which is where a recovery reads
+        # them from, and no new shard exists.
+        write_note(cluster._storages_of(0),
+                   PendingNote.split(shard_id=0, split_key=b"n", new_shard_id=NEW_SHARD))
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+    metadata = _start_metadata(tmp_path)
+    revived = _start_cluster(tmp_path, addresses, metadata)
+    try:
+        assert list(revived.pending_splits()) == [0], "the note is there for the start to read"
+        assert revived.recover_splits() == [], "a split that would copy across a lock refuses"
+        assert list(revived.pending_splits()) == [0], "and the note is kept for the next call"
+        assert "lock" in (revived.split_error() or ""), (
+            "refused over the lock, and not for some other reason")
+        assert revived._load_split_record(0) is not None, "the note is still on disk"
+        assert revived.get_shard_server(1).get_shard_node(0).writes_frozen, (
+            "and the shard stays frozen while that is true")
+        new_shard = revived.get_shard_server(1).get_shard_node(NEW_SHARD)
+        assert new_shard is not None, "the group the split would fill is built, and left empty"
+        assert new_shard._state_machine._storage.get_latest_version(MOVED_KEYS[0]) is None, (
+            "nothing was copied into it")
     finally:
         revived.shutdown()
         metadata.shutdown()

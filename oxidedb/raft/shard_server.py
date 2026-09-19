@@ -962,6 +962,15 @@ class ShardedRaftCluster:
             # rows are read out of the source, which has been frozen since it started and
             # is the only place they exist, rather than out of the note.
             start, end = self._range_map[shard_id]
+            # And the check the caller that begins a move makes, because this is the same
+            # read: a lock in the range may be a commit that has not been applied yet, and a
+            # copy taken over one is a row read at a moment when it is about to change.  The
+            # note stays, the shard stays frozen, and the lock clears on its own.
+            if self._locks_in_range(source, start, end):
+                self._last_migration_error = (
+                    f"a transaction holds a lock in shard {shard_id}; its rows cannot be "
+                    f"read at one moment while one is in flight")
+                return False
             state.rows = self._committed_rows(source, start, end)
 
         # The target's own members and nothing closed, which is not the placement: the
@@ -1448,6 +1457,17 @@ class ShardedRaftCluster:
             self._last_split_error = f"shard {shard_id} has no leader"
             return False
 
+        # The check the call that begins a split makes, made here by the call that finishes
+        # one: this is the same read of the same frozen range, so a lock in it is the same
+        # reason to refuse.  The note stays and the shard stays frozen, which is the state a
+        # retry starts from - and the lock clears on its own.
+        start, end = self._range_map[shard_id]
+        if self._locks_in_range(source, start, end):
+            self._last_split_error = (
+                f"a transaction holds a lock in shard {shard_id}; its rows cannot be copied "
+                f"while one is in flight")
+            return False
+
         pending["rows"] = self._rows_above(source, shard_id, pending["split_key"])
         return self._finish_split(pending)
 
@@ -1586,7 +1606,17 @@ class ShardedRaftCluster:
         return state_machine._storage.scan(start, end, state_machine._last_applied_timestamp)
 
     def _locks_in_range(self, leader: MemoryRaftNode, start: bytes, end: bytes) -> bool:
-        """Whether a transaction holds a lock anywhere in ``[start, end)``."""
+        """Whether a transaction holds a lock anywhere in ``[start, end)``.
+
+        Asked by every caller about to read a whole range out of a shard and put it
+        somewhere else: the two that begin a split or a move, and the two that finish one
+        out of a note.  A lock in there may be a commit that has not been applied yet, and
+        an intent is not in the version space, so a read that went ahead would answer with
+        the old version of a row a transaction is in the middle of changing - the copy would
+        be of a row that is about to be different, and nothing downstream could tell.  A
+        caller that gets a yes refuses and comes back later: the lock belongs to a
+        transaction, so it clears by itself, and the shard waits for that frozen.
+        """
         return any(start <= key < end for key, _ in leader._state_machine._storage.iter_locks())
 
     def _shard_leader_node(self, shard_id: int) -> Optional[MemoryRaftNode]:
