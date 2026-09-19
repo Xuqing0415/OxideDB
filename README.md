@@ -549,10 +549,15 @@ Honest list of what is *not* done, roughly in priority order.
   without the double-write half, because a split copies rather than moves.  The tests for
   this - `tests/test_migration_recovery.py` and `tests/test_split_recovery.py` - both drive
   `ShardedRaftCluster`, so no test here covers the path a deployed node takes.  Fixing it is
-  moving that logic somewhere both start-up paths can call, not adding a call: it is written
-  against the cluster's own `_migrations`, `_pending_splits`, `_placed_shards`,
-  `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group has
-  none of those.  A split has one boundary of its own: a node's ports are its shard
+  mostly moving that logic somewhere both start-up paths can call: it is written against the
+  cluster's own `_migrations`, `_pending_splits`, `_placed_shards`, `_orphan_dirs` and
+  `_shard_servers`, and a `ClusterNode` holding one node of each group has none of those.
+  It is not only moving it, though.  A copied row is stamped with the version it already is,
+  and none of the six primitives says which version a row is at - a write record is written
+  by a transaction's commit and not by a plain `SET` - so the client service has to carry a
+  version-stamped read before any recovery can copy a row out of another process
+  (`docs/recovery.md`, section 5).
+  A split has one boundary of its own: a node's ports are its shard
   segment with the two groups above it, so a cluster can serve `SHARD_SEGMENT` shards and
   a split asking for the shard after that has to be refused - a check the split path does
   not make yet (`docs/recovery.md`, section 5).

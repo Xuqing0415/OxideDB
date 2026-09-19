@@ -616,6 +616,16 @@ decision about placement in the client, and a caller that has to read prose to a
 refusal is a caller that cannot be anything but this repository's own code.  Until then
 it is written down in the README as well as here.
 
+That widening is no longer only about this refusal.  Recovery needs a read that says
+which version a row is at, and no combination of the six calls the client service has
+can produce it (`docs/recovery.md`, section 5): a write record is written by a
+transaction's commit and not by a plain `SET`, and the scans answer key and value with
+no version.  So a recovery cannot copy a row from another process until the service
+carries a version-stamped read, which puts the next widening - and this decision with
+it - in front of the recovery instead of after it.  A stamped read adds nothing to the
+refusal family, but it is the first change to the same contract, and the two are
+decided together.
+
 ### What is not covered.
 
 The split can end up behind a write that resolved to the old shard just before the range
