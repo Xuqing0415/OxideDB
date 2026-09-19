@@ -431,9 +431,14 @@ class ShardedRaftCluster:
         #: for callers that look - a test, an operator - and never read back: nothing
         #: here opens one.
         self._orphan_dirs: List[str] = []
-        #: How "who leads this shard" becomes a client, built when something first
-        #: asks.  Kept because the lookup remembers what a factory built for it, and a
-        #: recovery that asks twice should not pay for the same answer twice.
+        #: The handles this cluster hands out for its own nodes, built when something
+        #: first asks: one wrapper per (shard, node), which is what the two lookups
+        #: below reach a group through, and the reason a caller that asked twice does
+        #: not pay for the same handle twice.
+        self._node_clients: Optional[LocalNodeClientFactory] = None
+        #: The lookup that turns "who leads this shard" into a handle, built when
+        #: something first asks.  Kept because a `ShardLeaders` remembers the refusals
+        #: it has been walked through, which is worth keeping between two calls.
         self._leaders: Optional[ShardLeaders] = None
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
@@ -614,8 +619,56 @@ class ShardedRaftCluster:
         None while nobody leads it, which is an answer and not a failure.
         """
         if self._leaders is None:
-            self._leaders = ShardLeaders(self, factory=LocalNodeClientFactory(self))
+            self._leaders = ShardLeaders(self, factory=self._node_client_factory())
         return self._leaders.leader_for_shard(shard_id)
+
+    def leader_client_for_nodes(self, shard_id: int,
+                                node_ids: List[int]) -> Optional[NodeClient]:
+        """The client for whichever of ``node_ids`` leads ``shard_id``, or None.
+
+        The question :meth:`leader_client` cannot answer, and the one a move asks: the
+        group its rows are being copied *into* is not the group the routing table names
+        yet, so the set comes from the caller that built it rather than from the table.
+        A call of its own and not a default on the other one, because the two answer
+        different questions and a caller that forgot the set would be handed the wrong
+        group's leader by a signature that let it forget - see ``docs/recovery.md``,
+        section 5.
+
+        Each node is asked with the call the client service already has for it: a
+        follower read index is answered by a leader that has confirmed an entry of its
+        own term with a quorum, and refused by every other node, so the first node that
+        answers with an index is the one to talk to.  Asked that way for the reason
+        :meth:`_wait_for_leader_on` waits the same way - a node that merely believes it
+        leads is exactly the node whose belief is in question, and here it is the one
+        that would be handed a copy.
+
+        No hint is followed, although a node that is not the leader answers with one:
+        every member of the group is in ``node_ids``, so the walk over the set is the
+        whole answer, and the set is the caller's.  A handle onto a group that has gone
+        away - the target of a move that was refused and is being tried again - answers
+        as a follower for the same reason, so it is skipped rather than used.
+        """
+        factory = self._node_client_factory()
+        for node_id in node_ids:
+            client = factory.get_client(shard_id, node_id)
+            if client is None:
+                continue
+            read_index, _ = client.follower_read_index()
+            if read_index is not None:
+                return client
+        return None
+
+    def _node_client_factory(self) -> LocalNodeClientFactory:
+        """The one factory the two lookups above build their handles through.
+
+        Shared rather than built per call so that a wrapper is built once per
+        (shard, node), which is what a factory is for - and so that both lookups hand
+        out the same object for the same node rather than two that are equal in
+        everything but identity.
+        """
+        if self._node_clients is None:
+            self._node_clients = LocalNodeClientFactory(self)
+        return self._node_clients
 
     def start_metadata_publisher(self, metadata,
                                  interval: float = DEFAULT_PUBLISH_INTERVAL) -> None:
