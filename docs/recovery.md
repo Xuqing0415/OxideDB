@@ -328,10 +328,10 @@ to respect:
   server's own answer always names itself) and `shard_addresses(0)` still naming this node
   at the port it just stopped listening on.  A publisher running on that node would put it
   in the table as a replica of a shard it does not serve, which is the one thing section 1
-  says a routing table must not do.  This is the part of the constraint above that is
-  still open rather than a detail of `ensure_serving`: either the view answers from the
-  groups it actually holds, or whoever closes a group also stops routing to its range, and
-  one of the two has to be in place before a recovery can close anything.
+  says a routing table must not do.  Which of the two ways out it takes - the view answers
+  from the groups it holds, or whoever closes a group also stops routing to its range - is
+  a decision for the recovery rather than a detail of `ensure_serving`, and one of the two
+  has to be in place before a recovery can close anything.
 
 ## 6. Order, failure, tests
 
