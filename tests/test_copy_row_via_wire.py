@@ -17,6 +17,13 @@ transaction committed has one, and only the second travels with a ``start_ts``.
 The version read is what makes this possible at all: ``KeyValuePair`` carried no version
 until recently, and without one a copy cannot know which moment to stamp a row with - it
 would arrive in the new group as the newest thing that has ever happened to that key.
+
+Which group the rows are going *into* is the other half of that.  The group a move builds is
+not the group the routing table names yet, so ``leader_client(shard_id)`` cannot answer for
+it - that lookup is the table's answer - and the first version of these tests reached the
+target's leader with a factory and a node id instead, saying in a comment that the interface
+could not name it.  It can name it now: ``leader_client_for_nodes(shard_id, nodes)``, whose
+own tests are the two at the end of this file.
 """
 
 from dataclasses import dataclass
@@ -26,7 +33,6 @@ import msgpack
 import pytest
 
 from _wait import wait_until
-from oxidedb.client.node_client import LocalNodeClientFactory
 from oxidedb.raft.shard_server import MigrationState, ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, MVCCStateMachine, serialize_command
 
@@ -121,18 +127,6 @@ def _write_rows(cluster):
     return leader
 
 
-def _client_for(cluster, node):
-    """A client for one node the cluster holds, the way ``leader_client`` builds one.
-
-    Built here rather than asked of ``leader_client(shard_id)`` because the group a move
-    copies into is not the group the routing table names: ``leader_client`` answers about
-    the shard's own group, and which node leads the other one is a question only the
-    caller that built it can answer.  A process-side recovery meets the same question, and
-    how it answers it is not settled here - this is the shape of it staying visible.
-    """
-    return LocalNodeClientFactory(cluster).get_client(0, node.node_id)
-
-
 def _copy_rows(cluster, how):
     """Run one copy over a freshly built target group and record what it did.
 
@@ -156,17 +150,22 @@ def _copy_rows(cluster, how):
         commands.append(command)
         return real_propose(command, *args, **kwargs)
 
+    # The same leader, asked for the way the copy asks for it and reached for the way the
+    # recording needs it; the copy is handed whichever one it takes its target through.
+    target_client = wait_until(lambda: cluster.leader_client_for_nodes(0, TARGET_NODES),
+                               message="the group a move built has no leader to ask")
+
     target_node.propose = recording_propose
     try:
         if how == "objects":
             assert cluster._copy_rows(source, target_node, state)
         else:
-            assert cluster._copy_rows_via_wire(cluster.leader_client(0),
-                                               _client_for(cluster, target_node), state)
+            assert cluster._copy_rows_via_wire(cluster.leader_client(0), target_client,
+                                               state)
     finally:
         del target_node.propose
 
-    rows = _client_for(cluster, target_node).scan_versions(*WHOLE_KEYSPACE)
+    rows = target_client.scan_versions(*WHOLE_KEYSPACE)
     return _Outcome(list(state.copied_keys), rows, commands)
 
 
@@ -261,5 +260,57 @@ def test_a_second_copy_of_the_same_rows_writes_nothing(how):
         assert second.copied_keys == []
         assert second.commands == []
         assert second.rows == first.rows
+    finally:
+        cluster.shutdown()
+
+
+def test_the_client_for_a_set_of_nodes_is_the_one_that_leads_them():
+    """Asked about a group the table does not name, the handle that comes back leads it.
+
+    The set is the caller's answer to "which group", and the answer has to be about that
+    set: node 1 leads a group for shard 0 as well - the one a move copies out of - so a
+    lookup that answered about the shard rather than about the set would hand back the
+    wrong group's leader, and the copy would go into the shard it was leaving.
+    """
+    cluster = _started_cluster()
+    try:
+        _write_rows(cluster)
+        cluster._ensure_group_on(TARGET_NODES, 0)
+        leader = wait_until(lambda: cluster._leader_on(TARGET_NODES, 0),
+                            message="the group a move built elected no leader")
+
+        client = wait_until(lambda: cluster.leader_client_for_nodes(0, TARGET_NODES),
+                            message="no client for the group a move built")
+
+        assert client._node is leader, "the leader of the set is the node asked for"
+        # And it is a leader to write through: a follower refuses a proposal, so a command
+        # that lands is a command that landed on the group's leader.
+        assert client.propose(
+            serialize_command(CommandType.SET, key=b"k", value=b"v", timestamp=1)).success
+    finally:
+        cluster.shutdown()
+
+
+def test_a_set_that_leads_nothing_answers_none():
+    """None, because the caller waits; never a handle to a group that will refuse it all.
+
+    Two ways for a set to lead nothing: its members hold no group for the shard at all -
+    where a move's target is until it is built - or they hold it and are following.  The
+    second is the one worth pinning, because a node that holds the group looks like an
+    answer and is not: a write proposed through it is refused, and a copy that took the
+    refusal for a missing row would leave the range half moved.
+    """
+    cluster = _started_cluster()
+    try:
+        _write_rows(cluster)
+        assert cluster.leader_client_for_nodes(0, TARGET_NODES) is None, \
+            "nothing holds the shard on those nodes yet"
+
+        cluster._ensure_group_on(TARGET_NODES, 0)
+        leader = wait_until(lambda: cluster._leader_on(TARGET_NODES, 0),
+                            message="the group a move built elected no leader")
+        followers = [node_id for node_id in TARGET_NODES if node_id != leader.node_id]
+
+        assert cluster.leader_client_for_nodes(0, followers) is None, "they are following"
     finally:
         cluster.shutdown()
