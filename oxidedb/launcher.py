@@ -411,6 +411,57 @@ class NodeClusterView:
             return None
         return (self._config.node_id, node.current_term)
 
+    # -- what a recovery asks a cluster -------------------------------------
+
+    def ensure_serving(self, shard_id: int, nodes: List[int]) -> None:
+        """Make this node's group for ``shard_id`` the one that serves ``nodes``.
+
+        One call for both directions, because in a process "the set changed" and "what I
+        hold changed" are the same event: afterwards this node holds exactly one group for
+        ``shard_id``, with exactly these members as its peers, if it is one of them - and
+        holds none if it is not.
+
+        Four cases, and the two in the middle are the ones a cluster object does not have
+        to answer:
+
+        * not one of the nodes, and holding nothing: nothing to do.
+        * not one of the nodes, and holding a group: close it.  The group and its storage
+          are closed and the directory is left where it is, rather than set aside under an
+          orphan name - setting it aside is the half of this that is not written yet, and
+          leaving it in place is what a later build of the same shard reopens.
+        * one of the nodes, and holding nothing: build a group here, with those members.
+          This is the case that makes the call worth having: a process does not learn its
+          shards from the routing table, so the shard a split created is one this node has
+          to build, and the members it is told are the ones it is not started with.
+        * one of the nodes, and holding a group with those members: nothing to do.
+
+        A group whose members are not those is closed and built again rather than told
+        about the new set, because a ``MemoryRaftNode`` takes its peers once and keeps
+        them.  The close coming first is also what the port needs: ``add_shard`` binds the
+        address again, and grpc raises out of ``add_insecure_port`` for a port that is
+        already bound rather than reporting it.
+
+        What it leaves behind is what it compares against, so a second call with the same
+        nodes does nothing - which is what a recovery that came back twice does.
+        """
+        server = self._shard_servers.get(self._config.node_id)
+        if server is None:
+            raise RuntimeError(
+                "this node has no shard server to build a group on: a recovery runs "
+                "after the node's own shards are up")
+
+        members = sorted(set(nodes))
+        holds = server.get_shard_node(shard_id) is not None
+        if self._config.node_id not in members:
+            if holds:
+                server.shutdown_shard(shard_id)
+            return
+        if holds and server.shard_replica_ids(shard_id) == members:
+            return
+        if holds:
+            server.shutdown_shard(shard_id)
+        server.add_shard(shard_id, members=members)
+
 
 class ClusterNode:
     """One node: its groups, its servers, its background threads, and its stop."""
