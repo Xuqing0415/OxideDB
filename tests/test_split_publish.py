@@ -236,9 +236,9 @@ def test_a_split_whose_answer_is_lost_is_not_applied_a_second_time(monkeypatch):
     copies = []
     original = ShardedRaftCluster._move_row
 
-    def counting_move_row(self, source_leader, target_leader, key, value):
+    def counting_move_row(self, source, target, key, value, version):
         copies.append(key)
-        return original(self, source_leader, target_leader, key, value)
+        return original(self, source, target, key, value, version)
 
     monkeypatch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
     try:

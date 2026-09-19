@@ -171,8 +171,8 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
     copied = []
     original = ShardedRaftCluster._move_row
 
-    def died_after_one_row(self, source_leader, target_leader, key, value):
-        original(self, source_leader, target_leader, key, value)
+    def died_after_one_row(self, source, target, key, value, version):
+        original(self, source, target, key, value, version)
         copied.append(key)
         if len(copied) == 1:
             raise RuntimeError("the process died in the middle of the copy")
@@ -193,13 +193,15 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
     again = []
     original = ShardedRaftCluster._move_row
 
-    def counting_move_row(self, source_leader, target_leader, key, value):
+    def counting_move_row(self, source, target, key, value, version):
         again.append(key)
         # The freeze is state in the process, and the process is what died, so a
         # restarted cluster has to put it back on before it copies anything: these rows
-        # are about to live in a shard the table does not name yet.
-        assert source_leader.writes_frozen, "the source shard is not frozen as its rows move"
-        return original(self, source_leader, target_leader, key, value)
+        # are about to live in a shard the table does not name yet.  The copy is handed
+        # clients now, and the freeze is on the node a client wraps - which is a fact a
+        # test in this process can read and a recovery in another process could not.
+        assert source._node.writes_frozen, "the source shard is not frozen as its rows move"
+        return original(self, source, target, key, value, version)
 
     # The pick-up happens while the cluster starts, because that is when a process that
     # has just come back finds the note - so the count has to be in place before the

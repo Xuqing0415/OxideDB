@@ -1,38 +1,43 @@
-"""The copy a move makes, written twice: over node objects, and over a client.
+"""The copy a move or a split makes, written against the client seam and nothing else.
 
 A recovery that finishes a move inside a process of its own has no ``MemoryRaftNode`` to
 read: it holds ids and addresses, and the leader of a shard may be in another process
-altogether.  So the copy has to be expressible through ``NodeClient`` - a range read that
-carries versions, a write record, and a proposal - and the way to show that it is, before
-anything is switched over to it, is to write it a second time beside the first and compare
-the two.
+altogether.  So the copy is expressible through ``NodeClient`` - a range read that carries
+versions, a write record, and a proposal - and there is one body for it rather than two,
+which is what these tests pin.
 
-These tests are that comparison.  One cluster's worth of rows goes through both copies, and
-what is pinned is what each one did: the keys it copied, the rows the target ends up with
+What is pinned is what the copy did: the keys it copied, the rows the target ends up with
 (the version included), and the command bytes it proposed - byte for byte, because a copy
-that carried a row across as a *new* write would pass every other check here.  Both branches
-of the write-record test are covered: a row a plain ``SET`` wrote has no record, and a row a
-transaction committed has one, and only the second travels with a ``start_ts``.
+that carried a row across as a *new* write would pass every other check here.  Both
+branches of the write-record test are covered: a row a plain ``SET`` wrote has no record,
+and a row a transaction committed has one, and only the second travels with a ``start_ts``.
 
 The version read is what makes this possible at all: ``KeyValuePair`` carried no version
 until recently, and without one a copy cannot know which moment to stamp a row with - it
 would arrive in the new group as the newest thing that has ever happened to that key.
 
-Which group the rows are going *into* is the other half of that.  The group a move builds is
-not the group the routing table names yet, so ``leader_client(shard_id)`` cannot answer for
-it - that lookup is the table's answer - and the first version of these tests reached the
-target's leader with a factory and a node id instead, saying in a comment that the interface
-could not name it.  It can name it now: ``leader_client_for_nodes(shard_id, nodes)``, whose
-own tests are the two at the end of this file.
+The expected commands are built here rather than taken from a recording of the copy, so
+what is compared is the copy's output and not its behaviour.  The two implementations this
+file used to hold side by side - one over node objects, the second written only to show
+they proposed the same bytes - are down to the second one: it was shown to agree, and two
+bodies for one copy is a change to the copy having to be made twice, and an equivalence
+test whose two sides move together.
+
+Which group the rows are going *into* is the other half of that.  The group a move builds
+is not the group the routing table names yet, so ``leader_client(shard_id)`` cannot answer
+for it - that lookup is the table's answer - and the first version of these tests reached
+the target's leader with a factory and a node id instead, saying in a comment that the
+interface could not name it.  It can name it now: ``leader_client_for_nodes(shard_id,
+nodes)``, whose own tests are the two at the end of this file.
 """
 
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import msgpack
-import pytest
 
 from _wait import wait_until
+from oxidedb.client.node_client import LocalNodeClient
 from oxidedb.raft.shard_server import MigrationState, ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, MVCCStateMachine, serialize_command
 
@@ -64,9 +69,9 @@ EXPECTED_ROWS = [
     (SECOND_KEY, SECOND_VALUE, SECOND_TS),
     (TXN_KEY, TXN_VALUE, TXN_COMMIT_TS),
 ]
-#: The commands, built here rather than taken from either implementation: what the copy
-#: has to be shown to do is hand these arguments to ``serialize_command`` and no others.
-#: The plain rows carry ``start_ts=None`` explicitly, which is a byte in the command.
+#: The commands, written out here rather than recorded off the copy: what the copy has to
+#: be shown to do is hand these arguments to ``serialize_command`` and no others.  The
+#: plain rows carry ``start_ts=None`` explicitly, which is a byte in the command.
 EXPECTED_COMMANDS = [
     serialize_command(CommandType.SET, key=PLAIN_KEY, value=PLAIN_VALUE,
                       timestamp=PLAIN_TS, start_ts=None),
@@ -76,8 +81,11 @@ EXPECTED_COMMANDS = [
                       timestamp=TXN_COMMIT_TS, start_ts=TXN_START_TS),
 ]
 
-#: The two implementations, as a test parameter.
-BOTH = ["objects", "clients"]
+#: The split's own rows: the point it splits at, a key below it that stays in shard 0, and
+#: two above it that the new shard takes.
+SPLIT_KEY = b"n"
+KEPT_KEY = b"a1"
+SPLIT_KEYS = [b"z01", b"z02"]
 
 
 @dataclass
@@ -127,12 +135,13 @@ def _write_rows(cluster):
     return leader
 
 
-def _copy_rows(cluster, how):
+def _copy_rows(cluster):
     """Run one copy over a freshly built target group and record what it did.
 
-    The commands are collected by wrapping the target leader's own ``propose``: both
-    implementations reach it - one as the node object, the other through the client that
-    wraps the same object - so the bytes compared are the bytes either of them committed.
+    The commands are collected by wrapping the target leader's own ``propose``: the copy
+    reaches the target through the client that wraps that node, so the bytes recorded are
+    the bytes it committed, and a copy that built its own command and never sent it would
+    record nothing.
     """
     source = wait_until(lambda: cluster._shard_leader_node(0),
                         message="shard 0 never elected a leader")
@@ -150,18 +159,12 @@ def _copy_rows(cluster, how):
         commands.append(command)
         return real_propose(command, *args, **kwargs)
 
-    # The same leader, asked for the way the copy asks for it and reached for the way the
-    # recording needs it; the copy is handed whichever one it takes its target through.
     target_client = wait_until(lambda: cluster.leader_client_for_nodes(0, TARGET_NODES),
                                message="the group a move built has no leader to ask")
 
     target_node.propose = recording_propose
     try:
-        if how == "objects":
-            assert cluster._copy_rows(source, target_node, state)
-        else:
-            assert cluster._copy_rows_via_wire(cluster.leader_client(0), target_client,
-                                               state)
+        assert cluster._copy_rows(cluster.leader_client(0), target_client, state)
     finally:
         del target_node.propose
 
@@ -169,28 +172,17 @@ def _copy_rows(cluster, how):
     return _Outcome(list(state.copied_keys), rows, commands)
 
 
-def _copy_in_its_own_cluster(how):
-    """The same rows through one implementation, in a cluster of its own."""
-    cluster = _started_cluster()
-    try:
-        _write_rows(cluster)
-        return _copy_rows(cluster, how)
-    finally:
-        cluster.shutdown()
+def test_a_copy_writes_the_rows_the_source_holds_at_the_version_they_are():
+    """The copy against an answer it did not produce: the rows and bytes the data implies.
 
-
-@pytest.mark.parametrize("how", BOTH)
-def test_a_copy_writes_the_rows_the_source_holds_at_the_version_they_are(how):
-    """Each copy on its own, against an answer neither of them produced.
-
-    Comparing the two implementations to each other shows they agree; it does not show
-    that they are right, and two copies that were wrong in the same way would pass.  So
-    this pins both of them to the rows and the commands the data implies.
+    The source is read once and the copies go in as the versions they already are.  A copy
+    stamped with the moment of the move is the newest thing that has ever happened to that
+    key, so this is also the test that fails if the version stops travelling.
     """
     cluster = _started_cluster()
     try:
         _write_rows(cluster)
-        outcome = _copy_rows(cluster, how)
+        outcome = _copy_rows(cluster)
 
         assert outcome.copied_keys == EXPECTED_KEYS
         assert outcome.rows == EXPECTED_ROWS
@@ -199,24 +191,7 @@ def test_a_copy_writes_the_rows_the_source_holds_at_the_version_they_are(how):
         cluster.shutdown()
 
 
-def test_the_two_implementations_write_the_same_bytes():
-    """The assertion the whole exercise is for: same rows, same commands, byte for byte.
-
-    Two clusters rather than one, because a copy into a group that already holds the rows
-    copies nothing: running them one after the other would compare the second one's
-    silence with the first one's work.  The rows are written the same way both times, so
-    the two sources are the same source.
-    """
-    over_objects = _copy_in_its_own_cluster("objects")
-    over_clients = _copy_in_its_own_cluster("clients")
-
-    assert over_clients.copied_keys == over_objects.copied_keys
-    assert over_clients.rows == over_objects.rows
-    assert over_clients.commands == over_objects.commands
-
-
-@pytest.mark.parametrize("how", BOTH)
-def test_only_the_row_a_transaction_wrote_carries_a_start_ts(how):
+def test_only_the_row_a_transaction_wrote_carries_a_start_ts():
     """A row a plain ``SET`` wrote has no record, and a row a transaction did.
 
     The command has to say which of the two it is carrying: the group the row lands in
@@ -232,7 +207,7 @@ def test_only_the_row_a_transaction_wrote_carries_a_start_ts(how):
         assert source.get_write_record(TXN_KEY) == {
             "start_ts": TXN_START_TS, "commit_ts": TXN_COMMIT_TS}
 
-        outcome = _copy_rows(cluster, how)
+        outcome = _copy_rows(cluster)
 
         carried = {msgpack.unpackb(command)["key"]: msgpack.unpackb(command)["start_ts"]
                    for command in outcome.commands}
@@ -241,8 +216,7 @@ def test_only_the_row_a_transaction_wrote_carries_a_start_ts(how):
         cluster.shutdown()
 
 
-@pytest.mark.parametrize("how", BOTH)
-def test_a_second_copy_of_the_same_rows_writes_nothing(how):
+def test_a_second_copy_of_the_same_rows_writes_nothing():
     """What makes a retry of a copy safe: a row already at that version is that row.
 
     A copy that died half way is retried from the beginning, and the half it had already
@@ -253,13 +227,66 @@ def test_a_second_copy_of_the_same_rows_writes_nothing(how):
     cluster = _started_cluster()
     try:
         _write_rows(cluster)
-        first = _copy_rows(cluster, how)
-        second = _copy_rows(cluster, how)
+        first = _copy_rows(cluster)
+        second = _copy_rows(cluster)
 
         assert first.commands == EXPECTED_COMMANDS
         assert second.copied_keys == []
         assert second.commands == []
         assert second.rows == first.rows
+    finally:
+        cluster.shutdown()
+
+
+def test_the_copy_a_split_makes_reads_the_source_by_range(monkeypatch):
+    """The split's copy reads versions over the seam, once, and writes into the new shard.
+
+    The rows come out of the source shard, so the versions they travel at have to come out
+    of it too - and out of it the way a process reaches it rather than the way this process
+    happens to be able to: one range read that answers for every row at once, in place of a
+    read per key, which is a quorum round per key.  A copy that reached into the source's
+    storage instead would pass every other test here, because in this process it answers.
+
+    The group the rows go into is the one the new shard has.  A copy that reached for the
+    group the routing table names would write them back into the group they are leaving -
+    which is, at this moment, still the group that answers for them.
+    """
+    cluster = _started_cluster()
+    reads = []
+    written = []
+    real_scan_versions = LocalNodeClient.scan_versions
+    real_move_row = ShardedRaftCluster._move_row
+
+    def recording_scan_versions(self, start_key, end_key, timestamp=None):
+        reads.append((start_key, end_key))
+        return real_scan_versions(self, start_key, end_key, timestamp)
+
+    def recording_move_row(self, source, target, key, value, version):
+        written.append((source._node, target._node, key, version))
+        return real_move_row(self, source, target, key, value, version)
+
+    monkeypatch.setattr(LocalNodeClient, "scan_versions", recording_scan_versions)
+    monkeypatch.setattr(ShardedRaftCluster, "_move_row", recording_move_row)
+    try:
+        source = wait_until(lambda: cluster._shard_leader_node(0),
+                            message="shard 0 never elected a leader")
+        machine = source._state_machine
+        assert source.propose(_set(machine, KEPT_KEY, b"kept", 1)).success
+        for index, key in enumerate(SPLIT_KEYS):
+            assert source.propose(_set(machine, key, b"v%d" % index, 2 + index)).success
+
+        assert cluster.split_shard(0, SPLIT_KEY), cluster.split_error()
+
+        new_shard = cluster._shard_leader_node(1)
+        assert new_shard is not None, "the shard the split made has no leader"
+        assert [key for _, _, key, _ in written] == SPLIT_KEYS
+        readers = {node for node, _, _, _ in written}
+        targets = {node for _, node, _, _ in written}
+        assert readers == {source}, "the versions came from another shard"
+        assert targets == {new_shard}, "the rows went into another group"
+        assert len(reads) == 1, "the source was walked a key at a time"
+        start, end = reads[0]
+        assert start <= SPLIT_KEYS[0] and SPLIT_KEYS[-1] < end, reads[0]
     finally:
         cluster.shutdown()
 

@@ -198,9 +198,9 @@ def test_a_move_that_died_before_the_proposal_is_finished_on_the_next_start(
         copied = []
         original = ShardedRaftCluster._move_row
 
-        def counting_move_row(self, source_leader, target_leader, key, value):
+        def counting_move_row(self, source, target, key, value, version):
             copied.append(key)
-            return original(self, source_leader, target_leader, key, value)
+            return original(self, source, target, key, value, version)
 
         with monkeypatch.context() as patch:
             patch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
@@ -274,9 +274,9 @@ def test_a_move_that_landed_and_died_before_the_cleanup_is_only_cleaned_up(
             told.append(target_nodes)
             return original_propose_move(self, shard_id, target_nodes)
 
-        def counting_move_row(self, source_leader, target_leader, key, value):
+        def counting_move_row(self, source, target, key, value, version):
             copied.append(key)
-            return original_move_row(self, source_leader, target_leader, key, value)
+            return original_move_row(self, source, target, key, value, version)
 
         with monkeypatch.context() as patch:
             patch.setattr(ShardedRaftCluster, "_propose_move", counting_propose_move)

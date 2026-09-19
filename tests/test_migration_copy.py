@@ -182,13 +182,16 @@ def test_the_shard_is_frozen_while_its_rows_are_copied(tmp_path, monkeypatch):
     seen = {}
     original = ShardedRaftCluster._move_row
 
-    def spy_move_row(self, source_leader, target_leader, key, value):
+    def spy_move_row(self, source, target, key, value, version):
         if not seen:
-            seen["frozen"] = source_leader.writes_frozen
-            seen["reason"] = source_leader.freeze_reason
-            seen["refused"] = source_leader.propose(
-                _set(source_leader._state_machine, b"x_new", b"v", 999))
-        return original(self, source_leader, target_leader, key, value)
+            # The copy is handed a client; the freeze it has to be seen on is the node
+            # the client wraps, which in this process the wrapper holds.
+            node = source._node
+            seen["frozen"] = node.writes_frozen
+            seen["reason"] = node.freeze_reason
+            seen["refused"] = node.propose(
+                _set(node._state_machine, b"x_new", b"v", 999))
+        return original(self, source, target, key, value, version)
 
     monkeypatch.setattr(ShardedRaftCluster, "_move_row", spy_move_row)
     try:
