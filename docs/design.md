@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Five habits, each of them learned by getting something wrong first, and between them the
+Six habits, each of them learned by getting something wrong first, and between them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -55,6 +55,16 @@ lives on the node a client wraps; every assertion in those files stood as it was
 is what makes them evidence that the behaviour did not move with the code.  Read the other
 way, it is the answer to "did this change the tests?": adding an argument to a spy is not
 changing a test, and relaxing what it claims is.
+
+**Sweep what a change touches with the syntax tree, not by eye.**  "Which places reach
+into this state" is the question that decides how far a refactor has to go, and reading
+answers it for the paths the reader already had in mind and misses the rest: a field read
+inside a loop over a dict, or on a branch that had been filed as uninteresting, is exactly
+the access a count by eye drops, and the one that decides whether the extraction is
+mechanical.  The sweep this repository's recovery interface was drawn from came out of
+`ast` rather than out of reading - parse the module, walk the class for `self.<name>` - and
+it found more of the cluster's own state inside the recovery's bodies than reading them
+had.  The walk is a script and a minute, and it cannot be too tired to check a branch.
 
 One thing is decided and deliberately not done yet, written down so that it is not
 decided twice.  The lists of what is owed are going to be two lists with one rule between
