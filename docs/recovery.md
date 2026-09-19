@@ -140,14 +140,16 @@ class RecoveryView(Protocol):
   comes back learns how far a move got, so it is a read of the table and of nothing local.
 * **`ensure_serving(shard_id, nodes)`** - make what this process holds match that set:
   build its member of the group if it is in the set and holds nothing, close its member if
-  it holds one and is not.  It also becomes this cluster's own answer for who serves the
-  shard, which is what the publisher follows: the replica set and the addresses it
-  publishes are read from the group this process holds, so closing one stops both from
-  naming this process - see the last constraint in section 5.  What it returns is the nodes
-  whose group it closed, which is how a caller that ran twice tells a call that did
-  something from one that found the work already done.  What a close leaves on disk - the
-  group's storage, put aside under an orphan name rather than deleted - is the cluster
-  side's half of this and is not written on the process side yet.  Idempotent.
+  it holds one and is not.  What the publisher follows is the group this side holds: the
+  replica set and the addresses it publishes are read from that group, so closing one stops
+  both from naming this side - see the last constraint in section 5.  A side with nowhere
+  to keep a placement, which a process is, reads its answer to "who serves this shard" off
+  the group it holds too, so there the two are one event; a cluster's answer is
+  `_placed_shards`, written one step earlier, and section 4 has that order.  What it
+  returns is the nodes whose group it closed, which is how a caller that ran twice tells a
+  call that did something from one that found the work already done.  What a close leaves
+  on disk - the group's storage, put aside under an orphan name rather than deleted - is
+  the cluster side's half of this and is not written on the process side yet.  Idempotent.
 * **`apply_split_locally(shard_id, split_key, new_shard_id)`** - the range map this process
   routes by becomes the new one, so that the publisher sees a cluster that agrees with the
   table rather than one mid-split.  Idempotent.
@@ -189,6 +191,22 @@ handle on whatever leads the shard, wherever it is.  A method that names
 `MemoryRaftNode` is not an interface method, and that check comes before any question
 about how wide the interface is.
 
+**The seam is at the note, and everything after one is written down is the recovery's
+side of it.**  `_num_shards` hands a split its new shard's id, `_drain_shard` waits out the
+writes the freeze admitted, and the rows a move copies are read - all three *before*
+`_remember_split` or `_remember_migration` writes anything.  That part belongs to whatever
+begins the work: `split_shard` and `move_shard` today, and a process that can begin one
+whenever it grows that.  The recovery neither needs it nor could get it: the note carries
+what the beginning decided, the new shard's id among it.  Everything after the note -
+reading it back, freezing, building, copying, proposing, forgetting, re-ranging - is the
+recovery, one body, whichever side runs it.
+
+Three things straddle the line and are worth naming, because the extraction has to carry
+them: `_pending_splits` and `_migrations` are written by the beginning - the entry it puts
+there is the in-memory copy of the note - and finished by the recovery, which is why
+`possible_ranges` reads the first of them; and `_last_migration_error` is written by both,
+by `move_shard`'s precondition refusals before the note and by the finish path after it.
+
 The differential was thirteen primitives only `ShardedRaftCluster` has, nine both sides
 already have, and three neither has.  The nine go straight in (`shard_ids`, `range_map`,
 `metadata_client`, `get_shard_server`, `shard_replica_ids`, `shard_addresses`,
@@ -199,8 +217,9 @@ thirteen and the three land like this:
 * `_shard_nodes`, `_nodes_on` - internal: "the nodes this process holds for the shard" is
   what a view answers, and it is a helper here rather than a call.
 * `_freeze_shard`, `_unfreeze_shard` - `freeze` and `unfreeze`.
-* `_drain_shard` - internal: waiting out the writes admitted before the freeze belongs to
-  the recovery's own protocol, not to the view.
+* `_drain_shard` - the beginning's, and internal: it waits out the writes the freeze
+  admitted, and it runs before anything is written down, so it sits on the far side of the
+  seam drawn above rather than in the recovery.
 * `_serving_nodes` - `serving_nodes`, under the interface's name.  `_placed_shards` is what
   it reads, and it is written where the routing table is: by `_commit_move`, when the table
   has agreed, and never by `ensure_serving`.
@@ -245,6 +264,12 @@ thirteen and the three land like this:
 * `split_error`, `migration_error`, `pending_splits`, `migration_state`, `migrations` - the
   recovery's own accessors, for tests and for an operator.
 
+One reader crosses that line and has to be said out loud: `possible_ranges` asks the
+publisher's question - both maps a cluster mid-split could be in - and the second of them
+comes out of `_pending_splits`.  When that table moves into the recovery, `possible_ranges`
+asks the recovery for it rather than reading it here: a caller of the boundary, not a
+second owner of the state.
+
 The three that exist nowhere yet are the process-side answers, and they are section 5.
 
 ## 4. The cluster side
@@ -260,10 +285,22 @@ Becomes the view (public, one implementation of `RecoveryView`):
   already mean what the interface means.
 * `serving_nodes(shard_id)` is `_serving_nodes` under the interface's name.
 * `ensure_serving(shard_id, nodes)` is `_retire_source` + `_close_group_on` + a build
-  for every node that holds nothing, in the order `_commit_move` does them today.  The
-  write to `_placed_shards` stays where it is, at the front of `_commit_move`: that is the
-  routing table's placement and it moves when the table does, so it is the one thing this
-  call must not touch.
+  for every node that holds nothing.  It is the second of the two steps `_commit_move`
+  takes, and the order between them is what made section 2 and this list read as if they
+  disagreed.  The first step writes the routing table's answer down: `_placed_shards`
+  becomes the set the proposal landed, and the `_migrations` entry that was answering with
+  the old set goes, so from there `serving_nodes` names the new one.  The second step is
+  this call, and it changes the groups the cluster actually holds.  What lies between them
+  is the drain window: the table already names the new set while the old group is still up
+  and still answering, which is what lets a client that routed by the table it cached
+  finish the read it arrived with.  So `ensure_serving` must not write `_placed_shards` -
+  that is the table's answer, and it moves when the table does, one step earlier.
+
+  A process has no such order and loses nothing by that: it has nowhere to keep a
+  placement, so who serves a shard there is read off the group it holds, and the two steps
+  are one event.  Both sides answer one question - who serves this shard - and the
+  difference is only which of the two carriers is written down and which is derived, which
+  is the difference the interface is there to hide.
 * `freeze` / `unfreeze` are `_freeze_shard` / `_unfreeze_shard` for the whole group.
 * `leader_client(shard_id)` is a `ShardLeaders` over the cluster's own nodes with a
   `LocalNodeClientFactory` - which is the same object the coordinator and the resolver
@@ -284,9 +321,16 @@ Stays internal (helpers the recovery calls through the view, or uses itself):
   `_propose_move`, `_commit_move`, `_abort_move`: these are the *recovery's* body, not
   the view's.  They move into it, so that the two start-up paths cannot drift into two
   slightly different protocols.
-* `_migrations`, `_pending_splits`, `_orphan_dirs`, `_placed_shards` stay where they
-  are.  The view is what hides them; nothing outside the cluster's own implementation
-  reads them, which is the property the interface is for.
+* `_orphan_dirs` and `_placed_shards` stay here: what has been set aside and what the
+  routing table names are this cluster's own bookkeeping, and `ensure_serving` and
+  `serving_nodes` are the only doors onto them.
+* `_migrations`, `_pending_splits` and the two `_last_*_error` strings move with the
+  recovery body, because they are a running recovery's working state - the boundary
+  section 3 draws.  Three of them are written from the beginning too: `split_shard` and
+  `move_shard` put the entry in the table the note is the disk copy of, and `move_shard`'s
+  precondition refusals are most of where `_last_migration_error` is written
+  (`_last_split_error` is the finish path's alone).  So the beginning reaches them through
+  `self._recovery`, the way the public accessors and `possible_ranges` do.
 
 What the public entry points become:
 

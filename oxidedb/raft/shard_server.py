@@ -897,6 +897,18 @@ class ShardedRaftCluster:
                                       f"{pending['shard_id']} has no leader")
             return False
 
+        # The new shard is not a shard the routing table names: for a split it is the one
+        # the split's own proposal is about to name, and until that lands the table has no
+        # entry for it.  So the group the copy goes into is asked for by node set - which
+        # is what ``leader_client_for_nodes`` is for - and not by shard id: asking by id
+        # would reach the every-node fallback ``_serving_nodes`` keeps for a shard it has
+        # no entry for, which happens to include the group just built, and a process keeps
+        # no such fallback and would be answered None.  Asserted rather than assumed, so
+        # that the day these two clients come from the view the target comes from the set.
+        assert pending["new_shard_id"] not in self._placed_shards, (
+            f"shard {pending['new_shard_id']} is a split's new shard and the routing "
+            f"table does not name it yet; leader_client would answer for it only "
+            f"through the every-node fallback")
         source_client = self._client_for_node(pending["shard_id"], source)
         target_client = self._client_for_node(pending["new_shard_id"], target)
 
