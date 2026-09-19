@@ -5,6 +5,26 @@ the way it is: the decisions behind the keyspace encoding, the snapshot, the
 two-phase commit protocol and the read path, and what each one buys.  File
 references point at the code that implements the decision.
 
+## How this repository is worked on
+
+Two habits, both of them learned by getting something wrong first, and both of them the
+reason the rest of this file can be believed rather than interesting on their own.
+
+**Measure before building, and fix the estimate rather than the plan.**  More than one
+correction below is of this kind: regenerating the protobuf bindings was written down as
+costing "an unreadable diff" when it costs nothing, and the first plan for cutting suite
+time was built on the guess that cluster startup dominated - which one timing run showed
+to be the tests themselves.  An estimate that is wrong by an order of magnitude is worse
+than none: it makes a cheap operation look expensive, and the plan then avoids the change
+it should make.
+
+**A control experiment needs a control of its own.**  A test is shown to be load-bearing
+by removing the thing it checks and watching it fail.  If the removal was never reached -
+a probe inside a docstring, a patch against a path the test does not take - the test stays
+green and nothing was proved, and green is exactly what a proof looks like.  So the
+removal has to be verified to have taken effect, by the run rather than by the source: the
+wall time, the failure count, or a probe that raises where the injection was meant to land.
+
 ## Invariants
 
 Five things that are true of this system's shape rather than of any one change, each

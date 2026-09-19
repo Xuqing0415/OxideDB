@@ -203,7 +203,10 @@ thirteen and the three land like this:
 * `_rows_above`, `_committed_rows`, `_locks_in_range` - internal, over
   `leader_client(shard_id).scan(...)`.
 * `_move_row`, `_copy_rows` - internal, over `leader_client(...).propose(...)` and
-  `leader_client(...).get_write_record(...)`.
+  `leader_client(...).get_write_record(...)`.  For now each is written twice,
+  `_move_row_via_wire` and `_copy_rows_via_wire` beside the original, and the two
+  have been shown to propose the same bytes for the same rows
+  (`tests/test_copy_row_via_wire.py`); the callers still reach the originals.
 * `_addresses_on` - not needed by the recovery: the addresses a move proposes are the ones
   the nodes it is proposing to serve at, and whoever holds those nodes works them out.
 * `_finish_split`, `_publish_split`, `_copy_what_is_missing` - internal to the recovery.
@@ -336,6 +339,16 @@ both turn out to be expressible with them:
   `oxidedb/raft/state_machine.py` for exactly this reason: "those bytes have to be the same
   on both sides of the seam between a client and a node".  A process builds the same bytes
   that a node in the same process would.
+
+Writing that copy a second time turned up one thing the interface as sketched cannot
+say: which group the rows are going *into*.  `leader_client(shard_id)` answers about
+the group the routing table names, and the group a move copies into is exactly the
+one the table does not name yet.  On the process side the addresses of that group are
+not the table's either - they are this node's peers at that shard's port - so naming
+its leader is the view's business rather than the table's.  Whether that wants a
+second call or a `leader_client` that takes a set of nodes is left open here; what is
+settled is that the caller of the copy has to be able to name that group's leader,
+and nothing in the interface does yet.
 
 **3. The local answer for who serves a shard.**  This is the one that changed the
 interface, and the change is in the *verb*: the process side cannot be told to "set the
