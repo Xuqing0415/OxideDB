@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Two habits, both of them learned by getting something wrong first, and both of them the
+Three habits, both of them learned by getting something wrong first, and both of them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -17,6 +17,15 @@ time was built on the guess that cluster startup dominated - which one timing ru
 to be the tests themselves.  An estimate that is wrong by an order of magnitude is worse
 than none: it makes a cheap operation look expensive, and the plan then avoids the change
 it should make.
+
+**A workaround in a test names itself as a gap.**  When a test has to go around an
+interface - it needs something the interface cannot hand it and reaches for it another
+way - the comment says what the interface cannot say, not "for now".  The first version
+of the wire-copy tests reached the group a move copies into with a factory and a node id,
+and the comment said in as many words that `leader_client(shard_id)` answers about the
+table's group and this one is not in the table yet; the next change added
+`leader_client_for_nodes` and deleted the workaround.  A gap written down as a gap is a
+gap the next change can be asked to close, and the note is what makes it findable.
 
 **A control experiment needs a control of its own.**  A test is shown to be load-bearing
 by removing the thing it checks and watching it fail.  If the removal was never reached -

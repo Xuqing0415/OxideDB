@@ -96,6 +96,8 @@ class RecoveryView(Protocol):
     def freeze(self, shard_id: int, reason: str) -> None: ...
     def unfreeze(self, shard_id: int) -> None: ...
     def leader_client(self, shard_id: int) -> Optional[NodeClient]: ...
+    def leader_client_for_nodes(self, shard_id: int,
+                                nodes: List[int]) -> Optional[NodeClient]: ...
     def serving_nodes(self, shard_id: int) -> List[int]: ...
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]: ...
     def apply_split_locally(self, shard_id: int, split_key: bytes,
@@ -126,6 +128,13 @@ class RecoveryView(Protocol):
   that is, or None while nobody does.  This is the only way the recovery moves rows: it
   reads the source and proposes into the target through it, and in a process the client it
   gets is a socket.  A read.
+* **`leader_client_for_nodes(shard_id, nodes)`** - the same question asked about a set of
+  nodes rather than about the shard.  `leader_client` answers with the group the routing
+  table names, and the group a move copies *into* is exactly the one the table does not
+  name yet, so the set has to come from the caller that built it.  A call of its own
+  rather than a default argument on the other one: a caller that forgot the set would be
+  handed the wrong group's leader, and the wrong group's leader here is the shard the
+  rows are being copied out of.  A read.
 * **`serving_nodes(shard_id)`** - the replica set the routing table names, or - with no
   table, as in an in-process test - this cluster's own answer.  It is how a cluster that
   comes back learns how far a move got, so it is a read of the table and of nothing local.
@@ -199,7 +208,8 @@ thirteen and the three land like this:
   question - may this leader answer a linearizable read yet - because `_read_index`
   answers it by collecting a quorum of acknowledgements of the current term, which is
   what the node's own flag reports.  So the wait is a retry of a call that exists rather
-  than a new one.
+  than a new one.  `_leader_on` is `leader_client_for_nodes`, which is the same walk
+  over a set of nodes with the client handed back instead of the object.
 * `_rows_above`, `_committed_rows`, `_locks_in_range` - internal, over
   `leader_client(shard_id).scan(...)`.
 * `_move_row`, `_copy_rows` - internal, over `leader_client(...).propose(...)` and
@@ -240,7 +250,9 @@ Becomes the view (public, one implementation of `RecoveryView`):
 * `leader_client(shard_id)` is a `ShardLeaders` over the cluster's own nodes with a
   `LocalNodeClientFactory` - which is the same object the coordinator and the resolver
   already ask, so a recovery in process reads its shards the way every other caller
-  does.
+  does.  `leader_client_for_nodes(shard_id, nodes)` asks the same factory for each node
+  of a set and keeps the first that answers a follower read index, which is the client
+  service's own way of saying "I lead and I have confirmed it with a quorum".
 * `apply_split_locally` is `_apply_split_locally`.
 * `metadata()` is `self._metadata_client`.
 
@@ -340,15 +352,25 @@ both turn out to be expressible with them:
   on both sides of the seam between a client and a node".  A process builds the same bytes
   that a node in the same process would.
 
-Writing that copy a second time turned up one thing the interface as sketched cannot
+Writing that copy a second time turned up one thing the interface as sketched could not
 say: which group the rows are going *into*.  `leader_client(shard_id)` answers about
-the group the routing table names, and the group a move copies into is exactly the
-one the table does not name yet.  On the process side the addresses of that group are
-not the table's either - they are this node's peers at that shard's port - so naming
-its leader is the view's business rather than the table's.  Whether that wants a
-second call or a `leader_client` that takes a set of nodes is left open here; what is
-settled is that the caller of the copy has to be able to name that group's leader,
-and nothing in the interface does yet.
+the group the routing table names, and the group a move copies into is exactly the one
+the table does not name yet.  It is a call of its own, `leader_client_for_nodes(shard_id,
+nodes)`, and not a set of nodes defaulted on the other one: a signature that let a caller
+forget the set would hand it the wrong group's leader in precisely the case this call
+exists for, and the wrong group's leader here is the group the rows are coming out of.
+
+Neither side needed a new RPC for it.  `ClientService.FollowerReadIndex` already answers
+a node that is not the leader with `NOT_LEADER` and, when that node knows who leads, with
+`leader_address` beside it - and a leader answers with its commit index, which it has
+confirmed with a quorum.  So the walk is one call per node in the set, and it is asked that
+way rather than trusted to `NodeState`: a node that merely believes it leads is
+exactly the node whose belief is in question, and here it is the one that would be handed
+a copy.  The hint is not followed, because every member of the group is in the set - the
+set is what the caller answered "which group" with - so walking it is the whole answer.
+One thing the hint does not do on the other path either: `NodeClient.follower_read_index`
+returns an index and a reason, and drops the address, so a caller holding only clients
+cannot follow a hint through that call.  Nothing here needs it to.
 
 **3. The local answer for who serves a shard.**  This is the one that changed the
 interface, and the change is in the *verb*: the process side cannot be told to "set the
