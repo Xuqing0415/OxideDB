@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass, field
 
 from typing import Any, Dict, List, Optional, Callable, Tuple
+from ..client.node_client import LocalNodeClientFactory, NodeClient
+from ..client.routing import ShardLeaders
 from ..metadata.publisher import DEFAULT_PUBLISH_INTERVAL, MetadataPublisher
 from ..metadata.service import PROPOSE_ATTEMPTS, RETRY_BACKOFF
 from ..shard.router import default_range_map, locate
@@ -37,7 +39,8 @@ MIGRATION_DRAIN_SECONDS = 30.0
 #: routing table's group is holding.
 SHARD_SEGMENT = 1000
 from .node import MemoryRaftNode, RaftCluster, NodeState
-from .state_machine import StateMachine, CommandType, ApplyResult, ErrorCode
+from .state_machine import (StateMachine, CommandType, ApplyResult, ErrorCode,
+                            serialize_command)
 from .storage import RaftStorage, JSONFileStorage
 
 
@@ -428,6 +431,10 @@ class ShardedRaftCluster:
         #: for callers that look - a test, an operator - and never read back: nothing
         #: here opens one.
         self._orphan_dirs: List[str] = []
+        #: How "who leads this shard" becomes a client, built when something first
+        #: asks.  Kept because the lookup remembers what a factory built for it, and a
+        #: recovery that asks twice should not pay for the same answer twice.
+        self._leaders: Optional[ShardLeaders] = None
     
     def _create_default_range_map(self) -> Dict[int, tuple]:
         return default_range_map(self._num_shards)
@@ -592,6 +599,23 @@ class ShardedRaftCluster:
             if node is not None and node.state == NodeState.LEADER:
                 return (node_id, node.current_term)
         return None
+
+    def leader_client(self, shard_id: int) -> Optional[NodeClient]:
+        """Who leads ``shard_id``, as a client rather than as a node object.
+
+        The same lookup the coordinator and the resolver ask, over this cluster's own
+        nodes: :meth:`shard_leader` answers with an id, the id goes into a factory, and
+        what comes back is a ``NodeClient`` - so a recovery that runs here reads and
+        proposes exactly the way one that runs in a process of its own does, and the
+        two can be compared.  The set it asks is :meth:`_serving_nodes`: the group the
+        routing table names, which for a shard being moved is the one its rows are
+        coming from.
+
+        None while nobody leads it, which is an answer and not a failure.
+        """
+        if self._leaders is None:
+            self._leaders = ShardLeaders(self, factory=LocalNodeClientFactory(self))
+        return self._leaders.leader_for_shard(shard_id)
 
     def start_metadata_publisher(self, metadata,
                                  interval: float = DEFAULT_PUBLISH_INTERVAL) -> None:
@@ -1024,6 +1048,49 @@ class ShardedRaftCluster:
                 continue
             result = self._move_row(source_leader, target_leader, key, value)
             if result is not None and not result.success:
+                # A row the new group refused is a row it does not have, and a move that
+                # carried on would leave a shard whose table entry names a group that is
+                # missing one of its rows.
+                self._last_migration_error = (
+                    f"the new group refused a row of shard {state.shard_id}: "
+                    f"{result.error_msg}")
+                return False
+            state.copied_keys.append(key)
+        return True
+
+    def _copy_rows_via_wire(self, source: NodeClient, target: NodeClient,
+                            state: MigrationState) -> bool:
+        """Copy the rows the new group does not already have, through the client seam.
+
+        The same copy as :meth:`_copy_rows`, written beside it rather than in place of
+        it: what has to be shown first is that the two write the same bytes, and a
+        second implementation is the only thing that can show it.  Nothing here touches
+        a ``MemoryRaftNode`` - a row's version comes out of a range read, the write
+        record out of ``get_write_record``, and the row goes in through ``propose`` -
+        which is the one discipline this has.  A copy that reached around the client
+        would work in this process and nowhere else, and it would work here silently.
+
+        ``state.rows`` is what the caller read at the freeze, which is a pair per row:
+        which version each one is at is a fact about the shard that holds it, so it is
+        asked of the shard.  When the read that fills ``state.rows`` moves onto the seam
+        as well the versions will arrive with the rows, and this becomes one read where
+        it is now two.
+        """
+        start, end = self._range_map[state.shard_id]
+        versions = {key: version
+                    for key, _, version in source.scan_versions(start, end)}
+        for key, value in state.rows:
+            expected = versions.get(key)
+            if expected is None:
+                # The source no longer has it, so there is nothing left to move.
+                continue
+            if target.get(key).commit_ts == expected:
+                # A read that could not answer carries no version, and 0 is what a row
+                # that is not there carries too.  Either way the row goes in, which is
+                # idempotent for a row that is already at this version.
+                continue
+            result = self._move_row_via_wire(source, target, key, value, expected)
+            if not result.success:
                 # A row the new group refused is a row it does not have, and a move that
                 # carried on would leave a shard whose table entry names a group that is
                 # missing one of its rows.
@@ -1817,6 +1884,28 @@ class ShardedRaftCluster:
                       and record["commit_ts"] == version.timestamp else None),
         )
         return target_leader.propose(command)
+
+    def _move_row_via_wire(self, source: NodeClient, target: NodeClient, key: bytes,
+                           value: bytes, version: int) -> ApplyResult:
+        """One row into the new shard through the client seam, at the version it is.
+
+        The same command as :meth:`_move_row` out of the same two facts - the version
+        the row already has, and the write record of the transaction that committed it
+        - with the version handed in rather than read a second time: the caller has
+        just read it, and a second read is a second answer to a question that has one.
+        A record whose commit is some other moment is a row written after that
+        transaction, and it travels without a ``start_ts``.
+        """
+        record = source.get_write_record(key)
+        command = serialize_command(
+            CommandType.SET,
+            key=key,
+            value=value,
+            timestamp=version,
+            start_ts=(record["start_ts"] if record is not None
+                      and record["commit_ts"] == version else None),
+        )
+        return target.propose(command)
     
     def shutdown(self):
         # Before the servers: the cleaner proposes entries onto shard leaders, so
