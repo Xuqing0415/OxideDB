@@ -322,14 +322,15 @@ both turn out to be expressible with them:
   and a write intent is not in it: an intent is a lock, and a lock is not a version, so
   the read answers straight through one.  The state machine's own `scan` - the one the
   wire reaches - refuses with `ScanRefused` when a lock it cannot judge is in the range.
-  `split_shard` and `move_shard` never meet the difference, because both check
-  `_locks_in_range` before they read; `recover_splits` and `recover_migrations` do not.
-  So the rewrite would change what a recovery does about a lock it finds, from copying
-  the version behind it to refusing to read.  Refusing is the one that matches section 6
-  - no answer, so the shard stays frozen and is asked again - but it is a decision rather
-  than a consequence, and the question under it comes first: whether the recovery paths
-  should be looking for locks at all, given that the two calls that begin a split or a
-  move already do.
+  The two are not two answers to one question, because the read is never the first thing
+  asked: a lock in the range is a transaction in the middle of changing a row in it, and
+  the version space holds the *old* version of that row - which nothing downstream could
+  tell from a row that is simply the row.  So all four calls that read a range in order to
+  move it check `_locks_in_range` first and refuse over a lock: `split_shard` and
+  `move_shard`, and now `recover_splits` and `recover_migrations` at the point where each
+  of them reads the rows - the same read, in the same place, for the same reason.  What a
+  refusing recovery leaves is the state section 6 describes: the note on disk, the shard
+  frozen, and the lock clearing on its own, since it belongs to a transaction.
 * The command is a `serialize_command(CommandType.SET, ...)` call with the value's
   timestamp and the write record's `start_ts`, and it is a module-level function in
   `oxidedb/raft/state_machine.py` for exactly this reason: "those bytes have to be the same
@@ -447,6 +448,10 @@ already settled and does not change with the caller:
   next call) asks again: this is the outcome a restarted process is most likely to meet,
   because the election or the table it needs may not be there yet in the first seconds;
 * no leader yet - the same: frozen, remembered, retried;
+* a lock in the range - frozen and remembered too, because a copy taken over one would be
+  of a row a transaction is in the middle of changing.  This is the one outcome whose exit
+  is not built: the lock goes by itself, but the note is only read again by the next start
+  or the next call, and nothing calls on its own (README, "Known gaps");
 * done - the note goes, the source of a split is thawed, and the group a move left is
   closed and set aside.
 
@@ -479,7 +484,6 @@ intermediate state the mover left it in - the one state that cannot lose a row.
 
 **One thing deliberately not built.**  The copy costs one read per row on the side it is
 copying into, which is a round trip a batched primitive would remove - but the batched
-primitive is not this change's subject and neither is the version-stamped read it would
-be built on: that is the open decision at the end of section 5, and it is what has to
-land before a recovery can copy a row across processes at all.  What is deliberately not
-built here is only the batching, for the reason it always was.
+primitive is not this change's subject.  The version-stamped read it would be built on has
+landed (section 5), so what is deliberately not built here is only the batching, for the
+reason it always was.
