@@ -6,10 +6,11 @@ that today (`docs/recovery.md`, section 5).  This file holds the part of the ans
 settled: the field exists, it is where the contract says it is, and a value that carries no
 version says so with 0 rather than with a second presence bit.
 
-It is a contract test rather than an implementation test, and deliberately: the servicer
-does not fill either field yet, so the shape lands first and the filling second.  Nothing
-here touches a shard; what it pins is the generated bindings, which is also the only place
-a field number can be got wrong without anything failing.
+It is a contract test rather than an implementation test, and deliberately: nothing here
+touches a shard.  What it pins is the generated bindings, which is also the only place a
+field number can be got wrong without anything failing - the filling is pinned where it
+can be seen happening, in `tests/test_client_servicer.py` and in the two tests that put a
+real client beside the node it wraps.
 
 The rule the two fields come from is worth stating, because one message is left out of it
 on purpose.  *A value and the version it is travel together*: `GetResponse` for one key,

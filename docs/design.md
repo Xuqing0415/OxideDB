@@ -664,14 +664,17 @@ refusal is a caller that cannot be anything but this repository's own code.  Unt
 it is written down in the README as well as here.
 
 That widening is no longer only about this refusal.  Recovery needs a read that says
-which version a row is at, and no combination of the six calls the client service has
-can produce it (`docs/recovery.md`, section 5): a write record is written by a
-transaction's commit and not by a plain `SET`, and the scans answer key and value with
-no version.  So a recovery cannot copy a row from another process until the service
-carries a version-stamped read, which puts the next widening - and this decision with
-it - in front of the recovery instead of after it.  A stamped read adds nothing to the
-refusal family, but it is the first change to the same contract, and the two are
-decided together.
+which version a row is at, and no combination of the six calls the client service had
+could produce it (`docs/recovery.md`, section 5): a write record is written by a
+transaction's commit and not by a plain `SET`, and the scans answered key and value
+with no version.  So a recovery could not copy a row from another process until the
+service carried a version-stamped read, which put the next widening - and this decision
+with it - in front of the recovery instead of after it.  The stamped read is done and
+the carrier is not: `GetResponse` and `KeyValuePair` have a `commit_ts`, the servicer
+fills it, and a client asks for `scan_versions` where `scan` drops the version for the
+callers that want rows.  Filling that field moved nothing about the refusal family,
+which is the sense in which the two are decided together: one contract, two changes,
+and only the carrier is still open.
 
 ### What is not covered.
 

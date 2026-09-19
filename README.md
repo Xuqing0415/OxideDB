@@ -553,10 +553,12 @@ Honest list of what is *not* done, roughly in priority order.
   cluster's own `_migrations`, `_pending_splits`, `_placed_shards`, `_orphan_dirs` and
   `_shard_servers`, and a `ClusterNode` holding one node of each group has none of those.
   It is not only moving it, though.  A copied row is stamped with the version it already is,
-  and none of the six primitives says which version a row is at - a write record is written
-  by a transaction's commit and not by a plain `SET` - so the client service has to carry a
-  version-stamped read before any recovery can copy a row out of another process
-  (`docs/recovery.md`, section 5).
+  and none of the six primitives said which version a row is at - a write record is written
+  by a transaction's commit and not by a plain `SET` - so the client service had to carry a
+  version-stamped read before any recovery could copy a row out of another process
+  (`docs/recovery.md`, section 5).  That read is in place: the servicer fills `commit_ts` on
+  a key and on every row of a scan, and `scan_versions` is where a recovery reads it.  The
+  recovery that uses it is the part still missing.
   A split has one boundary of its own: a node's ports are its shard
   segment with the two groups above it, so a cluster can serve `SHARD_SEGMENT` shards and
   a split asking for the shard after that has to be refused - a check the split path does

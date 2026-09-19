@@ -309,10 +309,14 @@ both turn out to be expressible with them:
   `SET` writes a version and no record at all - so a row the SQL path wrote has a version
   and nothing to read it from.  `_move_row` already assumes the two can differ: it takes
   `timestamp` from the version and its `start_ts` from the record only when the record's
-  `commit_ts` matches the version.  This is the one thing the six calls cannot express,
-  so the copy cannot move onto `leader_client` until the client service carries the
-  version.  The open decision below is that, and it is in front of the recovery rather
-  than behind it.
+  `commit_ts` matches the version.  This was the one thing the six calls could not
+  express, so the copy could not move onto `leader_client` until the client service
+  carried the version - and the open decision in `docs/design.md`, section 7, is that
+  read, which is now in place: `KeyValuePair.commit_ts` and `GetResponse.commit_ts` are
+  filled by the servicer, and a client reads them as `scan_versions` and as
+  `ReadResult.commit_ts`.  0 says a row has no version, which is the case for a row that
+  came from the reader's own write intent: an intent is a lock, and a lock is not a row.
+  The copy can move onto `leader_client` as soon as it is written.
 
 * *What a lock in the range means.*  `_committed_rows` reads the storage's version space,
   and a write intent is not in it: an intent is a lock, and a lock is not a version, so
