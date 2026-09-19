@@ -1,16 +1,20 @@
-"""``NodeClusterView.ensure_serving``: what one node holds, with no cluster around it.
+"""``ensure_serving``: what a node or a cluster holds for a shard, and what it lets go.
 
 ``docs/recovery.md`` gives the recovery one call for both directions of a shard's
 membership - build my member of the group, or close it - so that a node coming back can
-agree with the routing table about who serves a shard.  These are that call's own tests:
-which case does what, and that calling it twice is calling it once.
+agree with the routing table about who serves a shard.  Both implementations of that call
+are here: the view one node of the launcher keeps, and the cluster object the in-process
+tests and the recovery run against.  What the two share is the decision - built, left
+alone, closed, built again - and the answer both give for it: the nodes whose group the
+call closed, which is how a caller that ran twice tells a call that did something from one
+that found the work already done.
 
-They are view-level on purpose: what is pinned here is the decision - built, left alone,
-closed, built again - and the decision is the same one a process makes.  What a process
-adds is that a group is also a bound port and a storage directory, and there is one test
-below of the half of that a rebuild depends on: the port coming back after the close.
-The storage of a shard this node stops serving is not covered - nothing sets a directory
-aside yet.
+The view's tests are view-level on purpose: what is pinned there is the decision, and the
+decision is the same one a process makes.  What a process adds is that a group is also a
+bound port and a storage directory, and there is one test below of the half of that a
+rebuild depends on: the port coming back after the close.  The storage of a shard this
+node stops serving is not covered - nothing sets a directory aside yet, where the cluster
+side does.
 
 Two of the tests are about the other half of a close, which is not a decision but a
 reading: what the view says it holds, for the publisher that asks it.  They are here
@@ -19,12 +23,15 @@ and the shard server still named this node, so a node that had just stopped serv
 shard would have been written into the table as a replica of it.
 """
 
+import os
+
 import pytest
 
 from _ports import allocate_port
 from oxidedb.launcher import ClusterConfig, NodeClusterView, Peer, block_width
-from oxidedb.raft.shard_server import ShardServer
+from oxidedb.raft.shard_server import ShardedRaftCluster, ShardServer
 from oxidedb.raft.state_machine import MVCCStateMachine
+from oxidedb.raft.storage import EngineRaftStorage
 from oxidedb.shard.router import default_range_map
 
 #: The first node's base port, for the tests that bind nothing: a group in process is a
@@ -128,10 +135,10 @@ def test_calling_it_twice_leaves_what_calling_it_once_left(a_node):
     """Idempotence, which is not decoration: a recovery that came back twice calls this
     twice, and the second call must not close and rebuild what the first one built."""
     view, server = a_node()
-    view.ensure_serving(SHARD, [1, 2])
+    assert view.ensure_serving(SHARD, [1, 2]) == [1], "the group it had was closed"
     built = server.get_shard_node(SHARD)
 
-    view.ensure_serving(SHARD, [1, 2])
+    assert view.ensure_serving(SHARD, [1, 2]) == []
 
     assert server.get_shard_node(SHARD) is built
     assert server.shard_replica_ids(SHARD) == [1, 2]
@@ -144,11 +151,11 @@ def test_a_shard_this_node_is_not_one_of_is_closed(a_node):
     view, server = a_node(node_id=3)
     assert server.get_shard_node(SHARD) is not None
 
-    view.ensure_serving(SHARD, [1, 2])
+    assert view.ensure_serving(SHARD, [1, 2]) == [3], "this node closed its group"
 
     assert server.get_shard_node(SHARD) is None
 
-    view.ensure_serving(SHARD, [1, 2])
+    assert view.ensure_serving(SHARD, [1, 2]) == [], "and there is nothing left to close"
     assert server.get_shard_node(SHARD) is None
 
 
@@ -218,3 +225,113 @@ def test_a_shard_this_node_was_not_started_with_is_claimed_only_once_it_is_built
     view.ensure_serving(A_SHARD_NOBODY_STARTED_WITH, [1, 2])
 
     assert view.shard_replica_ids(A_SHARD_NOBODY_STARTED_WITH) == [1, 2]
+
+# -- the cluster's own implementation --------------------------------------------
+
+
+def _in_process_cluster(tmp_path, num_nodes=3, num_shards=1):
+    """A cluster whose nodes are all started serving every shard, with durable storage.
+
+    Storage because half of what the cluster's close does is a rename: the directory a
+    retired group's rows are in is put aside under an orphan name rather than deleted,
+    and that is a fact about a file rather than about a group.
+    """
+    cluster = ShardedRaftCluster(num_nodes=num_nodes, num_shards=num_shards)
+    cluster.start(
+        state_machine_factory=lambda: MVCCStateMachine(),
+        storage_factory=lambda node_id, shard_id: EngineRaftStorage(
+            data_dir=str(tmp_path / f"shard{shard_id}_node{node_id}")),
+        lock_cleaner_interval=None,
+    )
+    return cluster
+
+
+def _holders(cluster, shard_id):
+    """The nodes of ``cluster`` holding a group for ``shard_id`` right now."""
+    return [node_id for node_id in sorted(cluster._shard_servers)
+            if cluster.get_shard_server(node_id).get_shard_node(shard_id) is not None]
+
+
+def test_the_cluster_closes_the_groups_of_the_nodes_a_placement_leaves_out(tmp_path):
+    """The other direction on the cluster side, which is how a move ends.
+
+    The nodes in the set keep the groups they had - the same objects, not built again -
+    and the ones outside it are closed, which on this side is a group, its port and its
+    storage going together: the directory is put aside under a name nothing reads, for
+    the reason the whole of that path exists - a leaked directory costs disk, and a lost
+    range costs the data.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        started_with = {node_id: cluster.get_shard_server(node_id).get_shard_node(0)
+                        for node_id in (1, 2, 3)}
+        assert all(started_with.values()), "every node was started with the shard"
+
+        assert cluster.ensure_serving(0, [1, 2]) == [3]
+
+        assert cluster.get_shard_server(3).get_shard_node(0) is None
+        for node_id in (1, 2):
+            assert cluster.get_shard_server(node_id).get_shard_node(0) is started_with[node_id], \
+                "a node that was already serving it keeps the group it had"
+        orphans = cluster.orphan_dirs()
+        assert len(orphans) == 1, "one directory aside"
+        assert os.path.basename(orphans[0]).startswith("orphan-shard-0-")
+        assert not os.path.isdir(str(tmp_path / "shard0_node3")), \
+            "the name the shard was stored under is free"
+    finally:
+        cluster.shutdown()
+
+
+def test_the_cluster_builds_a_shard_it_was_not_started_with_on_every_node(tmp_path):
+    """A split's new shard, which is the reason this call exists at all.
+
+    A restarted cluster builds the shards it was told to serve and nothing else, so the
+    shard the note names is one nobody holds until this builds it - and the whole cluster
+    is the set, which is what a shard created by a split gets.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        assert _holders(cluster, A_SHARD_NOBODY_STARTED_WITH) == []
+
+        assert cluster.ensure_serving(A_SHARD_NOBODY_STARTED_WITH, [1, 2, 3]) == []
+
+        assert _holders(cluster, A_SHARD_NOBODY_STARTED_WITH) == [1, 2, 3]
+        for node_id in (1, 2, 3):
+            server = cluster.get_shard_server(node_id)
+            assert server.shard_replica_ids(A_SHARD_NOBODY_STARTED_WITH) == [1, 2, 3]
+        assert cluster._num_shards == A_SHARD_NOBODY_STARTED_WITH + 1, \
+            "the cluster counts a shard it now holds"
+    finally:
+        cluster.shutdown()
+
+
+def test_the_cluster_builds_a_group_with_the_members_it_is_given(tmp_path):
+    """A move's target set: the nodes are the caller's, and the group built on them has
+    them and no others as its members, which is what lets the new group elect and
+    replicate on its own before anything is copied into it."""
+    cluster = _in_process_cluster(tmp_path, num_nodes=5)
+    try:
+        assert _holders(cluster, A_SHARD_NOBODY_STARTED_WITH) == []
+
+        assert cluster.ensure_serving(A_SHARD_NOBODY_STARTED_WITH, [4, 5]) == []
+
+        assert _holders(cluster, A_SHARD_NOBODY_STARTED_WITH) == [4, 5]
+        server = cluster.get_shard_server(4)
+        assert server.shard_replica_ids(A_SHARD_NOBODY_STARTED_WITH) == [4, 5]
+    finally:
+        cluster.shutdown()
+
+
+def test_the_cluster_closing_twice_is_closing_once(tmp_path):
+    """Idempotence on the cluster side, and the same answer the view gives: a recovery
+    that came back twice closes nothing the second time, and the empty list is how it
+    knows the first call was the one that did it."""
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        assert cluster.ensure_serving(0, [1, 2]) == [3]
+        orphans = cluster.orphan_dirs()
+
+        assert cluster.ensure_serving(0, [1, 2]) == []
+        assert cluster.orphan_dirs() == orphans, "and nothing else was put aside"
+    finally:
+        cluster.shutdown()

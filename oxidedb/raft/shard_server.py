@@ -702,7 +702,7 @@ class ShardedRaftCluster:
             # same state machine, same storage, and in network mode a port at the
             # address the table is about to publish.
             self._remember_split(pending)
-            self._ensure_shard(new_shard_id)
+            self.ensure_serving(new_shard_id, sorted(self._shard_servers))
 
             copied = True
             return self._finish_split(pending)
@@ -970,6 +970,9 @@ class ShardedRaftCluster:
             start, end = self._range_map[shard_id]
             state.rows = self._committed_rows(source, start, end)
 
+        # The target's own members and nothing closed, which is not the placement: the
+        # source is still the group the table names, so this is a group built beside it
+        # rather than instead of it, and its members are the target nodes alone.
         self._ensure_group_on(state.target_nodes, shard_id)
 
         target = self._wait_for_leader_on(state.target_nodes, shard_id)
@@ -1164,7 +1167,7 @@ class ShardedRaftCluster:
             time.sleep(drain)
 
         self._forget_migration(shard_id)
-        return self._retire_source(shard_id)
+        return self.ensure_serving(shard_id, target_nodes)
 
     def _abort_move(self, state: MigrationState) -> List[int]:
         """Give up on a move the routing table refused, and put the shard back.
@@ -1205,26 +1208,101 @@ class ShardedRaftCluster:
             if node._storage is not None:
                 node._storage.delete_admin(key)
 
-    def _retire_source(self, shard_id: int) -> List[int]:
-        """Close the group a shard left behind, on every node that is not serving it now.
+    def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]:
+        """Make every node that serves ``shard_id`` one of ``nodes``, and no other.
 
-        Which nodes those are is read off the cluster rather than out of the move: a group
-        for the shard exists on the nodes that have one, and the nodes the table names now
-        are the ones that keep theirs.  A caller that came back after a restart has no
-        move in memory and does not need one - the placement is the whole of it.
+        The cluster's own answer to the call the recovery makes, and one call for both
+        directions for the same reason the process side's is one: a shard's placement and
+        the groups that answer for it are two halves of one fact, so a caller that moved
+        one without the other would leave a shard with two live groups, or with none.
+
+        Two things, in this order:
+
+        * every node in ``nodes`` that holds no group for the shard builds one, with the
+          set it was given as its members.  A restarted cluster builds the shards it was
+          told to serve and nothing else, so the group a split created, or the one a move
+          went to, has to be built again before it can answer anything - and building it
+          is also what reads back the rows a move committed through it.
+        * every node that holds a group and is not in ``nodes`` closes it and puts its
+          storage aside, which is what a move leaves behind: the range belongs to a group
+          this one is not, and a client still routing by the old table must not be
+          answered by a group that no longer owns it.
+
+        ``nodes`` is the whole set and not a part of it, which is the caller's to name -
+        the replica set a move is going to is a policy (see :meth:`move_shard`).  The
+        whole cluster is the other answer there is, and the one a split's new shard gets;
+        it is left unsaid rather than written down, because that is how a shard server
+        already spells it (see ``ShardServer._serves``).
+
+        What this call is not is the step that builds a group a move is still copying
+        into.  That one closes nothing, and its members are the nodes it is given - which
+        is a different set from "the nodes that should end up holding the shard", because
+        the source is holding its own group at that moment and its members are its own.
+        It is :meth:`_ensure_group_on`, a move calls it before the proposal and this call
+        after, and the two are not one call for the reason a process does not have: one
+        process holds one of those groups, and a cluster object holds both.
+
+        What it returns is the nodes whose group it closed, so an empty list is a
+        placement that was already in force - an answer rather than a failure, and the
+        difference a caller that ran twice sees.
+
+        What it does not touch is this cluster's own answer for who serves the shard,
+        which is ``_placed_shards``: that is the routing table's placement and it moves
+        when the table does, so a move builds its new group here before the proposal and
+        goes on answering with the group it is leaving until the table agrees.
         """
-        target = set(self._placed_shards.get(shard_id, []))
-        left = [node_id for node_id in sorted(self._shard_servers) if node_id not in target]
+        members = sorted(set(nodes))
+        # Left unsaid when the set is the whole cluster, which is what a shard built at
+        # start-up and a shard a split creates are: a shard server's own reading of "no
+        # set was given" is every node, and naming them would be a second way of saying
+        # it - which ``ShardServer._serves`` and ``ShardServer._get_peer_nodes`` both
+        # answer the same way, so this is spelling rather than meaning.
+        named = None if members == sorted(self._shard_servers) else members
+        # Counted as one of the cluster's own, the way a shard it was started with is.
+        self._num_shards = max(self._num_shards, shard_id + 1)
+        for node_id in members:
+            server = self._shard_servers[node_id]
+            if server.get_shard_node(shard_id) is None:
+                server.add_shard(shard_id, members=named)
+        left = [node_id for node_id in sorted(self._shard_servers)
+                if node_id not in members]
         return self._close_group_on(left, shard_id)
+
+    def _ensure_group_on(self, node_ids: List[int], shard_id: int) -> None:
+        """Make sure every node of ``node_ids`` is holding a group for ``shard_id``.
+
+        The set a move is going to, which is not a set this cluster was started with: a
+        restarted cluster builds the shards it was told to serve and nothing else, so the
+        group the routing table names has to be built here before it can answer anything.
+
+        The build half of :meth:`ensure_serving` on its own, and the members are exactly
+        ``node_ids``: a move builds this group while the source is still the group the
+        table names, so the set of nodes that hold the shard is not a set that any one
+        replica set describes - see the note there.
+
+        What it comes back with is the copy.  A move's rows are committed through the group
+        they are carried into, so the storage under the new group's name on each of its
+        nodes is where they are; building the group is what reads them back, and it is the
+        only reason a restarted cluster can serve a shard it was not placed on.
+        """
+        for node_id in node_ids:
+            server = self._shard_servers[node_id]
+            if server.get_shard_node(shard_id) is None:
+                server.add_shard(shard_id, members=node_ids)
 
     def _close_group_on(self, node_ids: List[int], shard_id: int) -> List[int]:
         """Stop serving a shard on exactly ``node_ids``, and put their storage aside.
 
-        The nodes are the caller's: the ones a move left, or the ones it built a group on
-        and then gave up on.  What it returns is the ones that actually had a group, which
-        is how a caller tells "I closed it" from "it was already closed" - a group that is
-        not there is an answer rather than an error, because a caller that died in the
-        middle of this comes back and runs the whole of it again.
+        The nodes are the caller's, and this is the primitive rather than the call:
+        :meth:`ensure_serving` closes through it on the nodes a placement leaves out, and
+        :meth:`_abort_move` names a set directly - the group a refused move built, which
+        is the only one that call is entitled to close, since a refusal does not say what
+        the table names instead.
+
+        What it returns is the ones that actually had a group, which is how a caller tells
+        "I closed it" from "it was already closed" - a group that is not there is an answer
+        rather than an error, because a caller that died in the middle of this comes back
+        and runs the whole of it again.
         """
         closed = []
         for node_id in sorted(set(node_ids)):
@@ -1372,7 +1450,7 @@ class ShardedRaftCluster:
         # rows until the table says where they go, and a restarted node has to be told
         # again: a freeze is a local fact, and it died with the process that held it.
         self._freeze_shard(shard_id)
-        self._ensure_shard(pending["new_shard_id"])
+        self.ensure_serving(pending["new_shard_id"], sorted(self._shard_servers))
 
         source = self._wait_for_shard_leader(shard_id)
         if source is None:
@@ -1426,6 +1504,9 @@ class ShardedRaftCluster:
             # group's and the note is all that is left of the move.  The group has to be
             # built here first: a restarted cluster builds the shards it was told to serve,
             # and the one the table names is not necessarily one of them.
+            # Built, but not the placement yet: the note this move wrote into the source
+            # is dropped by :meth:`_commit_move` before that group goes, so the source has
+            # to still be holding its storage when the cleanup gets there.
             self._ensure_group_on(state.target_nodes, shard_id)
             # No drain and no proposal.  A window is what lets a client that cached the old
             # table finish the read it arrived with, and this process has been down long
@@ -1543,35 +1624,6 @@ class ShardedRaftCluster:
     @staticmethod
     def _migration_record_key(shard_id: int) -> str:
         return f"{MIGRATION_RECORD_PREFIX}/{shard_id}"
-
-    def _ensure_shard(self, shard_id: int) -> None:
-        """Make sure every node of the cluster serves ``shard_id``.
-
-        A restarted cluster builds the shards it was started with and nothing else - it
-        does not read its ranges from the table - so the shard a split created has to
-        be built again before that split can be finished.
-        """
-        for server in self._shard_servers.values():
-            if server.get_shard_node(shard_id) is None:
-                server.add_shard(shard_id)
-        self._num_shards = max(self._num_shards, shard_id + 1)
-
-    def _ensure_group_on(self, node_ids: List[int], shard_id: int) -> None:
-        """Make sure every node of ``node_ids`` is holding a group for ``shard_id``.
-
-        The set a move is going to, which is not a set this cluster was started with: a
-        restarted cluster builds the shards it was told to serve and nothing else, so the
-        group the routing table names has to be built here before it can answer anything.
-
-        What it comes back with is the copy.  A move's rows are committed through the group
-        they are carried into, so the storage under the new group's name on each of its
-        nodes is where they are; building the group is what reads them back, and it is the
-        only reason a restarted cluster can serve a shard it was not placed on.
-        """
-        for node_id in node_ids:
-            server = self._shard_servers[node_id]
-            if server.get_shard_node(shard_id) is None:
-                server.add_shard(shard_id, members=node_ids)
 
     def _rows_above(self, leader: MemoryRaftNode, shard_id: int, split_key: bytes):
         """The rows of ``shard_id``'s range that belong to the shard above the point."""

@@ -438,7 +438,7 @@ class NodeClusterView:
 
     # -- what a recovery asks a cluster -------------------------------------
 
-    def ensure_serving(self, shard_id: int, nodes: List[int]) -> None:
+    def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]:
         """Make this node's group for ``shard_id`` the one that serves ``nodes``.
 
         One call for both directions, because in a process "the set changed" and "what I
@@ -468,6 +468,10 @@ class NodeClusterView:
 
         What it leaves behind is what it compares against, so a second call with the same
         nodes does nothing - which is what a recovery that came back twice does.
+
+        What it returns is this node when it had a group to close, and nothing otherwise:
+        the same answer the cluster side gives, so a caller can tell a call that did
+        something from one that found the work already done.
         """
         server = self._shard_servers.get(self._config.node_id)
         if server is None:
@@ -478,14 +482,17 @@ class NodeClusterView:
         members = sorted(set(nodes))
         holds = server.get_shard_node(shard_id) is not None
         if self._config.node_id not in members:
-            if holds:
-                server.shutdown_shard(shard_id)
-            return
+            if not holds:
+                return []
+            server.shutdown_shard(shard_id)
+            return [self._config.node_id]
         if holds and server.shard_replica_ids(shard_id) == members:
-            return
+            return []
+        closed = [self._config.node_id] if holds else []
         if holds:
             server.shutdown_shard(shard_id)
         server.add_shard(shard_id, members=members)
+        return closed
 
 
 class ClusterNode:
