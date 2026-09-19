@@ -97,7 +97,7 @@ class RecoveryView(Protocol):
     def unfreeze(self, shard_id: int) -> None: ...
     def leader_client(self, shard_id: int) -> Optional[NodeClient]: ...
     def serving_nodes(self, shard_id: int) -> List[int]: ...
-    def ensure_serving(self, shard_id: int, nodes: List[int]) -> None: ...
+    def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]: ...
     def apply_split_locally(self, shard_id: int, split_key: bytes,
                             new_shard_id: int) -> None: ...
     def metadata(self): ...
@@ -130,11 +130,15 @@ class RecoveryView(Protocol):
   table, as in an in-process test - this cluster's own answer.  It is how a cluster that
   comes back learns how far a move got, so it is a read of the table and of nothing local.
 * **`ensure_serving(shard_id, nodes)`** - make what this process holds match that set:
-  build its member of the group if it is in the set and holds nothing, close and set aside
-  its member if it holds one and is not.  It also becomes this cluster's own answer for who
-  serves the shard, which is what the publisher follows: the replica set and the addresses
-  it publishes are read from the group this process holds, so closing one stops both from
-  naming this process - see the last constraint in section 5.  Idempotent.
+  build its member of the group if it is in the set and holds nothing, close its member if
+  it holds one and is not.  It also becomes this cluster's own answer for who serves the
+  shard, which is what the publisher follows: the replica set and the addresses it
+  publishes are read from the group this process holds, so closing one stops both from
+  naming this process - see the last constraint in section 5.  What it returns is the nodes
+  whose group it closed, which is how a caller that ran twice tells a call that did
+  something from one that found the work already done.  What a close leaves on disk - the
+  group's storage, put aside under an orphan name rather than deleted - is the cluster
+  side's half of this and is not written on the process side yet.  Idempotent.
 * **`apply_split_locally(shard_id, split_key, new_shard_id)`** - the range map this process
   routes by becomes the new one, so that the publisher sees a cluster that agrees with the
   table rather than one mid-split.  Idempotent.
@@ -166,10 +170,15 @@ thirteen and the three land like this:
 * `_freeze_shard`, `_unfreeze_shard` - `freeze` and `unfreeze`.
 * `_drain_shard` - internal: waiting out the writes admitted before the freeze belongs to
   the recovery's own protocol, not to the view.
-* `_serving_nodes`, `_placed_shards` - `serving_nodes` to read, and this cluster's own half
-  of `ensure_serving` to write.
-* `_ensure_shard`, `_ensure_group_on`, `_retire_source`, `_close_group_on` - all four are
-  `ensure_serving`, which is one call for both directions.
+* `_serving_nodes` - `serving_nodes`, under the interface's name.  `_placed_shards` is what
+  it reads, and it is written where the routing table is: by `_commit_move`, when the table
+  has agreed, and never by `ensure_serving`.
+* `_ensure_shard`, `_retire_source` - `ensure_serving`, which is one call for both
+  directions.  `_close_group_on` is what it closes through.  `_ensure_group_on` is *not*
+  part of it, and the reason is the one asymmetry between the two implementations: that
+  call builds a group a move is still copying into, so it closes nothing and takes the
+  target nodes as its members while the source is still the group the table names.  A
+  process is never in that state, because it holds one of the two groups rather than both.
 * `_rename_storage`, `orphan_dirs` - internal to `ensure_serving`: putting storage aside is
   what closing a group means, and remembering what was set aside is the view's business.
 * `_leader_on`, `_wait_for_leader_on`, `_wait_for_shard_leader`, `_shard_leader_node` -
@@ -202,9 +211,11 @@ Becomes the view (public, one implementation of `RecoveryView`):
 * `shard_ids`, `range_map`, `metadata_client` and `get_shard_server` already exist and
   already mean what the interface means.
 * `serving_nodes(shard_id)` is `_serving_nodes` under the interface's name.
-* `ensure_serving(shard_id, nodes)` is `_ensure_group_on` + `_retire_source` +
-  `_close_group_on` + the write to `_placed_shards`, in the order `_commit_move` does
-  them today.
+* `ensure_serving(shard_id, nodes)` is `_retire_source` + `_close_group_on` + a build
+  for every node that holds nothing, in the order `_commit_move` does them today.  The
+  write to `_placed_shards` stays where it is, at the front of `_commit_move`: that is the
+  routing table's placement and it moves when the table does, so it is the one thing this
+  call must not touch.
 * `freeze` / `unfreeze` are `_freeze_shard` / `_unfreeze_shard` for the whole group.
 * `leader_client(shard_id)` is a `ShardLeaders` over the cluster's own nodes with a
   `LocalNodeClientFactory` - which is the same object the coordinator and the resolver
@@ -216,7 +227,7 @@ Becomes the view (public, one implementation of `RecoveryView`):
 Stays internal (helpers the recovery calls through the view, or uses itself):
 
 * `_shard_nodes`, `_nodes_on`, `_addresses_on`, `_drain_shard`, `_rename_storage`,
-  `_close_group_on`, `_retire_source`, `_shard_leader_node`, `_wait_for_leader_on`,
+  `_close_group_on`, `_ensure_group_on`, `_shard_leader_node`, `_wait_for_leader_on`,
   `_wait_for_shard_leader`, `_shard_leader_on`, `_load_split_record`,
   `_load_migration_record`, `_remember_*`, `_forget_*`.
 * `_finish_split`, `_publish_split`, `_copy_what_is_missing`, `_finish_move`,
@@ -300,8 +311,9 @@ to respect:
   guards on `get_shard_node(shard_id) is None` and `ensure_serving` has to keep that
   guard; the `add_shard` that already carries `members=` is otherwise exactly right.
 * A process does not learn its shards from the table.  It serves the `--num-shards` shards
-  it was started with, every node serving all of them, which is also why `_ensure_shard`
-  exists for a split's new shard: the shard the recovery is finishing may not be one this
+  it was started with, every node serving all of them, which is also why a split's new
+  shard has to be built by a step of its own: the shard the recovery is finishing may not
+  be one this
   node was started with.  The process side needs the same step, and `shard_ids()` cannot be
   the table's list.  A shard the node was not started with is a group it has to build, so
   this is `ensure_serving`'s other half - and the port for it is the segment's, up to the
