@@ -56,6 +56,14 @@ is what makes them evidence that the behaviour did not move with the code.  Read
 way, it is the answer to "did this change the tests?": adding an argument to a spy is not
 changing a test, and relaxing what it claims is.
 
+One thing is decided and deliberately not done yet, written down so that it is not
+decided twice.  The lists of what is owed are going to be two lists with one rule between
+them: an entry that has a finished state is a *gap*, and an entry only a change to the
+shape of the system could cross is a *boundary*.  The re-sort waits for the recovery's
+interface to exist, because that interface brings boundaries of its own - so until then an
+entry may be in the list it does not belong to, and this paragraph is the promise that it
+was thought about rather than missed.
+
 ## Invariants
 
 Five things that are true of this system's shape rather than of any one change, each
