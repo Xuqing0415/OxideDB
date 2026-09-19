@@ -158,6 +158,17 @@ implementation reaching through `leader_client`.
 
 ## 3. Where the thirteen primitives went
 
+**The rule that decides what can be in the interface at all: a `RecoveryView` method's
+arguments and its answer have to be values that cross a process boundary.**  A method
+that returns a node object - `_shard_leader_node`, `_wait_for_shard_leader`, `_leader_on`
+- cannot be implemented on the process side, and not because it would be awkward there: a
+process holds its own `ShardServer` and the shard's leader may be inside another one, so
+there is no object to return.  That is a type-level impossibility rather than a
+preference, and it is what turned `_shard_leader_node` into `leader_client(shard_id)` - a
+handle on whatever leads the shard, wherever it is.  A method that names
+`MemoryRaftNode` is not an interface method, and that check comes before any question
+about how wide the interface is.
+
 The differential was thirteen primitives only `ShardedRaftCluster` has, nine both sides
 already have, and three neither has.  The nine go straight in (`shard_ids`, `range_map`,
 `metadata_client`, `get_shard_server`, `shard_replica_ids`, `shard_addresses`,
@@ -182,7 +193,13 @@ thirteen and the three land like this:
 * `_rename_storage`, `orphan_dirs` - internal to `ensure_serving`: putting storage aside is
   what closing a group means, and remembering what was set aside is the view's business.
 * `_leader_on`, `_wait_for_leader_on`, `_wait_for_shard_leader`, `_shard_leader_node` -
-  `leader_client`, with the waiting inside it and a deadline on that wait.
+  `leader_client`, with the waiting inside it and a deadline on that wait.  The test
+  that wait makes is one the client service already has a call for:
+  `has_committed_in_its_own_term` and `NodeClient.follower_read_index` are the same
+  question - may this leader answer a linearizable read yet - because `_read_index`
+  answers it by collecting a quorum of acknowledgements of the current term, which is
+  what the node's own flag reports.  So the wait is a retry of a call that exists rather
+  than a new one.
 * `_rows_above`, `_committed_rows`, `_locks_in_range` - internal, over
   `leader_client(shard_id).scan(...)`.
 * `_move_row`, `_copy_rows` - internal, over `leader_client(...).propose(...)` and
@@ -283,11 +300,32 @@ both turn out to be expressible with them:
   `_last_applied_timestamp`; over the wire that is `NodeClient.scan(start, end)` with no
   timestamp, which is a leader read at the newest versions.  The same rows.
 * *The version a row already is.*  `_copy_rows` skips a row whose target version is
-  already at the source's timestamp, which is what makes the copy idempotent, and the
-  wire's `scan` carries key and value only.  The version is recoverable:
-  `get_write_record(key)` on each side, compared by `commit_ts`, which is the timestamp
-  the row's version has.  One extra call per row on the side being copied into, and the
-  one place a batched primitive would pay - noted in section 6 rather than built.
+  already at the source's timestamp, which is what makes the copy idempotent, and
+  `_move_row` stamps the `SET` with that same timestamp, because a row re-stamped with
+  the moment of the move is the newest thing that has ever happened to the key.  **The
+  wire cannot answer it, and the route this section first claimed is not a route.**
+  `scan` answers key and value (`KeyValuePair`) and nothing else; a write record is
+  written by a transaction's commit and by a moved row, and by nothing else - a plain
+  `SET` writes a version and no record at all - so a row the SQL path wrote has a version
+  and nothing to read it from.  `_move_row` already assumes the two can differ: it takes
+  `timestamp` from the version and its `start_ts` from the record only when the record's
+  `commit_ts` matches the version.  This is the one thing the six calls cannot express,
+  so the copy cannot move onto `leader_client` until the client service carries the
+  version.  The open decision below is that, and it is in front of the recovery rather
+  than behind it.
+
+* *What a lock in the range means.*  `_committed_rows` reads the storage's version space,
+  and a write intent is not in it: an intent is a lock, and a lock is not a version, so
+  the read answers straight through one.  The state machine's own `scan` - the one the
+  wire reaches - refuses with `ScanRefused` when a lock it cannot judge is in the range.
+  `split_shard` and `move_shard` never meet the difference, because both check
+  `_locks_in_range` before they read; `recover_splits` and `recover_migrations` do not.
+  So the rewrite would change what a recovery does about a lock it finds, from copying
+  the version behind it to refusing to read.  Refusing is the one that matches section 6
+  - no answer, so the shard stays frozen and is asked again - but it is a decision rather
+  than a consequence, and the question under it comes first: whether the recovery paths
+  should be looking for locks at all, given that the two calls that begin a split or a
+  move already do.
 * The command is a `serialize_command(CommandType.SET, ...)` call with the value's
   timestamp and the write record's `start_ts`, and it is a module-level function in
   `oxidedb/raft/state_machine.py` for exactly this reason: "those bytes have to be the same
@@ -358,6 +396,25 @@ to respect:
   close visible are held by `tests/test_ensure_serving.py`, and the table that stays right
   because of them by `tests/test_metadata_wiring.py`.
 
+**Open decision: how the version reaches a caller.**  The recovery needs, per row, the
+timestamp of the source's newest committed version and the version the target already
+holds, and the client service answers neither today.  Two shapes:
+
+* *A stamped read*, with the version travelling in the answer: a `version_ts` on
+  `GetResponse` and on `KeyValuePair`, so a `scan` returns rows as key, value and
+  version.  No new call, no new refusal, additive on the wire, and `_move_row` keeps
+  taking its `start_ts` from `get_write_record` exactly as it does now.
+* *A call of its own*, `version_of(key)`, beside `get_write_record`: the same
+  information, one more method on `NodeClient` and one more RPC, for a reader that wants
+  the version and not the value.
+
+The first is smaller, and it is the one this document assumes.  What it may not be is a
+change slipped in with the copy.  It is the first widening of the client service, which
+is the place `docs/design.md` already says its open decision about the refusal family is
+due, and the two should be taken together even though this one adds no code - a recovery
+that cannot read a version cannot run at all, so this widening is not after the
+recovery, it is in front of it.
+
 ## 6. Order, failure, tests
 
 **Order.**  The launcher's `ClusterNode.start` becomes the cluster's `start`, in the
@@ -416,8 +473,9 @@ intermediate state the mover left it in - the one state that cannot lose a row.
    (section 1) - so it is the test that arrives with whatever adds one, and until then
    layer 2 is what covers the path.
 
-**One thing deliberately not built.**  The copy costs one `get_write_record` per row on
-the side it is copying into, which is a round trip a batched primitive would remove.  A
-batch belongs in the client service's next widening, with the wire's refusal carrier
-that is already owed there - not in this change, which is about which code runs the
-recovery rather than about what it costs.
+**One thing deliberately not built.**  The copy costs one read per row on the side it is
+copying into, which is a round trip a batched primitive would remove - but the batched
+primitive is not this change's subject and neither is the version-stamped read it would
+be built on: that is the open decision at the end of section 5, and it is what has to
+land before a recovery can copy a row across processes at all.  What is deliberately not
+built here is only the batching, for the reason it always was.
