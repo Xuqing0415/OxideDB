@@ -5,6 +5,53 @@ the way it is: the decisions behind the keyspace encoding, the snapshot, the
 two-phase commit protocol and the read path, and what each one buys.  File
 references point at the code that implements the decision.
 
+## Invariants
+
+Five things that are true of this system's shape rather than of any one change, each
+found while trying to change something around it and none of them written down until
+now.  They are here to be checked against rather than to be admired: nearly every bug
+this repository has had is one of them being violated somewhere, which is why they sit
+in front of the decisions they constrain.
+
+**The version space holds no write intent.**  An intent is a lock, in a key space of its
+own (`MVCCStorage.put_lock`, under `_LOCK`); a version is a row a commit published
+(under `_VERSION`).  Two consequences, and the second is the one that gets forgotten: a
+read at a timestamp cannot see a write that has not committed, and *a scan of the
+version space cannot see one either*.  That is what makes it safe to read a shard's
+rows at one moment and copy them somewhere else - Raft is what makes them applied, and
+this is what makes them committed.  A change that folded intents into the version space
+- a read-your-writes optimisation, say - would break the copy silently, with nothing to
+report until the rows were already somewhere else and wrong.
+
+**A value travels with the version it is.**  Everywhere the client service hands out a
+value - `GetResponse` for one key, `KeyValuePair` for a row of a scan - it carries the
+timestamp that value was written at (`commit_ts`), and 0 says there is none.  There is
+deliberately no way to ask for the value alone: a caller holding a value without its
+version could put it somewhere else and be wrong in a way nothing reports.  A lock's
+value is the exception, and is not a version at all - an intent has no `commit_ts` to
+carry, which is the same fact as the first invariant seen from the other side.
+
+**`has_committed_in_its_own_term` is `follower_read_index`.**  Two names for one
+question: has this leader confirmed an entry of its own term with a quorum, so that a
+read it serves is linearizable.  `_read_index` answers it by collecting those
+acknowledgements and the node's own flag reports the same thing, so a caller about to
+add a call for one of the two should check whether the other already is it.
+
+**A `RecoveryView` method's arguments and its answer cross a process boundary.**  No
+method that names `MemoryRaftNode` can be in that interface, because a process holds
+its own shard server and the leader of a shard may be inside another one: there is no
+object to return.  That is a type-level impossibility rather than a preference, and it
+is what turned `_shard_leader_node` into `leader_client(shard_id)`.  The check comes
+before any question about how wide the interface is.
+
+**One call re-maps one range.**  `locate` answers a key that falls outside every range
+by handing it to shard 0, silently - that is its fallback, not an error.  So a split
+that moved its ranges in two steps would have a window in which the keys of a live
+range were routed back to the shard that had just given them away, with nothing failing
+and the wrong shard answering.  `apply_split_locally` is one call for precisely this
+reason: the side that holds the table does the whole re-mapping at once, so no window
+exists for a key to be misrouted in.
+
 ## 1. The keyspace: a namespace byte, a separator, a timestamp
 
 Four logical keyspaces share one byte-ordered engine.  Each one starts with a
