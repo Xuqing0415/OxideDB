@@ -103,9 +103,12 @@ class RecoveryView(Protocol):
     def metadata(self): ...
 ```
 
-* **`shard_ids()`** - the shards this process holds a replica of.  The set the notes are
-  looked for in, and never the table: a process does not learn its shards from the table
-  (section 5).  A read, not a step.
+* **`shard_ids()`** - the shards this process looks after: the keys of its range map,
+  which is the set the notes are looked for in, and never the table - a process does not
+  learn its shards from the table (section 5).  Deliberately not "the shards it holds a
+  group for": that is a different question, an implementation answers it from its groups
+  rather than from its range map, and it is the one `ensure_serving` is there to change.
+  A read.
 * **`ranges()`** - the ranges this process believes in, the source shard's included.  A
   split needs the range it is splitting, a move needs the range it is copying.  A read.
 * **`note(shard_id)`** - the split or the move a replica this process holds wrote down, as
@@ -129,7 +132,9 @@ class RecoveryView(Protocol):
 * **`ensure_serving(shard_id, nodes)`** - make what this process holds match that set:
   build its member of the group if it is in the set and holds nothing, close and set aside
   its member if it holds one and is not.  It also becomes this cluster's own answer for who
-  serves the shard, which is what the publisher follows.  Idempotent.
+  serves the shard, which is what the publisher follows: the replica set and the addresses
+  it publishes are read from the group this process holds, so closing one stops both from
+  naming this process - see the last constraint in section 5.  Idempotent.
 * **`apply_split_locally(shard_id, split_key, new_shard_id)`** - the range map this process
   routes by becomes the new one, so that the publisher sees a cluster that agrees with the
   table rather than one mid-split.  Idempotent.
@@ -320,18 +325,26 @@ to respect:
   bound is `SHARD_SEGMENT`, which `ClusterConfig.validate` refuses a configuration above.
   What is still missing is the same check on the split itself: it is the split that would
   want shard `SHARD_SEGMENT` and find the routing table's group there.
-* **A group `ensure_serving` closes does not change what the view says it holds.**  The
-  members half of the call follows: `add_shard(members=...)` writes them down and
-  `shard_replica_ids` reads them back.  The holding half does not.  With shard 0 closed on
-  node 3 and the call told `[1, 2]`, `NodeClusterView` still answers `shard_ids() == [0]`,
-  `shard_replica_ids(0) == [3]` (a closed group leaves no peers to list, and the shard
-  server's own answer always names itself) and `shard_addresses(0)` still naming this node
-  at the port it just stopped listening on.  A publisher running on that node would put it
-  in the table as a replica of a shard it does not serve, which is the one thing section 1
-  says a routing table must not do.  Which of the two ways out it takes - the view answers
-  from the groups it holds, or whoever closes a group also stops routing to its range - is
-  a decision for the recovery rather than a detail of `ensure_serving`, and one of the two
-  has to be in place before a recovery can close anything.
+* **A group `ensure_serving` closes stops being a shard the view names.**  The members
+  half of the call follows for free: `add_shard(members=...)` writes them down and
+  `shard_replica_ids` reads them back.  The holding half has to be asked of the group
+  rather than of the range map, and that is the half this constraint is about.  The range
+  map stays as it is, and should: `shard_ids` still names the shard, because the range map
+  is what a node routes by and what it reads its pending-split notes by, so a shard's own
+  note has to stay reachable through it - and a note is written on every replica, so a
+  node that stopped looking after the shard would stop finding the split.  What changes is
+  the two answers the table is written from: `shard_replica_ids` and `shard_addresses`
+  read the group this process holds, and answer nothing for a shard whose group was
+  closed.  Asked the other way, a close left the view still naming this node -
+  `shard_replica_ids(0) == [3]`, a closed group having no peers to list while the shard
+  server's own answer always names itself, and `shard_addresses(0)` naming the port it had
+  just stopped listening on - and a publisher on that node would have written it into the
+  table as a replica of a shard it does not serve, which is the one thing section 1 says a
+  routing table must not do.  A *fresh* publisher is what finds this, which makes it worse
+  rather than better: a node that has just come back has published nothing yet, so the
+  shard it just closed is one it has every licence to write.  The two answers that make a
+  close visible are held by `tests/test_ensure_serving.py`, and the table that stays right
+  because of them by `tests/test_metadata_wiring.py`.
 
 ## 6. Order, failure, tests
 
