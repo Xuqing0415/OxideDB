@@ -377,7 +377,7 @@ class RecoveryRunner:
         self._view.remember_note(note)
         self._pending_splits[pending["shard_id"]] = pending
 
-    def finish_split(self, pending: Dict[str, Any]) -> bool:
+    def finish_split(self, pending: Dict[str, Any], source: NodeClient) -> bool:
         """Copy what the new shard is missing, then tell the routing table.
 
         Called for the first attempt and for every retry of it.  A retry that finds rows
@@ -387,8 +387,15 @@ class RecoveryRunner:
         that is already there is the row, and copying it again would be work for nothing.
         What is left is the proposal, which the group recognises as the split it already
         applied.
+
+        ``source`` is the handle the caller read the shard's rows through, handed in rather
+        than found here: the copy reads the versions of those same rows back out of that
+        same group, and a lookup of its own would be a second answer to a question that
+        already has one - the two agree only for as long as the node that gave the first
+        is still the leader.  The move's body has had this shape since it moved:
+        :meth:`finish_move` takes its source and hands it to :meth:`_copy_rows`.
         """
-        if not self._copy_what_is_missing(pending):
+        if not self._copy_what_is_missing(pending, source):
             return False
 
         if not self._publish_split(pending):
@@ -555,9 +562,10 @@ class RecoveryRunner:
             return False
 
         pending["rows"] = self._rows_above(source, shard_id, pending["split_key"])
-        return self.finish_split(pending)
+        return self.finish_split(pending, source)
 
-    def _copy_what_is_missing(self, pending: Dict[str, Any]) -> bool:
+    def _copy_what_is_missing(self, pending: Dict[str, Any],
+                              source: NodeClient) -> bool:
         """Move the rows of the right half that the new shard does not already hold.
 
         A retry starts from whatever the process that died had managed to copy, so the
@@ -589,8 +597,14 @@ class RecoveryRunner:
         # to it by a test that reads this body (``tests/test_copy_row.py``) rather than by
         # a check here: the four outcomes of a split are about the work, and a bug filed
         # as one more attempt is a bug that gets retried instead of fixed.
+        #
+        # The source is the other way round, and is not looked up here at all: it is the
+        # caller's handle, the one the shard's rows were read through, and what the
+        # versions below are read back through.  One answer to one question - where a
+        # lookup here would be a second, agreeing only while the leader that gave the
+        # first still leads.  The same scan of this body holds the copy to that: it may
+        # name neither lookup, and the caller passes what it has.
         target = self._wait_for_group(new_shard_id, self._view.node_ids())
-        source = self._view.leader_client(pending["shard_id"])
         if target is None or source is None:
             self._last_split_error = (f"shard {new_shard_id} or "
                                       f"{pending['shard_id']} has no leader")

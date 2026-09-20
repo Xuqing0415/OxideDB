@@ -661,7 +661,8 @@ class ShardedRaftCluster:
                 # A different split of a shard that is already half-split.  There is no
                 # answer this could give that would not lose one of the two.
                 return False
-            return self._recovery_runner.finish_split(pending)
+            return self._recovery_runner.finish_split(
+                pending, self.leader_client(shard_id))
 
         old_range = self._range_map.get(shard_id)
         if old_range is None:
@@ -712,7 +713,8 @@ class ShardedRaftCluster:
             self.ensure_serving(new_shard_id, sorted(self._shard_servers))
 
             copied = True
-            return self._recovery_runner.finish_split(pending)
+            return self._recovery_runner.finish_split(
+                pending, self.leader_client(shard_id))
         finally:
             if not copied:
                 # Nothing of this split exists anywhere, so there is nothing a write

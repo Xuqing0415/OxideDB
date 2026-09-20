@@ -35,8 +35,15 @@ test, in the spirit of ``tests/test_client_boundary.py``, and it is one because 
 copy here cannot turn the mistake red: this cluster answers a shard it has no entry for with
 every node it holds, and the group a split just built is one of them.  What a process is
 answered with, for the same code, is None.  The body is read instead, and read for the
-argument as well as for the name - the copy asks for the source by id too, and is right to,
-because the source is a shard the routing table does name.
+argument as well as for the name: what the scan is about is which shard id a lookup is
+handed, and not which of the two names appears anywhere.
+
+The source is not a lookup at all.  It is passed in: the caller read the shard's rows
+through a client, and the copy reads the versions of those rows back through the same one,
+so a lookup in this body would be a second answer to a question that already has one - one
+that agrees with the first only for as long as the node that gave the first still leads.
+The scan reads the signature for that too, and reads that the range read goes through the
+handle it was handed rather than through one it went and got.
 """
 
 import ast
@@ -430,6 +437,71 @@ def test_the_lookup_by_node_set_never_falls_back_to_the_shard_id():
                   _calls(RUNNER_SOURCE.read_text(encoding="utf-8"), "_wait_for_group")]
     assert BY_NODES in attributes
     assert BY_ID not in attributes
+
+
+def _looked_up(source):
+    """The lines of the copy where the source is looked up rather than handed in."""
+    return [(line, attribute) for line, attribute, _ in _calls(source, "_copy_what_is_missing")
+            if attribute in (BY_ID, BY_NODES)]
+
+
+def _read_versions_through(source):
+    """What the copy's range read is made on: the expression before the call."""
+    found = []
+    for node in ast.walk(_definition(source, "_copy_what_is_missing")):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "scan_versions"):
+            found.append(ast.unparse(node.func.value))
+    return found
+
+
+def test_the_copy_is_handed_the_source_it_reads_versions_through():
+    """Read off the body, because a second lookup here agrees with the first until it does not.
+
+    The rows the copy is about were read out of the source by the caller, which is the call
+    that waited for the shard's leader; the versions the copy stamps them with are read back
+    out of the same group through the same handle.  A lookup in this body would be a second
+    question to the cluster with the same answer only while the leader holds - the shape
+    ``_resume_split`` and ``finish_move`` were both fixed out of, and the shape a copy that
+    reached for its own client would go back to.
+
+    What is read is the signature and the body: the source arrives as a parameter, neither
+    lookup is named in the body at all, and the range read goes through the parameter.
+    """
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    assert _looked_up(source) == []
+
+    parameters = [argument.arg
+                  for argument in _definition(source, "_copy_what_is_missing").args.args]
+    assert parameters == ["self", "pending", "source"], parameters
+
+    assert _read_versions_through(source) == ["source"]
+
+
+def test_the_scan_catches_a_copy_that_looks_its_source_up():
+    """The control: the same body with a lookup of its own back in it is caught.
+
+    Without this, the test above would pass just as well if the scan were reading the wrong
+    method, or reading nothing at all.
+    """
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    waited_for = "        target = self._wait_for_group(new_shard_id, self._view.node_ids())\n"
+    assert source.count(waited_for) == 1
+
+    looked_up = '        source = self._view.leader_client(pending["shard_id"])\n'
+    assert _looked_up(source.replace(waited_for, looked_up + waited_for)) != []
+    assert _looked_up(source) == []
+
+    # The same two anchors are in the move's copy - one range read each, one handle each -
+    # so the one this body owns is told apart by the shard it reads the range of.
+    read = ("""        start, end = self._view.range_map()[pending["shard_id"]]
+        versions = {key: version
+                    for key, _, version in source.scan_versions(start, end)}""")
+    assert source.count(read) == 1
+    fetched = read.replace("source.scan_versions",
+                           "source_of_its_own().scan_versions")
+    assert _read_versions_through(source.replace(read, fetched)) == ["source_of_its_own()"]
+    assert _read_versions_through(source) == ["source"]
 
 
 def test_the_scan_catches_the_group_filled_asked_for_by_id():
