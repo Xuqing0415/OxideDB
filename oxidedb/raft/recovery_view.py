@@ -213,6 +213,26 @@ class RecoveryView(Protocol):
         the group it is being asked to join.  Idempotent.
         """
 
+    def close_group_on(self, shard_id: int, nodes: List[int]) -> List[int]:
+        """Close this side's member of the group on exactly ``nodes``, and build nothing.
+
+        The other half of :meth:`ensure_group_on`, and the half of :meth:`ensure_serving`
+        that closes, but not a synonym for that call: the set is the caller's, where
+        ``ensure_serving`` answers to the set the *routing table* names - which is the
+        table's answer and not the caller's, and takes in building on its nodes as well.
+
+        The caller is a move the routing table refused.  A refusal says no and does not
+        say what the table names instead: it may name a set that is neither of the two
+        the move was about, and it may have no entry at all.  So the shard goes back to
+        serving with the group it had, and the one group to take down is the one built to
+        receive the rows - the only group this call is entitled to name.  Mending to any
+        other set would be the opposite of what is wanted: it would close the groups of
+        the set the table does name, on behalf of a move that has just failed.
+
+        What it returns is the nodes whose group it closed, so a caller that ran twice can
+        tell one that did something from one that found the work already done.  Idempotent.
+        """
+
     def apply_split_locally(self, shard_id: int, split_key: bytes,
                             new_shard_id: int) -> None:
         """Re-range this side: ``shard_id`` now ends at ``split_key``, the new one starts.

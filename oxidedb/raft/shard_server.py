@@ -1343,6 +1343,17 @@ class ShardedRaftCluster:
         """
         self._ensure_group_on(nodes, shard_id)
 
+    def close_group_on(self, shard_id: int, nodes: List[int]) -> List[int]:
+        """Close the group on exactly these nodes, and put their storage aside.
+
+        The set is the caller's and the routing table is not: the placement is read by
+        :meth:`serving_nodes` and this call does not go near it, where
+        :meth:`ensure_serving` answers to whatever the table names.
+
+        See :class:`RecoveryView.close_group_on`.
+        """
+        return self._close_group_on(nodes, shard_id)
+
     def _ensure_group_on(self, node_ids: List[int], shard_id: int) -> None:
         """Make sure every node of ``node_ids`` is holding a group for ``shard_id``.
 

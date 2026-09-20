@@ -22,10 +22,13 @@ because that is where a closed group went wrong - the range map still named the 
 and the shard server still named this node, so a node that had just stopped serving a
 shard would have been written into the table as a replica of it.
 
-The last test is the boundary of this call rather than a case of it: what a cluster
-answers to "who serves this shard" is the routing table's placement, `ensure_serving`
-must not write it, and the call that does is `apply_move_locally`.  The two disagree
-for the length of a move's drain window on purpose.
+The last two tests are about the boundaries of this call rather than cases of it.  What
+a cluster answers to "who serves this shard" is the routing table's placement, so
+`ensure_serving` must not write it, and the call that does is `apply_move_locally` - the
+two disagree for the length of a move's drain window on purpose.  The other boundary is
+`close_group_on`, which is this call's closing half with the set named by the caller: a
+refused move takes down the group it built and mends to nothing, which is not something
+`ensure_serving` can be asked for, because it answers to the set the table names.
 """
 
 import os
@@ -338,6 +341,44 @@ def test_the_cluster_closing_twice_is_closing_once(tmp_path):
 
         assert cluster.ensure_serving(0, [1, 2]) == []
         assert cluster.orphan_dirs() == orphans, "and nothing else was put aside"
+    finally:
+        cluster.shutdown()
+
+
+def test_closing_a_set_takes_those_groups_and_mends_to_nothing(tmp_path):
+    """A move the table refused, which is the caller this call was drawn for.
+
+    The group built to receive the rows has to go, and nothing else may: a refusal does not
+    say what the routing table names instead, so mending to a set - which is what
+    ``ensure_serving`` does, over the set the table names - would take down the groups of a
+    set the table does name, on behalf of a move that has just failed.  What pins the
+    difference is one set given to the two calls: this one closes exactly the nodes it was
+    handed and leaves the rest holding the groups they had, where ``ensure_serving`` would
+    have closed every holder outside its set.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        cluster.ensure_serving(A_SHARD_NOBODY_STARTED_WITH, [1, 2, 3])
+        started_with = {node_id: cluster.get_shard_server(node_id).get_shard_node(
+                        A_SHARD_NOBODY_STARTED_WITH) for node_id in (1, 2, 3)}
+        placement = cluster.serving_nodes(A_SHARD_NOBODY_STARTED_WITH)
+
+        assert cluster.close_group_on(A_SHARD_NOBODY_STARTED_WITH, [2]) == [2]
+
+        assert _holders(cluster, A_SHARD_NOBODY_STARTED_WITH) == [1, 3], \
+            "exactly the nodes named, and no others"
+        for node_id in (1, 3):
+            assert cluster.get_shard_server(node_id).get_shard_node(
+                A_SHARD_NOBODY_STARTED_WITH) is started_with[node_id], \
+                "a node outside the set keeps the group it had"
+        assert cluster.serving_nodes(A_SHARD_NOBODY_STARTED_WITH) == placement, \
+            "the placement is the routing table's, and this call does not write it"
+        assert cluster.close_group_on(A_SHARD_NOBODY_STARTED_WITH, [2]) == [], \
+            "a group that is already closed is an answer rather than an error"
+        orphans = cluster.orphan_dirs()
+        assert len(orphans) == 1, "one directory aside, for the group that went"
+        assert os.path.basename(orphans[0]).startswith(
+            f"orphan-shard-{A_SHARD_NOBODY_STARTED_WITH}-")
     finally:
         cluster.shutdown()
 

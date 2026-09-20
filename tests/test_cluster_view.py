@@ -1,8 +1,8 @@
 """A cluster is a recovery view: every call the protocol names, taking what it says.
 
 ``isinstance`` against a ``runtime_checkable`` protocol asks whether the names are there
-and nothing else.  A class with seventeen methods of the right names and the wrong
-arguments passes it, and fails the first time a recovery calls one - in the one code path
+and nothing else.  A class whose methods have the right names and the wrong arguments
+passes it, and fails the first time a recovery calls one - in the one code path
 that only runs after a crash.  So the gate is asked here twice: once as ``isinstance``,
 and once by comparing what each call takes with what the protocol says it takes.
 

@@ -109,6 +109,7 @@ class RecoveryView(Protocol):
     def unfreeze(self, shard_id: int) -> None: ...
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]: ...
     def ensure_group_on(self, shard_id: int, nodes: List[int]) -> None: ...
+    def close_group_on(self, shard_id: int, nodes: List[int]) -> List[int]: ...
     def apply_split_locally(self, shard_id: int, split_key: bytes,
                             new_shard_id: int) -> None: ...
     def apply_move_locally(self, shard_id: int, nodes: List[int]) -> None: ...
@@ -185,6 +186,15 @@ class RecoveryView(Protocol):
   holding that shard are not any one replica set: a cluster holds both groups, and this is
   how it builds the second; a process holds one, and this is the whole of what it does
   about the group it is being asked to join.  Idempotent.
+* **`close_group_on(shard_id, nodes)`** - close this side's member of the group on
+  exactly `nodes`, and build nothing.  The other half of `ensure_group_on` and the
+  closing half of `ensure_serving`, but not that call: the set is the caller's,
+  where `ensure_serving` answers to the set the routing table names - and builds
+  on its nodes as well.  The caller is a move the table refused, and a refusal
+  does not say what the table names instead, so the only group to take down is
+  the one built to receive the rows; mending to any other set would close the
+  groups of the set the table does name.  Returns the nodes whose group it
+  closed.  Idempotent.
 * **`apply_split_locally(shard_id, split_key, new_shard_id)`** - the range map this process
   routes by becomes the new one, so that the publisher sees a cluster that agrees with the
   table rather than one mid-split.  A move's second write has the call beside this one,
@@ -271,7 +281,9 @@ thirteen and the three land like this:
   it reads, and it is written where the routing table is: by `apply_move_locally`, which
   `_commit_move` calls once the table has agreed, and never by `ensure_serving`.
 * `_ensure_shard`, `_retire_source` - `ensure_serving`, which is one call for both
-  directions.  `_close_group_on` is what it closes through.  `_ensure_group_on` is *not*
+  directions.  `_close_group_on` is what it closes through, and it is `close_group_on`
+  as well: a refused move takes down the group it built and mends to nothing, which is
+  not what answering to the table's set would do.  `_ensure_group_on` is *not*
   part of it, and the reason is the one asymmetry between the two implementations: that
   call builds a group a move is still copying into, so it closes nothing and takes the
   target nodes as its members while the source is still the group the table names.  A
