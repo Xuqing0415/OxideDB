@@ -40,6 +40,17 @@ message GetRequest {
     // The snapshot to read at.  Unset reads the newest version; a transaction passes
     // its own start_ts and must see exactly the snapshot it started with.
     optional int64 timestamp = 2;
+    // The index the answer has to reflect.  A server given one waits until its own
+    // state machine has applied that index before it reads, which is what lets a node
+    // holding a copy answer a read at all: the index comes from the leader, so the
+    // answer is as of the request without the answering node having to lead anything.
+    //
+    // Unset leaves the choice to the server - a leader confirms a quorum and reads at
+    // its commit index, a follower refuses - which is what a caller that names no index
+    // gets.  That is also why it is optional rather than a 0 read as unset: 0 is not a
+    // position a log has been applied at, and a field whose "not set" is a magic value
+    // is a contract the next reader has to be told rather than read.
+    optional int64 read_index = 3;
 }
 
 message GetResponse {
@@ -53,12 +64,21 @@ message GetResponse {
     // them, so a read of one carries the same thing a scan carries beside each row.
     // It says nothing unless value is set.
     int64 commit_ts = 5;
+    // The index this answer was read at.  A read always happens at one - the commit
+    // index the server confirmed, or the index the caller named - so a server always
+    // has one to send, and a caller that named an index can check that the answer is
+    // new enough.  It is not a version: nothing about it is stamped onto the value,
+    // and a snapshot read asked for by timestamp is still answered at whatever index
+    // has been applied.
+    int64 read_index = 6;
 }
 
 message ScanRequest {
     bytes start_key = 1;
     bytes end_key = 2;
     optional int64 timestamp = 3;
+    // See GetRequest.read_index: the same wait, at the same index, for a range.
+    optional int64 read_index = 4;
 }
 
 message KeyValuePair {
@@ -91,6 +111,9 @@ message ScanResponse {
     // is why the local scan raises instead of answering - the key is what the caller
     // needs to resolve it.
     optional bytes locked_key = 5;
+    // See GetResponse.read_index: the index the range was read at.  The rows carry the
+    // versions they are at; this is how far the log the reader looked at had got.
+    int64 read_index = 6;
 }
 
 message ProposeRequest {
