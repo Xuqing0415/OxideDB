@@ -5,6 +5,18 @@ same six calls on a port, so that a caller in another process meets the same sha
 translation is deliberately thin: the servicer holds a ``LocalNodeClient`` for its node
 and does nothing to an answer except put it in a message and classify it.
 
+One call is more than a translation, and it is the read.  A read has to be told the index
+it is to be answered at, and a node that does not lead cannot work that index out by
+itself - so this layer gets one: the caller's own when it named one, this node's when it
+leads, and the leader's over the wire when it does not.  That is the orchestration; the
+node below is the execution, and a caller in this process can skip the first half because
+it holds the node.
+
+Below this layer there is one read path and not two.  A replica waits for the index it was
+handed and answers out of its own machine, and it asks nothing about its own leadership on
+the way, because an index a leader confirmed is a statement about the log and not about
+whoever is doing the reading.
+
 The classification is the interesting part, and it is lossy on purpose.  A shard refuses
 in its own codes - a write conflict, a frozen range, a lock - while a client on the wire
 is told one of five things: it worked, ask the leader instead, a lock is in the way, the
@@ -60,11 +72,20 @@ class ClientServicer(ClientServiceServicer):
 
     def Get(self, request, context):
         timestamp = request.timestamp if request.HasField("timestamp") else None
-        result = self._client.get(request.key, timestamp)
+        read_index, failure, carried_to = self._index_for_a_read(self._named(request))
+        if read_index is None:
+            return self._refusal_without_an_index(
+                client_pb2.GetResponse(), failure, carried_to)
+
+        result = self._client.get(request.key, timestamp, read_index)
 
         response = client_pb2.GetResponse(
             error_code=self._wire_code(result.error_code),
-            message=self._message(result))
+            message=self._message(result),
+            # Which index the answer is as of, out here as well as in the result: the
+            # caller named it, or this node produced it - and it is what a caller with
+            # many reads to make at one snapshot names on the reads that follow.
+            read_index=read_index)
         # Unset rather than empty: a key that is not there at this snapshot is a read
         # that answered, and the caller tells it from a failure by the error code.
         if result.success and result.value is not None:
@@ -79,19 +100,25 @@ class ClientServicer(ClientServiceServicer):
 
     def Scan(self, request, context):
         timestamp = request.timestamp if request.HasField("timestamp") else None
+        read_index, failure, carried_to = self._index_for_a_read(self._named(request))
+        if read_index is None:
+            return self._refusal_without_an_index(
+                client_pb2.ScanResponse(), failure, carried_to)
+
         try:
             rows = self._client.scan_versions(request.start_key, request.end_key,
-                                              timestamp)
+                                              timestamp, read_index)
         except ScanRefused as refusal:
             response = client_pb2.ScanResponse(
                 error_code=self._wire_code(refusal.error_code),
-                message=refusal.error_msg or "")
+                message=refusal.error_msg or "",
+                read_index=read_index)
             if refusal.key is not None:
                 response.locked_key = refusal.key
             self._add_leader_hint(response, refusal.error_code)
             return response
 
-        response = client_pb2.ScanResponse(error_code=client_pb2.OK)
+        response = client_pb2.ScanResponse(error_code=client_pb2.OK, read_index=read_index)
         for key, value, commit_ts in rows:
             entry = response.entries.add()
             entry.key = key
@@ -144,26 +171,27 @@ class ClientServicer(ClientServiceServicer):
         the question is carried once to the leader this node has heard from - the address
         it would otherwise only hint at - and what comes back is this node's answer.
 
+        A read that named no index asks this same question, through
+        :meth:`_index_for_a_read`: the index such a read needs is this one, and the layer
+        that obtained it is the layer that can ask for it.
+
         Once, and the request that travels on says so.  A node whose leader has moved
         would otherwise pass the question to the leader it used to have, which can be the
         node the question came from, and the two would ask each other for as long as the
         caller was willing to wait.
         """
-        read_index, failure = self._client.follower_read_index()
-        carried_to = None
-
-        if read_index is None and not request.answer_locally:
-            read_index, failure, carried_to = self._ask_the_leader(failure)
+        if request.answer_locally:
+            # This node's own answer and not the leader's: a caller that asks this way
+            # wants to know what this node itself can say, which is what a walk over a
+            # group looking for its leader asks for.
+            read_index, failure = self._client.follower_read_index()
+            carried_to = None
+        else:
+            read_index, failure, carried_to = self._index_for_a_read(None)
 
         if read_index is None:
-            response = client_pb2.FollowerReadIndexResponse(
-                error_code=client_pb2.NOT_LEADER, message=failure or "Not leader")
-            if carried_to is None:
-                # The hint is what makes this refusal worth having, and it is worth
-                # having only while nobody has been asked: an address that has just
-                # failed is not somewhere to send the caller next.
-                self._add_leader_hint(response, ErrorCode.ERR_NOT_LEADER)
-            return response
+            return self._refusal_without_an_index(
+                client_pb2.FollowerReadIndexResponse(), failure, carried_to)
         return client_pb2.FollowerReadIndexResponse(
             error_code=client_pb2.OK, read_index=read_index)
 
@@ -202,6 +230,55 @@ class ClientServicer(ClientServiceServicer):
         if index is None:
             return None, why, address
         return index, None, address
+
+    def _index_for_a_read(self, named):
+        """The index this read is to be answered at, or why there is none to name.
+
+        A caller that named one has said where its read is consistent to, and the node it
+        asked need not lead: an index a leader confirmed is a statement about the log, and
+        it travels with the question.  A caller that named none is asking for a
+        linearizable read of *this* node, which then has to produce the index itself - its
+        own when it leads, and the leader's carried there and back when it does not.  The
+        question that carries it is :meth:`FollowerReadIndex`, asked here on a caller's
+        behalf rather than on its own.
+
+        ``(index, why not, where the question went)``.  The last is None unless an address
+        was named and failed to answer, which is the one case where a refusal has nowhere
+        left to send the caller.
+        """
+        if named is not None:
+            return named, None, None
+        read_index, failure = self._client.follower_read_index()
+        if read_index is not None:
+            return read_index, None, None
+        return self._ask_the_leader(failure)
+
+    @staticmethod
+    def _named(request):
+        """The index the caller named, when it named one.
+
+        Presence rather than a value: no log has an index 0, so 0 would do as a stand-in,
+        but the question here is whether the caller named one at all, and the proto says
+        that with a field that can be absent.
+        """
+        return request.read_index if request.HasField("read_index") else None
+
+    def _refusal_without_an_index(self, response, failure, carried_to):
+        """A read that could not be told what to be consistent to, so it is not answered.
+
+        The same refusal ``FollowerReadIndex`` makes, and for the same reason: this node
+        does not lead and could not reach the one that does, so the caller's move is to
+        ask somebody else.  The hint goes with it only while nobody has been asked - an
+        address that has just stopped answering is not somewhere to send the caller next -
+        and that address is in the message instead.
+
+        The response carries no index.  A refusal is not an answer as of anything.
+        """
+        response.error_code = client_pb2.NOT_LEADER
+        response.message = failure or "Not leader"
+        if carried_to is None:
+            self._add_leader_hint(response, ErrorCode.ERR_NOT_LEADER)
+        return response
 
     # -- the mapping between the shard's codes and the wire's ---------------
 

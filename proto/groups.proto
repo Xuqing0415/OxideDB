@@ -30,9 +30,11 @@ enum ErrorCode {
     // read a linearizable one from, a batch that could not be allocated.  The detail is
     // in message, and retrying the same call will not help.
     REFUSED = 3;
-    // The group did not get to a decision - a proposal that never committed - so the same
-    // call is worth making again.  Sent by both of these groups, and here for the same
-    // reason LOCKED is: one meaning, one number, in either file.
+    // The group did not get to a decision - a table read on a member whose apply is behind
+    // the index its own read confirmed, a proposal that never committed - so the same call
+    // is worth making again.  Sent by both of these groups, and not only kept so that the
+    // numbers line up: the table is read through the same bounded wait a shard reads
+    // through, and the clock's batch is a proposal like any other.
     TIMEOUT = 4;
 }
 

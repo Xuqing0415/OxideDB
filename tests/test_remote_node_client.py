@@ -10,7 +10,9 @@ apart is a caller that has to be rewritten to cross the wire.  The second is wha
 when a node does not answer at all - a named failure and not a refusal, since there is
 nothing in it for a caller to act on.  The third is the leader hint: a node that has stopped
 leading says where the leader is, and the retry follows that address without reading the
-routing table again.
+routing table again.  That last one is about a write: a read sent to a node that does not
+lead is answered by that node now - the servicer gets the index such a read has to be
+answered at - so a read never reaches the point of refusing with a hint.
 """
 
 import pytest
@@ -19,6 +21,7 @@ from _ports import allocate_port, free_addresses
 from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
 from oxidedb.client import (LocalNodeClient, NodeUnreachable, RemoteNodeClient,
                             RemoteNodeClientFactory)
+from oxidedb.client.routing import ShardLeaders, ask_shard
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import RoutingTable, ShardPlacement
 from oxidedb.raft.shard_server import ShardedRaftCluster
@@ -259,7 +262,14 @@ def test_a_node_that_does_not_answer_is_a_named_failure():
 
 
 def test_a_refusal_over_a_wire_keeps_its_code_and_names_the_leader():
-    """A follower refuses, and says where to go instead, in each shape it refuses in."""
+    """A follower refuses a write, and says where to go instead.
+
+    A write is the shape a follower still refuses in, and it is the one a hint is for: the
+    caller's next move is to ask whoever leads, and the address is a fact this node has and
+    the caller does not.  A read is no longer among the shapes - a node that does not lead
+    gets the index the read has to be answered at and answers the read here (pinned in
+    ``test_client_servicer.py``), so there is no read refusal left to carry a hint on.
+    """
     cluster = _cluster()
     factory = _factory()
     wait_for_keys_leader(cluster, [KEY_A])
@@ -269,26 +279,16 @@ def test_a_refusal_over_a_wire_keeps_its_code_and_names_the_leader():
     follower = factory.get_client(0, follower_id, addresses[follower_id])
 
     def the_refusal_is_ready():
-        answer = follower.get(KEY_A)
-        if (answer.error_code == ErrorCode.ERR_NOT_LEADER
-                and answer.leader_address == addresses[leader_id]):
-            return answer
+        written = follower.propose(serialize_command(
+            CommandType.SET, key=KEY_A, value=b"v1"))
+        if (written.error_code == ErrorCode.ERR_NOT_LEADER
+                and written.leader_address == addresses[leader_id]):
+            return written
         return None
 
     refusal = wait_until(the_refusal_is_ready, timeout=20,
                          message="the follower never named the node that leads")
     assert refusal.leader_address == addresses[leader_id]
-
-    written = follower.propose(serialize_command(CommandType.SET, key=KEY_A, value=b"v1"))
-    assert written.error_code == ErrorCode.ERR_NOT_LEADER
-    assert written.leader_address == addresses[leader_id]
-
-    # The range read refuses by raising, here as in process, because rows are the answer's
-    # shape and a refusal in their place would look like a range with nothing in it.
-    with pytest.raises(ScanRefused) as refused:
-        follower.scan(b"a", b"z")
-    assert refused.value.error_code == ErrorCode.ERR_NOT_LEADER
-    assert refused.value.leader_address == addresses[leader_id]
 
 
 def test_a_refusal_the_shard_made_for_its_own_reason_arrives_as_refused():
@@ -321,32 +321,34 @@ def test_a_refusal_the_shard_made_for_its_own_reason_arrives_as_refused():
 # -- the retry a hint buys -----------------------------------------------------
 
 def test_a_retry_follows_the_hint_and_never_reads_the_table():
-    """The table names a node that has stopped leading, and the read still answers.
+    """The table names a node that has stopped leading, and the write still lands.
 
     This is the case a hint exists for.  The publisher has not caught up with a leader
     change, so the table is wrong, and the node it names is alive and says so - with the
     address of the node that leads now.  Without hints the retry went back to the same wrong
-    node and the read failed; with them it goes straight to the leader, and the cache
+    node and the write was refused; with them it goes straight to the leader, and the cache
     counter is the evidence that no metadata read happened on the way.
+
+    A write and not a read, because that is where the hint is still handed out: a read sent
+    to a node that does not lead is answered by that node now, which is a shorter path than
+    refusing and being sent elsewhere.
     """
     cluster = _cluster()
     factory = _factory()
     wait_for_keys_leader(cluster, [KEY_A])
-    leader_id, _term = _settled_leader(cluster)
-    addresses = cluster.shard_addresses(0)
-    follower_id = _a_follower(cluster, leader_id)
-
-    leader = factory.get_client(0, leader_id, addresses[leader_id])
-    assert leader.propose(serialize_command(
-        CommandType.SET, key=KEY_A, value=b"v1", timestamp=5)).success
+    _leader_id, _term = _settled_leader(cluster)
+    follower_id = _a_follower(cluster, _leader_id)
 
     # A table that names the follower as shard 0's leader and never changes: the staleness a
     # real table has for one publisher interval, held still for the length of the test.
     table = _table_over(cluster, lambda shard_id: (
         follower_id if shard_id == 0 else _settled_leader(cluster, shard_id)[0]))
     cache = _cache_over(cluster, table, factory)
-    client = SmartClient(None, cluster, router=cache)
+    leaders = ShardLeaders(cluster, factory=factory, router=cache)
 
-    assert client.get(KEY_A) == b"v1"
+    command = serialize_command(CommandType.SET, key=KEY_A, value=b"v1", timestamp=5)
+    written = ask_shard(leaders, 0, lambda client: client.propose(command))
+
+    assert written.success, written.error_msg
     assert cache.refreshes == 0, (
         "the client read the table again instead of following the address it was given")

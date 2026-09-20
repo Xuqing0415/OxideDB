@@ -51,10 +51,13 @@ class RemoteNodeClient:
     def address(self) -> str:
         return self._address
 
-    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None,
+            read_index: Optional[int] = None) -> ReadResult:
         request = client_pb2.GetRequest(key=key)
         if timestamp is not None:
             request.timestamp = timestamp
+        if read_index is not None:
+            request.read_index = read_index
 
         response = self._call(self._stub.Get, request)
         if response.error_code == client_pb2.OK:
@@ -64,17 +67,19 @@ class RemoteNodeClient:
         return ReadResult.failure(*self._failure(response))
 
     def scan(self, start_key: bytes, end_key: bytes,
-             timestamp: Optional[int] = None) -> list:
+             timestamp: Optional[int] = None, read_index: Optional[int] = None) -> list:
         """The rows of :meth:`scan_versions`, with the version dropped.
 
         One call to the node and two ways to read what came back, so a caller that
         wants rows does not take a different path from one that wants versions.
         """
         return [(key, value)
-                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+                for key, value, _ in self.scan_versions(start_key, end_key, timestamp,
+                                                        read_index)]
 
     def scan_versions(self, start_key: bytes, end_key: bytes,
-                      timestamp: Optional[int] = None) -> list:
+                      timestamp: Optional[int] = None, read_index: Optional[int] = None
+                      ) -> list:
         """The same rows, each with the version it is at - which is what a copy needs.
 
         The version is the timestamp the value was written at, and it survives the
@@ -85,6 +90,8 @@ class RemoteNodeClient:
         request = client_pb2.ScanRequest(start_key=start_key, end_key=end_key)
         if timestamp is not None:
             request.timestamp = timestamp
+        if read_index is not None:
+            request.read_index = read_index
 
         response = self._call(self._stub.Scan, request)
         if response.error_code != client_pb2.OK:

@@ -30,7 +30,7 @@ from oxidedb.proto import client_pb2, groups_pb2
 from oxidedb.proto.client_pb2_grpc import (ClientServiceStub,
                                            add_ClientServiceServicer_to_server)
 from oxidedb.raft.client_servicer import ClientServicer
-from oxidedb.raft.node import MemoryRaftNode, NodeState
+from oxidedb.raft.node import APPLY_TIMEOUT, MemoryRaftNode, NodeState
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
                                         serialize_command)
@@ -68,11 +68,17 @@ def _stop_what_the_test_started():
     del _BUILT_FACTORIES[:]
 
 
-def _leader():
-    """A one-node shard that leads itself, so that proposals commit."""
+def _leader(apply_timeout=APPLY_TIMEOUT):
+    """A one-node shard that leads itself, so that proposals commit.
+
+    ``apply_timeout`` is the node's own bound on how long a read waits for this replica to
+    catch up.  A test that wants a read refused for being behind shortens it rather than
+    sitting through the default.
+    """
     node = MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
                           get_peer_node=None,
-                          election_timeout_min=20, election_timeout_max=40)
+                          election_timeout_min=20, election_timeout_max=40,
+                          apply_timeout=apply_timeout)
     _BUILT_NODES.append(node)
     wait_until(lambda: node.state == NodeState.LEADER, timeout=10,
                message="the single node never became the leader")
@@ -401,9 +407,10 @@ def test_a_shard_that_did_not_get_to_a_decision_is_not_refused():
     piece of client code reads either response.
 
     What produces one over a port is a read named at an index the replica cannot reach,
-    which needs the servicer to pass ``read_index`` down (see ``docs/design.md``, section
-    4): until that lands this is the mapping pinned, and ``tests/test_raft_cluster.py`` is
-    where the code itself is produced and read in process.
+    and the servicer passes such an index down now (see ``docs/design.md``, section 4): the
+    mapping is pinned here, and
+    ``test_a_read_named_at_an_index_this_replica_cannot_reach_crosses_as_timeout`` below is
+    where the code itself is produced and read across a port.
     """
     servicer = ClientServicer(_leader())
 
@@ -413,3 +420,132 @@ def test_a_shard_that_did_not_get_to_a_decision_is_not_refused():
     assert local_code(client_pb2.TIMEOUT) == ErrorCode.ERR_TIMEOUT
     assert local_code(groups_pb2.TIMEOUT) == ErrorCode.ERR_TIMEOUT
     assert wire_code(ErrorCode.ERR_TIMEOUT) == groups_pb2.TIMEOUT
+
+
+def test_a_read_named_at_an_index_this_replica_cannot_reach_crosses_as_timeout():
+    """The wait a named index buys has an end on it, and what comes out of the end is TIMEOUT.
+
+    The index here is one this replica will never apply, which stands in for every way a
+    replica can be behind: a follower that has not caught up, one that has just restarted,
+    one whose apply loop is slower than the caller is willing to wait.  The wait is
+    shortened so that the test does not sit through it - ``APPLY_TIMEOUT`` is the default
+    and not the value - and the code crosses as TIMEOUT rather than REFUSED, because the
+    same read made again is not the same mistake.
+    """
+    node = _leader(apply_timeout=0.2)
+    stub = _stub(_served(node))
+    assert _propose(stub, cmd_type=CommandType.SET, key=KEY, value=b"v1",
+                    timestamp=5).error_code == client_pb2.OK
+
+    beyond_any_log = 10 ** 6
+    refused = stub.Get(client_pb2.GetRequest(key=KEY, read_index=beyond_any_log),
+                       timeout=TIMEOUT)
+
+    assert refused.error_code == client_pb2.TIMEOUT
+    assert refused.read_index == beyond_any_log, (
+        "the basis the caller named comes back with the refusal, so that the same read can "
+        "be made again at it on another replica")
+    assert refused.message, "and the reason says how far behind this replica is"
+
+
+# -- the index a read is answered at -------------------------------------------
+
+def test_a_read_answered_here_says_which_index_it_is_as_of():
+    """A read that named no index is answered at one, and the answer says which.
+
+    A caller that named none is asking for a linearizable read, so the node has to produce
+    the index itself: its own here, since it leads and has nobody to ask.  It crosses for a
+    read that found a value and for one that found none - both of them answered, and both
+    as of an index - and a range read is answered the same way.
+    """
+    node = _leader()
+    stub = _stub(_served(node))
+    _propose(stub, cmd_type=CommandType.SET, key=KEY, value=b"v1", timestamp=5)
+
+    read = stub.Get(client_pb2.GetRequest(key=KEY), timeout=TIMEOUT)
+    assert read.error_code == client_pb2.OK and read.value == b"v1"
+    assert read.read_index >= 1, "the index this replica confirmed for its own read"
+
+    missing = stub.Get(client_pb2.GetRequest(key=b"missing"), timeout=TIMEOUT)
+    assert missing.error_code == client_pb2.OK
+    assert missing.read_index >= 1, "a read that found no value is as of an index too"
+
+    rows = stub.Scan(client_pb2.ScanRequest(start_key=b"a", end_key=b"z"), timeout=TIMEOUT)
+    assert rows.error_code == client_pb2.OK
+    assert rows.read_index >= 1, "and so is a range read"
+
+
+def test_a_follower_answers_a_read_that_named_no_index():
+    """The first end-to-end follower read: the question, the hop, and the value.
+
+    A caller that named no index is asking for a linearizable read, and the node it asked
+    does not lead - so the index is the leader's, over the wire, and the answer comes out of
+    this node's own state machine.  Nothing about the caller changed: it gets a value from
+    an address that used to refuse it and name somewhere else to go, which is the point of
+    answering here instead.
+    """
+    cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
+    _BUILT_CLUSTERS.append(cluster)
+    cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(),
+                          peer_addresses=free_addresses())
+    wait_for_keys_leader(cluster, [KEY])
+
+    leader_id = cluster.shard_leader(0)[0]
+    addresses = cluster.shard_addresses(0)
+    follower_id = next(node_id for node_id in addresses if node_id != leader_id)
+    assert _propose(_stub(addresses[leader_id]), cmd_type=CommandType.SET, key=KEY,
+                    value=b"v1", timestamp=5).error_code == client_pb2.OK
+
+    follower_stub = _stub(addresses[follower_id])
+
+    def the_follower_answers():
+        """Taken again until it does.
+
+        A node that began an election just before the winner did has no leader to carry the
+        question to, and answers the refusal a node in that state answers with; the read is
+        retried until this is a real follower, the way a client of a wire service would.
+        """
+        read = follower_stub.Get(client_pb2.GetRequest(key=KEY), timeout=TIMEOUT)
+        if read.error_code != client_pb2.OK or read.value != b"v1":
+            return None
+        return read
+
+    read = wait_until(the_follower_answers, timeout=10,
+                      message="the follower never answered a read it had no index for")
+    assert read.read_index >= 1, "the index the leader confirmed, carried back"
+
+
+def test_a_read_that_names_an_index_does_not_ask_for_one(monkeypatch):
+    """An index a caller names replaces the question rather than adding to it.
+
+    The caller that has an index is a caller with many reads to make at it, so what it must
+    not pay is a second confirmation of a thing it already knows.  The counter is the
+    evidence, and it is patched onto this one node rather than built into the servicer: a
+    hook in the product for a test to reach into would be a hook no caller uses.
+    """
+    node = _leader()
+    stub = _stub(_served(node))
+    _propose(stub, cmd_type=CommandType.SET, key=KEY, value=b"v1", timestamp=5)
+
+    first = stub.Get(client_pb2.GetRequest(key=KEY), timeout=TIMEOUT)
+    assert first.error_code == client_pb2.OK
+    assert first.read_index >= 1, (
+        "the index that read was answered at, and the one the next read is to name - "
+        "taken from an answer rather than written down, so that the two cannot agree "
+        "on a zero")
+
+    asked = []
+    node_read_index = node._read_index
+
+    def counting_read_index():
+        asked.append(1)
+        return node_read_index()
+
+    monkeypatch.setattr(node, "_read_index", counting_read_index)
+
+    named = stub.Get(client_pb2.GetRequest(key=KEY, read_index=first.read_index),
+                     timeout=TIMEOUT)
+
+    assert named.error_code == client_pb2.OK and named.value == b"v1"
+    assert named.read_index == first.read_index, "the index it was named at, echoed back"
+    assert asked == [], "a read that named an index does not confirm one of its own"

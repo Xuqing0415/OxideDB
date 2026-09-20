@@ -68,7 +68,7 @@ class _FakeNode:
         #: names nowhere.
         self._leader_address = leader_address
 
-    def get(self, key, timestamp=None):
+    def get(self, key, timestamp=None, read_index=None):
         if self._error is not None:
             return ReadResult.failure(self._error, "Not leader", self._leader_address)
         return ReadResult.success(self._value)
@@ -389,7 +389,7 @@ class _FakeScanningNode:
         self._rows = list(rows)
         self._refusal = refusal
 
-    def scan(self, start_key, end_key, timestamp=None):
+    def scan(self, start_key, end_key, timestamp=None, read_index=None):
         if self._refusal is not None:
             raise self._refusal
         return list(self._rows)

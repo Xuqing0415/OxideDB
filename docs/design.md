@@ -460,7 +460,11 @@ past that index holds everything that was committed when it was named - which is
 makes a follower read a read rather than a guess.  The wait is the whole of what is
 left, and it is bounded the same way it is above: a replica that cannot reach the index
 is refused with `ERR_TIMEOUT` rather than held.  The wire has the field for it
-(`GetRequest.read_index`); nothing sends one yet.
+(`GetRequest.read_index`), and a read that arrives without one is given it: the client
+service asks `FollowerReadIndex` on the caller's behalf - carrying the question to the
+leader, over the wire, when the node it is on does not lead - and passes the answer down.
+So a caller that names no index is still answered at one, which is what makes a read
+sent to a follower a read rather than a refusal.
 
 ### Why the quorum proves what it needs to
 
@@ -875,6 +879,8 @@ The write that arrives in the window is still the caller's to act on, because th
 does not cross the wire: what a client should do about it is settled above, and the shape
 that would carry it is what is still owed.
 
-Follower reads do not exist.  The read index a follower would ask for is implemented on the
-node and nothing routes a read through it, so every read goes to a leader, including the
-ones the CLI's `--server` makes.
+Nothing routes a read to a follower.  A read that arrives at one is answered there now -
+the client service fills in the index, as above - but nothing chooses a follower to send
+a read to, so every client that has a table still asks the leader, including the CLI's
+`--server`; picking the replica to read from is a client-side choice that does not exist
+yet.

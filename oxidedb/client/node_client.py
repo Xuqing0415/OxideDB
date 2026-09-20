@@ -50,26 +50,36 @@ class NodeClient(Protocol):
     committed version of a key was, and how far this node's log has committed.
     """
 
-    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None,
+            read_index: Optional[int] = None) -> ReadResult:
         """Read ``key`` at ``timestamp``, or at the newest version when it is None.
 
         A result rather than bytes, because a read has three answers and not two: a
         value, no value (a key that is not there at this snapshot), and a key that
         cannot be read *yet* because a lock is in the way.  Telling the last apart
         from the first is the caller's job, so it comes back as an error code.
+
+        ``read_index`` is the index the answer has to reflect, for a caller that has
+        one: it takes the place of this node confirming one for itself, so the read is
+        answered by a replica that need not lead.  None - the default, and what every
+        caller in this process passes - leaves the node to confirm its own.
         """
 
     def scan(self, start_key: bytes, end_key: bytes,
-             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+             timestamp: Optional[int] = None,
+             read_index: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
         """Every key in ``[start_key, end_key)`` at ``timestamp``.
 
         Rows only, so an empty list means the range is empty and a range read that
         cannot answer raises ``ScanRefused`` instead of coming back short.  Which
         version each value is at is :meth:`scan_versions`, which is the same read.
+        ``read_index`` is :meth:`get`'s, and means the same thing on a range.
         """
 
     def scan_versions(self, start_key: bytes, end_key: bytes,
-                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+                      timestamp: Optional[int] = None,
+                      read_index: Optional[int] = None
+                      ) -> List[Tuple[bytes, bytes, int]]:
         """The rows of :meth:`scan`, each with the version it is at.
 
         Not a second walk: the same rows, with the timestamp each value was written
@@ -80,7 +90,7 @@ class NodeClient(Protocol):
 
         0 is a row with no version, which is one that came from this reader's own
         write intent: an intent is a lock the node holds, and no timestamp published
-        it.
+        it.  ``read_index`` is :meth:`get`'s.
         """
 
     def propose(self, command: bytes) -> ApplyResult:
@@ -149,16 +159,20 @@ class LocalNodeClient:
     def __init__(self, node: MemoryRaftNode):
         self._node = node
 
-    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
-        return self._node.get(key, timestamp)
+    def get(self, key: bytes, timestamp: Optional[int] = None,
+            read_index: Optional[int] = None) -> ReadResult:
+        return self._node.get(key, timestamp, read_index)
 
     def scan(self, start_key: bytes, end_key: bytes,
-             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
-        return self._node.scan(start_key, end_key, timestamp)
+             timestamp: Optional[int] = None,
+             read_index: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+        return self._node.scan(start_key, end_key, timestamp, read_index)
 
     def scan_versions(self, start_key: bytes, end_key: bytes,
-                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
-        return self._node.scan_versions(start_key, end_key, timestamp)
+                      timestamp: Optional[int] = None,
+                      read_index: Optional[int] = None
+                      ) -> List[Tuple[bytes, bytes, int]]:
+        return self._node.scan_versions(start_key, end_key, timestamp, read_index)
 
     def propose(self, command: bytes) -> ApplyResult:
         return self._node.propose(command)
