@@ -539,10 +539,9 @@ Honest list of what is *not* done, roughly in priority order.
 
 * **Recovery is not wired into `launcher.py`, so a process that dies mid-move does not pick
   it up.**  `recover_splits` and `recover_migrations`, and the notes they read through
-  `RecoveryRunner.load_pending_splits` and `_load_pending_migrations`, are reached from
-  `start` and `start_network` and nowhere else - the split's half through a
-  `RecoveryRunner` that both a cluster and a process could hold, the move's still written
-  on `ShardedRaftCluster` - so the cluster object the
+  `RecoveryRunner.load_pending_splits` and `load_pending_migrations`, are reached from
+  `start` and `start_network` and nowhere else, through a `RecoveryRunner` that both a
+  cluster and a process could hold - so the cluster object the
   tests start recovers and a node started as a process does not.  A process killed between a
   move's copy and its proposal comes back with the note unread and, worse, with the source
   shard unfrozen: the freeze is a flag in memory, nothing puts it back, and the group the
