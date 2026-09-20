@@ -22,13 +22,19 @@ because that is where a closed group went wrong - the range map still named the 
 and the shard server still named this node, so a node that had just stopped serving a
 shard would have been written into the table as a replica of it.
 
-The last two tests are about the boundaries of this call rather than cases of it.  What
+Two of the tests are about the boundaries of this call rather than cases of it.  What
 a cluster answers to "who serves this shard" is the routing table's placement, so
 `ensure_serving` must not write it, and the call that does is `apply_move_locally` - the
 two disagree for the length of a move's drain window on purpose.  The other boundary is
 `close_group_on`, which is this call's closing half with the set named by the caller: a
 refused move takes down the group it built and mends to nothing, which is not something
 `ensure_serving` can be asked for, because it answers to the set the table names.
+
+The last two are about the answer itself rather than about this call: what a cluster says
+to "who serves this shard" when it has a table to ask, and what it says when the table will
+not answer.  That answer is what a recovery reads - it is how a side that comes back learns
+how far a move got - so where it comes from is worth pinning here, next to the placement
+those two tests keep apart from it.
 """
 
 import os
@@ -37,6 +43,7 @@ import pytest
 
 from _ports import allocate_port
 from oxidedb.launcher import ClusterConfig, NodeClusterView, Peer, block_width
+from oxidedb.metadata.service import RoutingTable, ShardPlacement
 from oxidedb.raft.shard_server import ShardedRaftCluster, ShardServer
 from oxidedb.raft.state_machine import MVCCStateMachine
 from oxidedb.raft.storage import EngineRaftStorage
@@ -410,5 +417,63 @@ def test_the_placement_moves_on_its_own_call_and_not_on_this_one(tmp_path):
 
         cluster.apply_move_locally(0, [2, 3])
         assert cluster.serving_nodes(0) == [2, 3], "writing it twice is writing it once"
+    finally:
+        cluster.shutdown()
+
+
+class _ATable:
+    """A routing table that answers with what it was handed.
+
+    What a cluster reads when it has one: the two tests below are about the two answers a
+    table gives that its own placement cannot - a set that is not this cluster's, and the
+    refusal of a group with no leader to ask.
+    """
+
+    def __init__(self, placements=None, complaint=None):
+        self._placements = dict(placements or {})
+        self._complaint = complaint
+
+    def table(self, refresh=False):
+        if self._complaint is not None:
+            raise RuntimeError(self._complaint)
+        return RoutingTable(version=1, shards=dict(self._placements))
+
+
+def test_the_table_is_what_this_cluster_answers_for_a_shard(tmp_path):
+    """``serving_nodes`` is the table's answer, not the placement this cluster holds.
+
+    A cluster keeps a placement of its own because it is the thing that publishes one, and
+    the two are meant to disagree: while a move is in flight, and for as long as a client
+    can be routed by the copy of the table it cached.  What a recovery reads has to be the
+    table's, because the question is how far somebody else's move got - and this cluster's
+    own placement is one step behind that by construction.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        cluster._placed_shards[0] = [1]
+        cluster._metadata_client = _ATable(
+            {0: ShardPlacement(0, b"", b"\xff", nodes=[2, 3])})
+
+        assert cluster.serving_nodes(0) == [2, 3], \
+            "the table's set, not the placement this cluster would publish"
+        assert cluster.serving_nodes(A_SHARD_NOBODY_STARTED_WITH) is None, \
+            "a shard the table does not name is None, not every node"
+    finally:
+        cluster.shutdown()
+
+
+def test_a_table_that_cannot_be_read_is_not_an_answer(tmp_path):
+    """The third thing: not a set and not None - nothing was read, so nothing is known.
+
+    A recovery reads this answer to find out which half of a move is left, and a read that
+    did not happen is not an answer about the shard at all.  So it raises, and the recovery
+    is what decides to wait for it or to leave the shard frozen.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        cluster._metadata_client = _ATable(complaint="the metadata group has no leader")
+
+        with pytest.raises(RuntimeError, match="no leader"):
+            cluster.serving_nodes(0)
     finally:
         cluster.shutdown()

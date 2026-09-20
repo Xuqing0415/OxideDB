@@ -634,21 +634,26 @@ class RecoveryRunner:
 
     # -- the move's body --------------------------------------------------------
 
-    def _wait_for_table(self, timeout: Optional[float] = None) -> Any:
-        """The routing table, asked for until it answers or until ``timeout`` runs out.
+    def _wait_for_serving(self, shard_id: int,
+                          timeout: Optional[float] = None) -> Optional[List[int]]:
+        """The set the routing table names for ``shard_id``, asked for until it answers.
 
         The look a recovery takes at the table before anything is decided, and the one look
-        that is waited for.  A side that comes back reads its notes while the metadata group
-        is still electing - the two are the same restart - and a read that lands in that
-        window is answered "there is no leader", which is true of the moment and not of the
-        table.  A recovery that took that as final would stop there for good: nothing calls
-        it a second time.  So the read is made again, and the deadline is what keeps that
-        bounded.
+        that is waited for.  It is asked of the view rather than of the table because "who
+        serves this shard" is the question a recovery has and a table is one side's way of
+        answering it: a process reaches the table over a wire and a cluster reads it out of
+        a group in its own process, and this flow is written for both.
 
-        None is an answer rather than a failure: it is a side with no table at all, which
-        is an in-process cluster with no metadata service, and there is nothing to come
-        back.  A table that has still not answered by the deadline is handed on as the
-        failure it is - the raise, and not a None that would read as "no table" - so what a
+        A side that comes back reads its notes while the metadata group is still electing -
+        the two are the same restart - and a read that lands in that window is answered
+        "there is no leader", which is true of the moment and not of the table.  A recovery
+        that took that as final would stop there for good: nothing calls it a second time.
+        So the read is made again, and the deadline is what keeps that bounded.  What is
+        waited for is the read answering at all; None, which is the table naming no such
+        shard, is one of its answers and comes straight back.
+
+        A table that has still not answered by the deadline is handed on as the failure it
+        is - the raise, and not a None that would read as "no such shard" - so what a
         recovery does with a table it cannot read is what it did before the wait was here.
         ``timeout`` defaults to ``TABLE_TIMEOUT``, read when the wait starts rather than
         bound to this call: a test that cannot wait the ten seconds out for real shortens
@@ -656,14 +661,11 @@ class RecoveryRunner:
         """
         if timeout is None:
             timeout = TABLE_TIMEOUT
-        client = self._view.metadata_client()
-        if client is None:
-            return None
 
         deadline = time.time() + timeout
         while True:
             try:
-                return client.table(refresh=True)
+                return self._view.serving_nodes(shard_id)
             except RuntimeError:
                 if time.time() >= deadline:
                     raise
@@ -682,28 +684,21 @@ class RecoveryRunner:
         self._view.freeze(shard_id, "migration", state.source_nodes)
 
         try:
-            table = self._wait_for_table()
+            nodes = self._wait_for_serving(shard_id)
         except RuntimeError as nothing_read:
-            # The same two shapes the proposal loop folds into one: an in-process group
-            # with no leader, and a client that found no address to ask.  Nothing was read,
-            # so nothing is known, and the move waits for the next call.
+            # The same two shapes the proposal loop folds into one: a side whose group has
+            # no leader, and a client that found no address to ask.  Nothing was read, so
+            # nothing is known, and the move waits for the next call.
             self.record_migration_error(str(nothing_read))
             return False
 
-        if table is None:
-            # No table to disagree with: this side's own range map is the whole world to
-            # it, so nothing was proposed anywhere and the move finishes the way a retry
-            # of it does.
-            return self.finish_move(state, drain=0)
-
-        placement = table.shard(shard_id)
-        if placement is None:
+        if nodes is None:
             self.record_migration_error(
                 f"shard {shard_id} is not in the routing table, and a move of it was in "
                 f"flight")
             return False
 
-        if sorted(placement.nodes) == sorted(state.target_nodes):
+        if sorted(nodes) == sorted(state.target_nodes):
             # The proposal landed before the process stopped, so the shard is the new
             # group's and the note is all that is left of the move.  The group has to be
             # built here first: a restarted side builds the shards it was told to serve,
@@ -719,15 +714,18 @@ class RecoveryRunner:
             self._commit_move(shard_id, state.target_nodes, drain=0)
             return True
 
-        if sorted(placement.nodes) == sorted(state.source_nodes):
+        if sorted(nodes) == sorted(state.source_nodes):
             # Nothing was proposed, so the copy is where the move stopped - or never
             # started - and the call that finishes it is the one a caller retrying the
-            # move would make.
+            # move would make.  A side with no table at all lands here as well: it answers
+            # for the shard out of its own placement, which while a move is in flight is
+            # the group the move is leaving, so "no table" and "the table names the source"
+            # are one answer and one call.
             return self.finish_move(state, drain=0)
 
         self.record_migration_error(
             f"shard {shard_id} is moving from {state.source_nodes} to "
-            f"{state.target_nodes}, and the routing table says {placement.nodes}")
+            f"{state.target_nodes}, and the routing table says {nodes}")
         return False
 
     def _copy_rows(self, source: NodeClient, target: NodeClient,
@@ -808,23 +806,23 @@ class RecoveryRunner:
         last_error = None
         for attempt in range(PROPOSE_ATTEMPTS):
             try:
-                table = client.table(refresh=True)
+                from_nodes = self._view.serving_nodes(shard_id)
             except RuntimeError as nothing_read:
-                # One exception for two shapes on purpose: the in-process client raises a
-                # RuntimeError when its group has no leader, and the one across a wire
-                # raises ``NodeUnreachable`` - which is one - when no address answered.
-                # Both mean the same thing here: nothing was asked, so nothing is known.
+                # One exception for two shapes on purpose: a side that holds the table's
+                # group in its own process raises a RuntimeError when that group has no
+                # leader, and a side that reads it across a wire raises ``NodeUnreachable``
+                # - which is one - when no address answered.  Both mean the same thing
+                # here: nothing was asked, so nothing is known.
                 last_error = str(nothing_read)
                 time.sleep(RETRY_BACKOFF * (attempt + 1))
                 continue
 
-            placement = table.shard(shard_id)
-            if placement is None:
+            if from_nodes is None:
                 return ProposalResult(
                     ProposalOutcome.REJECTED,
                     f"shard {shard_id} is not in the routing table")
 
-            result = client.move_shard(shard_id, placement.nodes, target_nodes, addresses)
+            result = client.move_shard(shard_id, from_nodes, target_nodes, addresses)
             if result.success:
                 return ProposalResult(ProposalOutcome.OK)
 

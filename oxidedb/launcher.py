@@ -537,11 +537,16 @@ class NodeClusterView:
         A table that cannot be read raises, which is how the recovery's own reads report
         the same thing: nothing was read, so nothing is known.
 
+        The nodes come back in the order the table holds them, and not in an order of this
+        side's choosing: a set handed back by a caller as the one a move expects to replace
+        is compared by the group that applies the move, and the table's own list is the one
+        that comparison was written against.
+
         See :class:`RecoveryView.serving_nodes`.
         """
         table = self._clients().metadata_client().table(refresh=True)
         placement = table.shard(shard_id)
-        return None if placement is None else sorted(placement.nodes)
+        return None if placement is None else list(placement.nodes)
 
     def addresses_on(self, shard_id: int, nodes: List[int]) -> Dict[int, str]:
         """Where each of ``nodes`` serves ``shard_id``, by the arithmetic both sides share.

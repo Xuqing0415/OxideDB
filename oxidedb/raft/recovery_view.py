@@ -125,7 +125,14 @@ class RecoveryView(Protocol):
         computed from the same table - which is not something a recovery may guess about,
         since guessing between two live groups is how a range ends up served by one of
         them while its rows are in the other.  A side with no table at all, as an
-        in-process cluster is, answers with its own placement.  A read.
+        in-process cluster is, answers with its own placement.
+
+        A read, and a fresh one: the answer is the table as it stands at this call, because
+        a copy taken before the last write answers with the step before it.  A side that
+        cannot read the table raises, which is a third thing again: nothing was read, so
+        nothing is known.  The nodes come back in the order the table holds them, because a
+        set a caller hands back as the one a move expects to replace is compared by the
+        group that applies it.
         """
 
     def shard_replica_ids(self, shard_id: int) -> List[int]:

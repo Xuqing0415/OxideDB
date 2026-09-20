@@ -1219,18 +1219,30 @@ class ShardedRaftCluster:
         nodes = [server.get_shard_node(shard_id) for server in self._shard_servers.values()]
         return [node for node in nodes if node is not None]
 
-    def serving_nodes(self, shard_id: int) -> List[int]:
-        """The nodes whose group is the shard's, as this cluster has it.
+    def serving_nodes(self, shard_id: int) -> Optional[List[int]]:
+        """The set the routing table names for ``shard_id``, or None if it names none.
 
-        An in-process cluster is the whole world to itself, so its own answer is the
-        table's: the group a move is leaving until the proposal lands, the one it went to
-        after, and every node for a shard nothing here was told about.  It is never None
-        on this side - that is the process side's third answer, a table that names the
-        shard and a placement of its own it does not have.
+        Read out of the table where this cluster has one.  The placement this cluster keeps
+        (``_placed_shards``) is the routing it publishes *from*, and a recovery answered out
+        of it would be answered out of this side's own belief about a table somebody else
+        may have moved - which is the difference the process side has always drawn, and
+        this side draws it too now.  A cluster with no table at all, which is a cluster
+        started without a metadata service and the in-process tests, answers with its own
+        placement instead: such a cluster is the whole world to itself and that placement is
+        the table's.
+
+        None is the table saying it names no such shard, which both sides can be told.  A
+        table that cannot be read raises rather than answering: nothing was read, so nothing
+        is known.
 
         See :class:`RecoveryView.serving_nodes`.
         """
-        return list(self._serving_nodes(shard_id))
+        client = self._metadata_client
+        if client is None:
+            return list(self._serving_nodes(shard_id))
+
+        placement = client.table(refresh=True).shard(shard_id)
+        return None if placement is None else list(placement.nodes)
 
     def _serving_nodes(self, shard_id: int) -> List[int]:
         """The nodes whose group is the shard's, as the routing table has it.

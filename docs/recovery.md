@@ -139,10 +139,11 @@ class RecoveryView(Protocol):
   replica whose storage has already been closed cannot be reached, which is why that is a
   no-op here rather than an error.  Idempotent.
 * **`serving_nodes(shard_id)`** - the replica set the routing table names, or - with no
-  table, as in an in-process test - this cluster's own answer.  It is how a cluster that
-  comes back learns how far a move got, so it is a read of the table and of nothing local.
-  None is the process side's third answer, a table that names the shard and a placement of
-  its own it does not have.
+  table, as in an in-process test - this cluster's own answer.  It is how a side that comes
+  back learns how far a move got, so it is a read of the table and of nothing local, and a
+  fresh read: a copy taken before the last write answers with the step before it.  None is
+  the third answer, the table naming no such shard, and both sides can be told it; a table
+  that cannot be read raises instead, because that is a third thing again.
 * **`shard_replica_ids(shard_id)`** - the members of the group for the shard, as this side
   has them.  What a proposal publishes as the new set, and not the same question as
   `serving_nodes`: a shard being moved has two groups for a moment and this one names the
@@ -286,8 +287,9 @@ thirteen and the three land like this:
 * `_drain_shard` - the beginning's, and internal: it waits out the writes the freeze
   admitted, and it runs before anything is written down, so it sits on the far side of the
   seam drawn above rather than in the recovery.
-* `_serving_nodes` - `serving_nodes`, under the interface's name.  `_placed_shards` is what
-  it reads, and it is written where the routing table is: by `apply_move_locally`, which
+* `_serving_nodes` - the answer `serving_nodes` falls back to when this cluster has no
+  table at all, which is the in-process case.  `_placed_shards` is what it reads, and it is
+  written where the routing table is: by `apply_move_locally`, which
   `RecoveryRunner._commit_move` calls once the table has agreed, and never by
   `ensure_serving`.
 * `_ensure_shard`, `_retire_source` - `ensure_serving`, which is one call for both
@@ -360,7 +362,9 @@ Becomes the view (public, one implementation of `RecoveryView`):
 
 * `shard_ids`, `range_map`, `metadata_client` and `get_shard_server` already exist and
   already mean what the interface means.
-* `serving_nodes(shard_id)` is `_serving_nodes` under the interface's name.
+* `serving_nodes(shard_id)` reads the routing table where this cluster has one - a fresh
+  read, and None for a shard the table does not name - and falls back to `_serving_nodes`
+  where it has none.
 * `ensure_serving(shard_id, nodes)` is `_retire_source` + `_close_group_on` + a build
   for every node that holds nothing.  It is the second of the two steps `_commit_move`
   takes, and the order between them is what made section 2 and this list read as if they
@@ -401,12 +405,12 @@ Stays internal (helpers the recovery calls through the view, or uses itself):
   `_copy_rows`, `_propose_move`, `_commit_move`, `_abort_move` and
   `_load_migration_record`, and `_forget_migration` is `RecoveryView.forget_note` where
   the move calls it.
-* `_orphan_dirs` and `_placed_shards` stay here: what has been set aside and what the
-  routing table names are this cluster's own bookkeeping.  `serving_nodes` reads the
-  second of them and `apply_move_locally` writes it, which is the pair the interface has
-  for it; `ensure_serving` deliberately does neither, because the placement moves when the
-  table moves and not when the groups do - the drain window is exactly the stretch in which
-  the two disagree, and it is what lets a client that cached the table finish its read.
+* `_orphan_dirs` and `_placed_shards` stay here: what has been set aside and what this
+  cluster believes the routing table names are its own bookkeeping.  `apply_move_locally`
+  writes the second of them and `_serving_nodes` reads it; `ensure_serving` deliberately
+  does neither, because the placement moves when the table moves and not when the groups do
+  - the drain window is exactly the stretch in which the two disagree, and it is what lets
+  a client that cached the table finish its read.
 * `_migrations`, `_pending_splits` and the two `_last_*_error` strings went with the
   recovery body, because they are a running recovery's working state - the boundary
   section 3 draws.  All four are the runner's now.  Three of them are written from the
