@@ -545,10 +545,13 @@ Honest list of what is *not* done, roughly in priority order.
   that wants them, and by nothing else: a note left over because its range held a lock, or
   because the table could not be read, waits for the next restart.  The lock clears on its
   own - a TTL, or the lock cleaner - but the note does not, and the shard stays frozen while
-  it waits.  The natural hook is the lock cleaner's pass, which already knows that a range
-  has unlocked; what is missing is a decision about which object owns the retry, because the
-  cleaner reaches a cluster through `_shard_servers` and the recovery it would call is the
-  one both start-up paths already call.
+  it waits.  This includes the case where the table never names the range the note refers to
+  - a start killed before its first publisher pass leaves exactly that - where the split
+  proposal is rejected forever and the shard stays frozen.  The natural hook is the lock
+  cleaner's pass, which already knows that a range has unlocked; what is missing is a
+  decision about which object owns the retry, because the cleaner reaches a cluster through
+  `_shard_servers` and the recovery it would call is the one both start-up paths already
+  call.
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not
