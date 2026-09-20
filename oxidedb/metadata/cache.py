@@ -58,12 +58,19 @@ class RoutingCache:
 
     def __init__(self, cluster, client: MetadataClient,
                  factory: Optional[NodeClientFactory] = None,
+                 local_node_id: Optional[int] = None,
                  missing_leader_refresh_interval: float = MISSING_LEADER_REFRESH_INTERVAL):
         self._client = client
         #: How this client reaches a node the table names.  The cluster is enough to
         #: build the in-process one, which is the only kind there is so far; a client
         #: outside the process hands in the factory it reaches nodes through.
         self._factory = factory if factory is not None else LocalNodeClientFactory(cluster)
+        #: Which node this cache is running on, when it was built for one: the member a
+        #: read should be served by when it need not leave the machine.  See
+        #: :meth:`any_replica_for`.  None is a cache built for a caller that is on no
+        #: node at all - every client outside a cluster has that shape - and not a
+        #: cache that lost something.
+        self._local_node_id = local_node_id
         self._lock = threading.RLock()
         #: How long a nameless leader is believed for.  A caller that knows the publisher
         #: writes faster than this can pass a shorter one; nothing should pass a longer
@@ -90,6 +97,13 @@ class RoutingCache:
         None is the honest answer for a cluster started without a metadata service:
         there is no table to read, and the caller routes by the cluster's own nodes
         instead - which is what ``ShardLeaders`` does when it is given no router.
+
+        The cache is built with no local node, and that is not an oversight: a cluster
+        here is every node of itself (it holds one ``ShardServer`` per node), and an
+        in-process cluster has no singular id to give - ``node_ids`` is the whole
+        membership.  The object that *is* one node, ``ShardServer.node_id``, is on the
+        other side of the seam, and a caller there has the id to hand - which is what
+        ``local_node_id`` is for.
         """
         client = cluster.metadata_client()
         if client is None:
@@ -197,23 +211,37 @@ class RoutingCache:
         the table publishes is somewhere a client may read rather than only a list to walk
         after a refusal.
 
-        Picked at random, and that is the point rather than an implementation detail: a
-        client reading from the node the table names would be reading from the leader again,
-        and the reason to read from a replica is that the reads of many clients are spread
-        over the set.  Which member is picked is not a fact about the shard - leading is the
-        only job any of them has - so nothing here prefers one.
+        The member this cache was told it is on comes first, when it is one of the set: a
+        read served here costs no hop.  Which member this process is, is not something the
+        table can say - it names a set, and nothing in it says which of them is asking - so
+        that is a fact the cache is given (``local_node_id``), and a preference rather than a
+        rule: what it buys is a hop, and a client on no node at all has nothing to prefer.
 
-        The local node is not one of the things this file knows.  A cache is given a cluster
-        or, for a client outside every cluster, nothing at all (``cli.py``), and neither says
-        which member this process is - so a client that is itself a replica cannot be
-        preferred here without being told which one it is, and nothing tells it.
+        Everybody else is drawn at random, and that is the point rather than an
+        implementation detail: a client reading from the node the table names would be
+        reading from the leader again, and the reason to read from a replica is that the
+        reads of many clients are spread over the set.  Which member is picked is not a fact
+        about the shard - leading is the only job any of them has - so nothing else prefers
+        one.  The preference is over the members this client can reach, the way the draw is:
+        a member whose channel has gone is one to try and not one to stop at.
 
         None when the table names nobody for the shard, or when the factory has no handle for
-        any member of the set: a set nothing can reach is not a set to pick from.
+        any member of the set: a set nothing can reach is not a set to pick from.  A shard the
+        table names with no members is the other case that answers None, and it is not a
+        broken table: the publisher writes the ranges before the replica sets, so a table
+        caught between the two passes names every shard and lists nobody in it.
         """
         placement = self.table().shard(shard_id)
         if placement is None or not placement.nodes:
             return None
+
+        # This machine first, when it is one of the members: a read served here costs no hop,
+        # and only the cache knows which node it is on.
+        if self._local_node_id in placement.nodes:
+            here = self._factory.get_client(shard_id, self._local_node_id,
+                                            placement.addresses.get(self._local_node_id))
+            if here is not None:
+                return here
 
         node_ids = list(placement.nodes)
         random.shuffle(node_ids)

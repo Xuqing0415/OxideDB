@@ -431,6 +431,60 @@ def test_a_member_this_client_has_no_handle_for_is_passed_over():
     assert unnamed.any_replica_for(0) is None, "a shard the table names nobody for"
 
 
+def test_a_read_is_served_by_this_machine_when_it_is_one_of_the_members():
+    """The member a cache was told it is on comes first, and the others are not asked.
+
+    A read answered here costs no hop, and only the cache knows which member this process
+    is: the table names a set and nothing in it says which of them is asking, so the id is
+    given rather than worked out.  What comes back is a handle on that member at that
+    member's own address, and no other member is asked about - a lookup that asked them all
+    and then picked one would be the random draw with a step in front of it.
+    """
+    addresses = {1: "node1:5001", 2: "node2:5002", 3: "node3:5003"}
+    factory = _RecordingFactory()
+    cache = RoutingCache(None, _FakeTableSource(_table_with_addresses(1, addresses)),
+                         factory=factory, local_node_id=3)
+
+    handles = [cache.any_replica_for(0) for _ in range(20)]
+
+    assert all(handle is not None and handle.address == "node3:5003" for handle in handles)
+    assert {node_id for _, node_id, _ in factory.asked} == {3}, (
+        "the machine it is on, and no question about the members it is not on")
+
+
+def test_a_machine_that_is_not_one_of_the_members_is_not_preferred():
+    """An id outside the set is not a member to hand back, and not a reason to answer None.
+
+    A node the shard is not served by is not a node to read that shard from, whoever is
+    asking: the set is the table's answer and the preference is over it.  So the draw is
+    what it was before there was a preference - every member, and nothing else.
+    """
+    addresses = {1: "node1:5001", 2: "node2:5002"}
+    factory = _RecordingFactory()
+    cache = RoutingCache(None, _FakeTableSource(_table_with_addresses(1, addresses)),
+                         factory=factory, local_node_id=9)
+
+    handles = [cache.any_replica_for(0) for _ in range(60)]
+
+    assert all(handle is not None for handle in handles)
+    assert {node_id for _, node_id, _ in factory.asked} == {1, 2}
+
+
+def test_a_machine_this_client_has_no_handle_for_is_not_where_it_reads():
+    """The preference is over the members a client can reach, the way the draw is.
+
+    A local node whose channel has gone is a member to try and not a member to stop at,
+    exactly as any other member is: what the preference is worth is a hop, and there is
+    nothing to answer None over while the set holds a member that does answer.
+    """
+    addresses = {1: "a:1", 2: "a:2"}
+    factory = _RecordingFactory(reachable={2})
+    cache = RoutingCache(None, _FakeTableSource(_table_with_addresses(1, addresses)),
+                         factory=factory, local_node_id=1)
+
+    assert cache.any_replica_for(0).address == "a:2"
+
+
 # -- the two sources a placement can come from ---------------------------------
 
 class _ClusterThatSaysWhoLeads:
