@@ -305,6 +305,46 @@ class Cluster:
         """Every node's timestamp port, in node id order, on the same terms."""
         return [self.tso_address(node.node_id) for node in self._nodes]
 
+    # -- one node, taken down and brought back -------------------------------
+
+    def stop_node(self, node_id: int, crash: bool = False) -> None:
+        """Stop one node and leave the rest of the cluster where it is.
+
+        ``crash`` takes it down without asking, which is the shape a test about a recovery
+        is usually after: a node that was killed comes back with the storage a node that
+        died has, and with none of what the shutdown path would have tidied on the way out.
+        """
+        node = self.node(node_id)
+        if crash:
+            node.kill()
+            return
+        node.ask_to_stop()
+        if not node.wait_for_stop():
+            raise AssertionError(f"node {node_id} was asked to stop and did not say "
+                                 f"STOPPED:\n{node.report()}")
+
+    def start_node(self, node_id: int) -> NodeProcess:
+        """Start one node again on the ports and the data directory it had, and wait for it.
+
+        The same ports deliberately: the addresses this node published the first time are
+        the ones in the routing table, and a node that came back somewhere else is a node
+        the table cannot reach.  The process it had has to be gone first - two of them on
+        one block of ports is a bind failure rather than a restart.
+        """
+        old = self.node(node_id)
+        if old.running:
+            raise AssertionError(f"node {node_id} is still running, so a second one on its "
+                                 f"ports would only fail to bind:\n{old.report()}")
+        where = self._nodes.index(old)
+        node = _spawn(old.config, self._root)
+        try:
+            node.wait_until_ready(READY_TIMEOUT)
+        except BaseException:
+            node.kill()
+            raise
+        self._nodes[where] = node
+        return node
+
     # -- the way out --------------------------------------------------------
 
     def stop(self) -> None:
