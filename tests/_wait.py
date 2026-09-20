@@ -36,12 +36,21 @@ def wait_for_leader(cluster, timeout: float = DEFAULT_TIMEOUT) -> int:
 
 
 def wait_for_single_leader(cluster, timeout: float = DEFAULT_TIMEOUT) -> int:
-    """Wait until exactly one node leads and every other node follows it.
+    """Wait until one node leads, everyone else follows, and the leader knows its log.
 
     A node that started an election just before the winner did stays a CANDIDATE
     until the winner's first heartbeat reaches it, so asserting on a single
     instant races with that handover.  A cluster that never converges still
     fails here.
+
+    Winning is not the same as being able to read, which is the second half of
+    this wait: the entries a new leader finds in its log were appended by leaders
+    of earlier terms, and which of them committed is something only a majority
+    acknowledging an entry of *this* term reveals - its own no-op, appended on
+    election.  Until that lands the state machine can be missing rows the group
+    has long since committed, and a caller that reads it rather than merely
+    appending to it is asking about a leader this wait has not reached yet.  A
+    caller that only needs somebody to append to has ``wait_for_leader``.
     """
     def settled():
         leaders = [node_id for node_id, node in cluster._nodes.items()
@@ -50,7 +59,10 @@ def wait_for_single_leader(cluster, timeout: float = DEFAULT_TIMEOUT) -> int:
             return None
         stragglers = [node for node_id, node in cluster._nodes.items()
                       if node_id != leaders[0] and node.state != NodeState.FOLLOWER]
-        return None if stragglers else leaders[0]
+        if stragglers:
+            return None
+        leader = cluster._nodes[leaders[0]]
+        return leaders[0] if leader.has_committed_in_its_own_term() else None
 
     return wait_until(settled, timeout=timeout,
                       message="cluster did not settle on a single leader")
