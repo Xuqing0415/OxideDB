@@ -443,6 +443,25 @@ handshake: a range read at a timestamp is only as safe as the replica serving it
 the quorum is a requirement of reading at all rather than a cost of reading one key.
 Only step 7 differs - the range instead of the key.
 
+### When the caller already has an index
+
+A read does not have to come this way.  `get` and `scan` also take an index from the
+caller, and a caller that has one replaces steps 1-6 and the leadership they establish
+with the wait alone: the replica waits for its own apply to reach the index and reads
+its state machine, whether or not it leads, and whether or not it still leads by the
+time the wait is over.  `FollowerReadIndex` on a leader is where such an index comes
+from, which is the point of the shape - the proof of freshness is done once, by the
+node that can do it, and the index it produces is what a replica that cannot do it
+answers at.
+
+Nothing is being assumed by that.  The index was set by a node a majority had confirmed,
+and the entries a replica has applied are committed entries, so a state machine at or
+past that index holds everything that was committed when it was named - which is what
+makes a follower read a read rather than a guess.  The wait is the whole of what is
+left, and it is bounded the same way it is above: a replica that cannot reach the index
+is refused with `ERR_TIMEOUT` rather than held.  The wire has the field for it
+(`GetRequest.read_index`); nothing sends one yet.
+
 ### Why the quorum proves what it needs to
 
 An acknowledgement from a majority at term `T` means no other node can have won an

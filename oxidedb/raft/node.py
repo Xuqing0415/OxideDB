@@ -1271,7 +1271,8 @@ class MemoryRaftNode:
             self._update_commit_index()
             return self._commit_index, None
 
-    def get(self, key: bytes, timestamp: Optional[int] = None) -> ReadResult:
+    def get(self, key: bytes, timestamp: Optional[int] = None,
+            read_index: Optional[int] = None) -> ReadResult:
         """Read ``key``, at ``timestamp`` if one is given and at the newest version
         otherwise.
 
@@ -1285,10 +1286,21 @@ class MemoryRaftNode:
         The apply the handshake implies is waited for with an end on it: a replica
         that cannot catch up says so (``ERR_TIMEOUT``) rather than holding the
         caller, which is a refusal a client can act on and a wait it cannot.
+
+        ``read_index`` is for a caller that already has an index to name, and it
+        replaces the handshake rather than adding to it.  An index a leader confirmed
+        is a statement about the log and not about this node: a replica that has
+        applied it holds everything committed at it, and that stays true of a replica
+        that does not lead, that lost an election while the read was in flight, or
+        that has never led at all.  So the quorum and the leadership it proves are
+        skipped, and with them the check after the wait - what is left is the wait,
+        and an index this replica cannot reach is refused exactly as above.
         """
-        read_index, failure = self._read_index()
-        if read_index is None:
-            return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, failure)
+        own_handshake = read_index is None
+        if own_handshake:
+            read_index, failure = self._read_index()
+            if read_index is None:
+                return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, failure)
 
         with self._lock:
             if not self._wait_for_apply(read_index):
@@ -1297,13 +1309,14 @@ class MemoryRaftNode:
                     f"this replica has applied {self._last_applied} and the read is at "
                     f"{read_index}: the entries between them are committed and not applied")
 
-            if self._state != NodeState.LEADER:
+            if own_handshake and self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
             return self._state_machine.get(key, timestamp)
 
     def scan(self, start_key: bytes, end_key: bytes,
-             timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
+             timestamp: Optional[int] = None,
+             read_index: Optional[int] = None) -> List[Tuple[bytes, bytes]]:
         """Every key in ``[start_key, end_key)``, at ``timestamp`` if one is given.
 
         The same read as :meth:`get`, over a range: no timestamp means the newest
@@ -1319,28 +1332,36 @@ class MemoryRaftNode:
         leader, both raise ``ScanRefused`` rather than come back with rows: an
         empty list means the range is empty, never that this replica could not say.
 
+        ``read_index`` is :meth:`get`'s, and means the same thing on a range: an
+        index from the caller takes the place of the handshake, and the answer comes
+        from a replica that need not lead.
+
         Rows only.  Which version each one is at is :meth:`scan_versions`, and a
         caller that copies a row into another group needs that rather than this.
         """
-        return [(key, value)
-                for key, value, _ in self.scan_versions(start_key, end_key, timestamp)]
+        rows = self.scan_versions(start_key, end_key, timestamp, read_index)
+        return [(key, value) for key, value, _ in rows]
 
     def scan_versions(self, start_key: bytes, end_key: bytes,
-                      timestamp: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
+                      timestamp: Optional[int] = None,
+                      read_index: Optional[int] = None) -> List[Tuple[bytes, bytes, int]]:
         """Every key in ``[start_key, end_key)``, each with the version it is at.
 
-        The rows of :meth:`scan` and the same walk - the read index, the wait, the
-        leader check - with the timestamp each value was written at kept beside it,
-        because a row put into another group has to keep the version it already had
-        or it arrives there as the newest thing that has ever happened to it.
+        The rows of :meth:`scan` and the same walk :meth:`get` takes - the index,
+        the wait, and the leadership of this node that only a handshake of its own
+        needs - with the timestamp each value was written at kept beside it, because
+        a row put into another group has to keep the version it already had or it
+        arrives there as the newest thing that has ever happened to it.
 
         0 says a row has no version, which is a row that came from this reader's own
         write intent: an intent is a lock the node is holding, and not a version any
         timestamp has published.
         """
-        read_index, failure = self._read_index()
-        if read_index is None:
-            raise ScanRefused(ErrorCode.ERR_NOT_LEADER, failure)
+        own_handshake = read_index is None
+        if own_handshake:
+            read_index, failure = self._read_index()
+            if read_index is None:
+                raise ScanRefused(ErrorCode.ERR_NOT_LEADER, failure)
 
         with self._lock:
             if not self._wait_for_apply(read_index):
@@ -1349,7 +1370,7 @@ class MemoryRaftNode:
                     f"this replica has applied {self._last_applied} and the read is at "
                     f"{read_index}: the entries between them are committed and not applied")
 
-            if self._state != NodeState.LEADER:
+            if own_handshake and self._state != NodeState.LEADER:
                 raise ScanRefused(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
             return self._state_machine.scan_versions(start_key, end_key, timestamp)

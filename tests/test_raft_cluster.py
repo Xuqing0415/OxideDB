@@ -113,6 +113,101 @@ class TestRaftCluster:
         finally:
             node.shutdown()
 
+    def test_a_read_named_at_an_index_sees_the_write_that_made_it(self):
+        """An index from the caller is read at, and the write it is the index of is in.
+
+        A caller that has an index names it instead of asking for a handshake.  The
+        index a proposal reports is where that write landed, so waiting for the apply to
+        reach it is waiting for the write to be readable - which is what makes an index
+        worth passing around: it is a promise that everything before it is visible.
+        """
+        node = MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
+                              election_timeout_min=20, election_timeout_max=40)
+        try:
+            wait_until(lambda: node.state == NodeState.LEADER, timeout=10,
+                       message="the single node never became the leader")
+            command = node._state_machine.serialize_command(
+                CommandType.SET, key=b"named", value=b"value")
+
+            written = node.propose(command)
+            assert written.success, written.error_msg
+            assert written.index is not None
+
+            read = node.get(b"named", read_index=written.index)
+            assert read.success, read.error_msg
+            assert read.value == b"value"
+
+            rows = node.scan(b"named", b"namee", read_index=written.index)
+            assert rows == [(b"named", b"value")]
+        finally:
+            node.shutdown()
+
+    def test_a_replica_that_does_not_lead_answers_a_read_named_at_an_index(self):
+        """The point of a named index: a replica no longer has to lead to be read from.
+
+        Three nodes, the write goes in through the leader, and a follower that has
+        applied the index the leader reported answers the same value at it.  The same
+        read on the same follower with no index is refused, so what changed the answer
+        is the index and not the follower - nothing in this path asks whether the node
+        holding the rows is the leader.
+        """
+        cluster = RaftCluster(num_nodes=3)
+        cluster.start(lambda: MVCCStateMachine())
+
+        try:
+            leader = cluster.get_node(wait_for_single_leader(cluster))
+            command = leader._state_machine.serialize_command(
+                CommandType.SET, key=b"named", value=b"value")
+            written = leader.propose(command)
+            assert written.success, written.error_msg
+
+            follower = next(node for node_id, node in cluster._nodes.items()
+                            if node_id != leader.node_id)
+            wait_for_replication(leader, [follower])
+
+            read = follower.get(b"named", read_index=written.index)
+            assert read.success, read.error_msg
+            assert read.value == b"value"
+
+            without = follower.get(b"named")
+            assert not without.success, "a follower answered a read with no index"
+            assert without.error_code == ErrorCode.ERR_NOT_LEADER, without.error_msg
+        finally:
+            cluster.shutdown()
+
+    def test_a_read_named_at_an_index_this_replica_cannot_reach_is_refused(self):
+        """Naming an index skips the handshake, and the wait that is left stays bounded.
+
+        The replica here never led and applied nothing, so an index it cannot reach is
+        the only kind there is.  What it answers is ``ERR_TIMEOUT`` - not the
+        ``ERR_NOT_LEADER`` every other path out of this read would give - which is the
+        two checks being told apart: the wait is what the read went through, and the
+        leadership it did not ask about.  A replica behind the index is a thing to ask
+        again rather than a bad request, which is why the refusal says how far it got.
+        """
+        node = MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
+                              election_timeout_min=2000, election_timeout_max=4000,
+                              apply_timeout=0.2)
+        try:
+            assert node.state == NodeState.FOLLOWER, "the node is expected never to lead"
+
+            started = time.time()
+            result = node.get(b"key", read_index=10 ** 6)
+            elapsed = time.time() - started
+
+            assert not result.success, "a read was answered from a machine behind its log"
+            assert result.error_code == ErrorCode.ERR_TIMEOUT, result.error_msg
+            assert "applied" in result.error_msg, result.error_msg
+            assert elapsed < 4, (
+                f"the read took {elapsed:.1f}s to be refused: a named index does not "
+                f"lift the bound on the wait")
+
+            with pytest.raises(ScanRefused) as refused:
+                node.scan(b"a", b"z", read_index=10 ** 6)
+            assert refused.value.error_code == ErrorCode.ERR_TIMEOUT, refused.value.error_msg
+        finally:
+            node.shutdown()
+
     def test_leader_failure(self):
         cluster = RaftCluster(num_nodes=3)
         cluster.start(lambda: MVCCStateMachine())
