@@ -27,8 +27,10 @@ What these tests pin: a move killed before the proposal is finished on the next 
 the rows readable out of the group the table now names; a move whose proposal landed before
 the process died is only cleaned up, and is neither copied nor proposed again; a move that
 finished leaves no note to pick up; a table that names a third set, or cannot be read at
-all, leaves the shard frozen and still remembered; and a lock in the range a move would copy
-stops it in the same way, because that read is the read the call that began the move made;
+all, leaves the shard frozen and still remembered; a table that has not answered yet is
+waited for rather than taken as final, which is the window a restart reads its notes in;
+and a lock in the range a move would copy stops it in the same way, because that read is the
+read the call that began the move made;
 and that a shard being moved answers for itself while it is in flight, out of the recovery's
 one record of it rather than out of a copy this cluster keeps.
 """
@@ -42,6 +44,7 @@ from _wait import wait_for_metadata_client, wait_until
 from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
+from oxidedb.raft import recovery_runner
 from oxidedb.raft.recovery_notes import PendingNote, write_note
 from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
@@ -157,6 +160,32 @@ class _TableThatSays:
         if self._complaint is not None:
             raise RuntimeError(self._complaint)
         return self._table
+
+
+class _TableThatHasNotAnsweredYet:
+    """A table whose group has no leader for the first few reads: what a restart meets.
+
+    A node reads its own notes the moment it comes back, and the metadata group is elected
+    a few hundred milliseconds later, so the first read of a recovery lands in the window
+    where the group has no leader and nothing answers it.  Wrapping a real client is what
+    makes this that window and nothing else: every read after it is the real table's.
+    """
+
+    def __init__(self, inner, blind=2):
+        self._inner = inner
+        self._blind = blind
+        self.reads = 0
+
+    def table(self, refresh=False):
+        self.reads += 1
+        if self._blind > 0:
+            self._blind -= 1
+            raise RuntimeError("the routing table cannot be read: the metadata group has "
+                               "no leader")
+        return self._inner.table(refresh)
+
+    def move_shard(self, *args, **kwargs):
+        return self._inner.move_shard(*args, **kwargs)
 
 
 def _a_move_that_died_before_the_proposal(tmp_path, monkeypatch, addresses, metadata,
@@ -383,6 +412,9 @@ def test_a_table_that_cannot_be_read_leaves_the_move_frozen_and_retryable(
         cluster, client = _a_move_that_died_before_the_proposal(
             tmp_path, monkeypatch, addresses, metadata)
         try:
+            # The wait is a moment here rather than the ten seconds a recovery offers:
+            # the stub never answers, and what the recovery does about that is the subject.
+            monkeypatch.setattr(recovery_runner, "TABLE_TIMEOUT", 0.05)
             cluster._metadata_client = _TableThatSays(
                 complaint="the metadata group has no leader")
 
@@ -400,6 +432,64 @@ def test_a_table_that_cannot_be_read_leaves_the_move_frozen_and_retryable(
             assert cluster._recovery_runner._load_migration_record(0) is None
             assert cluster.migrations() == {}
             _the_rows_are_where_the_table_says(cluster, client)
+        finally:
+            cluster.shutdown()
+    finally:
+        metadata.shutdown()
+
+
+def test_a_recovery_waits_for_a_table_that_has_not_elected_yet(tmp_path, monkeypatch):
+    """A table with no leader for a moment is asked again rather than believed.
+
+    The window is not exotic: a node reads its notes as it comes back, the metadata group
+    is elected in the same restart, and a read that lands between the two is answered
+    "there is no leader".  Believing that ends the recovery for good, because nothing calls
+    it a second time - so the read is made again, and this is the test that it is.
+    """
+    addresses = free_addresses(num_nodes=5)
+    metadata = _start_metadata()
+    try:
+        cluster, client = _a_move_that_died_before_the_proposal(
+            tmp_path, monkeypatch, addresses, metadata)
+        try:
+            late = _TableThatHasNotAnsweredYet(client)
+            cluster._metadata_client = late
+
+            assert cluster.recover_migrations() == [0], cluster.migration_error()
+            assert late.reads > 2, (
+                "the reads the group could not answer were followed by one it did, not "
+                f"taken as final: {late.reads} reads")
+            assert client.table(refresh=True).shard(0).nodes == MOVE_TO
+            assert cluster._recovery_runner._load_migration_record(0) is None
+            assert cluster.migrations() == {}
+        finally:
+            cluster.shutdown()
+    finally:
+        metadata.shutdown()
+
+
+def test_a_recovery_that_may_not_wait_stops_at_that_table(tmp_path, monkeypatch):
+    """The control for the test above: with the patience gone, the same window stops it.
+
+    Same cluster, same table, same read - the deadline is the one thing that differs, and
+    it is nothing.  What is left is the behaviour the wait was added for: the move stands,
+    the shard stays frozen, and the reason recorded is the read that did not answer.
+    """
+    addresses = free_addresses(num_nodes=5)
+    metadata = _start_metadata()
+    try:
+        cluster, client = _a_move_that_died_before_the_proposal(
+            tmp_path, monkeypatch, addresses, metadata)
+        try:
+            monkeypatch.setattr(recovery_runner, "TABLE_TIMEOUT", 0.0)
+            late = _TableThatHasNotAnsweredYet(client)
+            cluster._metadata_client = late
+
+            assert cluster.recover_migrations() == []
+            assert late.reads == 1, "one read, and the recovery stopped there"
+            assert "no leader" in cluster.migration_error()
+            assert cluster.migrations()[0].target_nodes == MOVE_TO, "the move stands"
+            assert cluster._recovery_runner._load_migration_record(0) is not None
         finally:
             cluster.shutdown()
     finally:

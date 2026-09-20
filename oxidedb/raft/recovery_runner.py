@@ -54,6 +54,17 @@ LEADER_TIMEOUT = 10.0
 #: noticed a moment after it does, long enough not to spin.
 LEADER_POLL_SECONDS = 0.05
 
+#: How long a recovery waits for the routing table to answer at all, in seconds.
+#:
+#: A recovery runs when a side comes back, and so does the group that holds the table: a
+#: node that reads its notes a moment before that group has elected a leader is told there
+#: is nothing there, and a recovery that took that as final would never look again -
+#: nothing calls it a second time.  An election takes a few hundred milliseconds, and a
+#: group that has not held one in ten seconds is not one this recovery can finish, so the
+#: wait is bounded.  It is the process side's wait in practice: a cluster reads the table
+#: out of a group in its own process, where a leader that exists answers on the first read.
+TABLE_TIMEOUT = 10.0
+
 #: How long a shard that has moved goes on answering on the node it left, in seconds.
 #: Clients route by a table they cached, so the node one of them was sent to a moment
 #: ago is a node it may still ask: the group stays up for a fixed window after the table
@@ -623,6 +634,41 @@ class RecoveryRunner:
 
     # -- the move's body --------------------------------------------------------
 
+    def _wait_for_table(self, timeout: Optional[float] = None) -> Any:
+        """The routing table, asked for until it answers or until ``timeout`` runs out.
+
+        The look a recovery takes at the table before anything is decided, and the one look
+        that is waited for.  A side that comes back reads its notes while the metadata group
+        is still electing - the two are the same restart - and a read that lands in that
+        window is answered "there is no leader", which is true of the moment and not of the
+        table.  A recovery that took that as final would stop there for good: nothing calls
+        it a second time.  So the read is made again, and the deadline is what keeps that
+        bounded.
+
+        None is an answer rather than a failure: it is a side with no table at all, which
+        is an in-process cluster with no metadata service, and there is nothing to come
+        back.  A table that has still not answered by the deadline is handed on as the
+        failure it is - the raise, and not a None that would read as "no table" - so what a
+        recovery does with a table it cannot read is what it did before the wait was here.
+        ``timeout`` defaults to ``TABLE_TIMEOUT``, read when the wait starts rather than
+        bound to this call: a test that cannot wait the ten seconds out for real shortens
+        the recovery's patience by patching the constant.
+        """
+        if timeout is None:
+            timeout = TABLE_TIMEOUT
+        client = self._view.metadata_client()
+        if client is None:
+            return None
+
+        deadline = time.time() + timeout
+        while True:
+            try:
+                return client.table(refresh=True)
+            except RuntimeError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(LEADER_POLL_SECONDS)
+
     def _resume_migration(self, shard_id: int) -> bool:
         """Pick a move back up.  See :meth:`recover_migrations`."""
         state = self.migration_state(shard_id)
@@ -635,21 +681,20 @@ class RecoveryRunner:
         # This is also what makes the call safe to make twice.
         self._view.freeze(shard_id, "migration", state.source_nodes)
 
-        client = self._view.metadata_client()
-        if client is None:
-            # No table to disagree with: this side's own range map is the whole world to
-            # it, so nothing was proposed anywhere and the move finishes the way a retry
-            # of it does.
-            return self.finish_move(state, drain=0)
-
         try:
-            table = client.table(refresh=True)
+            table = self._wait_for_table()
         except RuntimeError as nothing_read:
             # The same two shapes the proposal loop folds into one: an in-process group
             # with no leader, and a client that found no address to ask.  Nothing was read,
             # so nothing is known, and the move waits for the next call.
             self.record_migration_error(str(nothing_read))
             return False
+
+        if table is None:
+            # No table to disagree with: this side's own range map is the whole world to
+            # it, so nothing was proposed anywhere and the move finishes the way a retry
+            # of it does.
+            return self.finish_move(state, drain=0)
 
         placement = table.shard(shard_id)
         if placement is None:
