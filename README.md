@@ -552,6 +552,24 @@ Honest list of what is *not* done, roughly in priority order.
   decision about which object owns the retry, because the cleaner reaches a cluster through
   `_shard_servers` and the recovery it would call is the one both start-up paths already
   call.
+* **A process serves the shards its own start-up names, not the shards the table names it
+  in.**  A node builds a group for the shard ids its configuration carries and for the ones
+  its own recovery builds; nothing on that path reads the routing table, so a node that has
+  just come up is not woken by a table that names it in a set it does not hold.  Both halves
+  of that are measured on a two-node cluster: a split's new shard is one voter short and
+  never lands - the node that built no group answers nothing on the shard's port, so the
+  group cannot elect a leader - and a move can build the target's group only on the node
+  that runs the recovery, which holds the note and so is a node the shard is leaving, never
+  a node it is going to.  The half of a move that runs *after* the proposal asks nothing of
+  the target, and that is the half a process can be shown to finish
+  (`tests/test_recovery_over_processes.py`); the half that copies into the new group has
+  nowhere to copy to, and a move that died inside its copy is the same shape.  What a
+  process does serve, it serves whole: every node is a member of every shard its start-up
+  names, which is why a cross-process transaction works over a three-node cluster while a
+  subset placement does not.  The completion state is a node that reads the table as it
+  starts and serves what it says; a node already running when the table changes needs to be
+  told, which is a message this repository does not have - `proto/groups.proto` is where it
+  would go.
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not

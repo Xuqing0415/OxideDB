@@ -374,14 +374,18 @@ Becomes the view (public, one implementation of `RecoveryView`):
   for every node that holds nothing.  It is the second of the two steps `_commit_move`
   takes, and the order between them is what made section 2 and this list read as if they
   disagreed.  The first step writes the routing table's answer down, and it is
-  `apply_move_locally`: `_placed_shards` becomes the set the proposal landed, the
-  `_migrations` entry that was answering with the old set goes, and from there
-  `serving_nodes` names the new one.  The second step is this call, and it changes the
-  groups the cluster actually holds.  What lies between them is the drain window: the table
-  already names the new set while the old group is still up and still answering, which is
-  what lets a client that routed by the table it cached finish the read it arrived with.
-  So `ensure_serving` must not write `_placed_shards` - that is the table's answer, and it
-  moves when the table does, one step earlier.
+  `apply_move_locally`: `_placed_shards` becomes the set the proposal landed, and from then
+  on `_serving_nodes` names the new one.  What that reads is the move's *phase*, which the
+  same step sets; what it does not read is the `_migrations` entry, which outlives it.  The
+  entry is the *publisher's* half, and it has to outlive the switch, because while it is
+  there this side is a side with a move in flight, which is what keeps a publisher from
+  describing the shard out of the group this side is still holding.  That group is the one
+  the move is leaving until the second step has run.  The second step is this call, and it
+  changes the groups the cluster actually holds.  What lies between them is the drain
+  window: the table already names the new set while the old group is still up and still
+  answering, which is what lets a client that routed by the table it cached finish the read
+  it arrived with.  So `ensure_serving` must not write `_placed_shards` - that is the
+  table's answer, and it moves when the table does, one step earlier.
 
   A process has no such order and loses nothing by that: it has nowhere to keep a
   placement, so who serves a shard there is read off the group it holds, and the two steps
