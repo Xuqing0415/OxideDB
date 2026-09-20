@@ -107,11 +107,12 @@ was thought about rather than missed.
 
 ## Pitfalls we have hit
 
-Four things that cost time here and are not design decisions: tools that do one thing and
-look like they did another, and a rule that reads as stricter than the code.  Each one is
-reproducible in a minute and invisible while it is happening, so they are written down
-here rather than left to be recognised.  The habits above say how to work; these say what
-to check before believing a result.
+Five things that cost time here and are not design decisions: tools that do one thing and
+look like they did another, a rule that reads as stricter than the code, and a correctness
+that comes from two places happening to agree.  Each one is reproducible in a minute and
+invisible while it is happening, so they are written down here rather than left to be
+recognised.  The habits above say how to work; these say what to check before believing a
+result.
 
 **A rule written stricter than the code makes the code look wrong.**  Section 6 of the
 recovery's notes said an in-process test "must pass unchanged", which reads as a promise
@@ -128,6 +129,16 @@ nothing to fix.  Nothing catches this one: the prose reads as a name, the code r
 name, and only the interface says which name the recovery can call.  A rename is swept
 from the definition outwards, and a name that appears in one file and not the other is the
 shape of it.
+
+**A right answer two places only agree on is not a right answer the call gives.**  `freeze`
+used to work out for itself which of a moved shard's two groups to stop, and it worked it
+out from `_serving_nodes` - which answers with the source set, but only while a move is in
+flight, and only because the note has been loaded.  So the group it froze was the right
+one for two reasons the call did not state, and one statement in the other order - the
+freeze before the note - freezes every node in the cluster instead.  The set is an
+argument now.  The question to ask of a piece of correctness is not whether it holds but
+what it holds *by*: two places that happen to agree are two places the next edit pulls
+apart, and a signature that names what it needs is the version of it that survives an edit.
 
 **`Path.read_text` normalises line endings, and `newline=""` writes them back that way.**
 Reading a CRLF file with it and writing the result with `newline=""` - the argument that
