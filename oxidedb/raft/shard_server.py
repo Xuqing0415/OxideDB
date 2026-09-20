@@ -551,6 +551,17 @@ class ShardedRaftCluster:
     def shard_ids(self) -> List[int]:
         return sorted(self._range_map)
 
+    def node_ids(self) -> List[int]:
+        """Every node of this cluster, in a fixed order.
+
+        The set a split's new shard is served by.  It is this cluster's whole membership
+        rather than the nodes holding the shard, and a process answers the same list, so
+        the members the two sides each build are the members of one group.
+
+        See :class:`RecoveryView.node_ids`.
+        """
+        return sorted(self._shard_servers)
+
     def shard_replica_ids(self, shard_id: int) -> List[int]:
         """The nodes whose Raft group serves ``shard_id``.
 
@@ -625,8 +636,8 @@ class ShardedRaftCluster:
         return self._leaders.leader_for_shard(shard_id)
 
     def leader_client_for_nodes(self, shard_id: int,
-                                node_ids: List[int]) -> Optional[NodeClient]:
-        """The client for whichever of ``node_ids`` leads ``shard_id``, or None.
+                                nodes: List[int]) -> Optional[NodeClient]:
+        """The client for whichever of ``nodes`` leads ``shard_id``, or None.
 
         The question :meth:`leader_client` cannot answer, and the one a move asks: the
         group its rows are being copied *into* is not the group the routing table names
@@ -645,13 +656,13 @@ class ShardedRaftCluster:
         that would be handed a copy.
 
         No hint is followed, although a node that is not the leader answers with one:
-        every member of the group is in ``node_ids``, so the walk over the set is the
+        every member of the group is in ``nodes``, so the walk over the set is the
         whole answer, and the set is the caller's.  A handle onto a group that has gone
         away - the target of a move that was refused and is being tried again - answers
         as a follower for the same reason, so it is skipped rather than used.
         """
         factory = self._node_client_factory()
-        for node_id in node_ids:
+        for node_id in nodes:
             client = factory.get_client(shard_id, node_id)
             if client is None:
                 continue
@@ -822,7 +833,8 @@ class ShardedRaftCluster:
         # Re-range this process first: from here on it is the map the table has, and
         # the publisher - which compares the two - sees a split that is finished rather
         # than a cluster whose ranges disagree with it.
-        self._apply_split_locally(pending)
+        self.apply_split_locally(pending["shard_id"], pending["split_key"],
+                                 pending["new_shard_id"])
         self._pending_splits.pop(pending["shard_id"], None)
         self._forget_split(pending)
         self._unfreeze_shard(pending["shard_id"])
@@ -854,16 +866,22 @@ class ShardedRaftCluster:
         self._last_split_error = result.error_msg
         return False
 
-    def _apply_split_locally(self, pending: Dict[str, Any]) -> None:
-        """Re-range this process too, now that the table says so.
+    def apply_split_locally(self, shard_id: int, split_key: bytes,
+                            new_shard_id: int) -> None:
+        """Re-range this cluster, now that the routing table says so.
 
-        The servers route by this map, so until it moves they would keep answering
-        for the range the table has already given away.
+        One call and one map, taken by the side that holds the map: the servers route by
+        it, so until it moves they would keep answering for the range the table has
+        already given away, and two edits would leave a moment in which a live range
+        belongs to neither shard and its keys are routed to shard zero without anything
+        failing.
+
+        See :class:`RecoveryView.apply_split_locally`.
         """
         new_range_map = dict(self._range_map)
-        start, end = new_range_map[pending["shard_id"]]
-        new_range_map[pending["shard_id"]] = (start, pending["split_key"])
-        new_range_map[pending["new_shard_id"]] = (pending["split_key"], end)
+        start, end = new_range_map[shard_id]
+        new_range_map[shard_id] = (start, split_key)
+        new_range_map[new_shard_id] = (split_key, end)
         self.update_range_map(new_range_map)
 
     def _copy_what_is_missing(self, pending: Dict[str, Any]) -> bool:
@@ -1177,6 +1195,16 @@ class ShardedRaftCluster:
             state.copied_keys.append(key)
         return True
 
+    def addresses_on(self, shard_id: int, nodes: List[int]) -> Dict[int, str]:
+        """Where each of ``nodes`` serves ``shard_id``, as those nodes bound it.
+
+        Asked of a set, because the nodes a move is going to are not the nodes the shard
+        is served by yet.
+
+        See :class:`RecoveryView.addresses_on`.
+        """
+        return self._addresses_on(nodes, shard_id)
+
     def _addresses_on(self, node_ids: List[int], shard_id: int) -> Dict[int, str]:
         """Where each of ``node_ids`` serves ``shard_id``, as the servers bound it.
 
@@ -1410,6 +1438,17 @@ class ShardedRaftCluster:
         left = [node_id for node_id in sorted(self._shard_servers)
                 if node_id not in members]
         return self._close_group_on(left, shard_id)
+
+    def ensure_group_on(self, shard_id: int, nodes: List[int]) -> None:
+        """Make sure every node of ``nodes`` holds a group for ``shard_id``.
+
+        The build half on its own, which is what a move needs and a split does not: a
+        move builds the group its rows are going into while the source is still the group
+        the table names, so the nodes holding that shard are not one replica set.
+
+        See :class:`RecoveryView.ensure_group_on`.
+        """
+        self._ensure_group_on(nodes, shard_id)
 
     def _ensure_group_on(self, node_ids: List[int], shard_id: int) -> None:
         """Make sure every node of ``node_ids`` is holding a group for ``shard_id``.
@@ -1680,6 +1719,48 @@ class ShardedRaftCluster:
             f"{state.target_nodes}, and the routing table says {placement.nodes}")
         return False
 
+    def pending_notes(self, shard_id: int) -> List[PendingNote]:
+        """The notes this cluster holds for ``shard_id``: a split's or a move's.
+
+        Written on every replica of the shard they are about, and read back off whichever
+        of them is still open - a replica whose storage has been closed cannot be asked,
+        which is why a note there is not a failure.  At most one today: a shard cannot be
+        splitting and moving at once, and a second would be a state neither flow can have
+        been in.
+
+        See :class:`RecoveryView.pending_notes`.
+        """
+        storages = self._storages_of(shard_id)
+        notes = []
+        for prefix in (SPLIT_RECORD_PREFIX, MIGRATION_RECORD_PREFIX):
+            note = read_note(storages, shard_id, prefix)
+            if note is not None:
+                notes.append(note)
+        return notes
+
+    def remember_note(self, note: PendingNote) -> None:
+        """Write ``note`` on every replica this cluster holds of the shard it is about.
+
+        Which shard that is is the note's own answer rather than a second argument, and
+        writing the same note twice is the same bytes.
+
+        See :class:`RecoveryView.remember_note`.
+        """
+        write_note(self._storages_of(note.shard_id), note)
+
+    def forget_note(self, shard_id: int) -> None:
+        """Drop every note this cluster holds for ``shard_id``, of either kind.
+
+        ``forget_note`` below is the module's function and not this method: a method body
+        looks its globals up rather than its own class, so the two do not shadow each
+        other and the call means what it says.
+
+        See :class:`RecoveryView.forget_note`.
+        """
+        storages = self._storages_of(shard_id)
+        for prefix in (SPLIT_RECORD_PREFIX, MIGRATION_RECORD_PREFIX):
+            forget_note(storages, shard_id, prefix)
+
     def _remember_split(self, pending: Dict[str, Any]) -> None:
         """Write a split down, on every replica of the shard being split.
 
@@ -1837,6 +1918,19 @@ class ShardedRaftCluster:
         nodes = [server.get_shard_node(shard_id) for server in self._shard_servers.values()]
         return [node for node in nodes if node is not None]
 
+    def serving_nodes(self, shard_id: int) -> List[int]:
+        """The nodes whose group is the shard's, as this cluster has it.
+
+        An in-process cluster is the whole world to itself, so its own answer is the
+        table's: the group a move is leaving until the proposal lands, the one it went to
+        after, and every node for a shard nothing here was told about.  It is never None
+        on this side - that is the process side's third answer, a table that names the
+        shard and a placement of its own it does not have.
+
+        See :class:`RecoveryView.serving_nodes`.
+        """
+        return list(self._serving_nodes(shard_id))
+
     def _serving_nodes(self, shard_id: int) -> List[int]:
         """The nodes whose group is the shard's, as the routing table has it.
 
@@ -1908,6 +2002,30 @@ class ShardedRaftCluster:
             if time.time() >= deadline:
                 return None
             time.sleep(0.05)
+
+    def freeze(self, shard_id: int, reason: str) -> None:
+        """Stop the shard taking new rows, on the group the routing table names.
+
+        Which nodes that is comes from :meth:`_serving_nodes` rather than from every node
+        holding the shard id, and the difference is a shard being moved: it has two groups
+        for a moment, and freezing the one the rows are being copied *into* would refuse
+        the copy itself.  Commits and rollbacks still go through, because they end a
+        transaction that prewrote before this.
+
+        See :class:`RecoveryView.freeze`.
+        """
+        self._freeze_shard(shard_id, reason=reason,
+                           node_ids=self._serving_nodes(shard_id))
+
+    def unfreeze(self, shard_id: int) -> None:
+        """Let the shard take rows again, over every replica this cluster holds for it.
+
+        A thaw takes the whole shard rather than the group the table names, and that is
+        the safe direction: a group that was not frozen is a no-op rather than a mistake.
+
+        See :class:`RecoveryView.unfreeze`.
+        """
+        self._unfreeze_shard(shard_id)
 
     def _freeze_shard(self, shard_id: int, reason: str = "split",
                       node_ids: Optional[List[int]] = None) -> None:
