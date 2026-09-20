@@ -891,6 +891,22 @@ Honest list of what is *not* done, roughly in priority order.
   `commit_ts`, so a crash between two of those writes, or a reader arriving
   mid-commit, can observe part of a transaction.  See `docs/design.md`.
 
+* **A range read has no index to read at again, so a cached read cannot cover one.**
+  `ScanResponse.read_index` is filled by the servicer and read by nobody: `scan` and
+  `scan_versions` answer with rows rather than with a result, on both carriers, so a client
+  that read a range has nothing to keep and name on the range that follows.  Single-key
+  reads are not affected - `ReadResult.read_index` crosses the wire and `GetResponse` is
+  read back - which is why this is the range half of the feature and not the whole of it.
+  The completion state is a range read that answers with the index it was made at, which is
+  a return type on `NodeClient` and on both implementations of it.
+* **The two `_read_shape` helpers disagree about what a read answers with.**  The one in
+  `tests/test_remote_node_client.py` compares `read_index`; the one in
+  `tests/test_local_node_client.py` does not, and could not be given it for free, because
+  two of its assertions name a result field by field - adding the index there would pin
+  this log's absolute positions in a test that is about two carriers agreeing.  The
+  completion state is one way of writing a result's shape that both files use, so that a
+  field added to a read cannot be compared on one side of a wire and not the other.
+
 ## Layout
 
 ```

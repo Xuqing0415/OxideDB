@@ -26,7 +26,7 @@ from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import RoutingTable, ShardPlacement
 from oxidedb.proto import client_pb2
 from oxidedb.raft.shard_server import ShardedRaftCluster
-from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
+from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine, ReadResult,
                                         ScanRefused, serialize_command)
 from oxidedb.shard.router import default_range_map
 from oxidedb.transaction.smart_client import SmartClient
@@ -368,21 +368,20 @@ def test_a_retry_follows_the_hint_and_never_reads_the_table():
     assert written.success, written.error_msg
     assert cache.refreshes == 0, (
         "the client read the table again instead of following the address it was given")
-# -- what a response's index means to the client -------------------------------
+# -- the basis of an answer, on the way in -------------------------------------
 
 
 def test_the_basis_a_response_carries_is_read_the_way_the_node_meant_it():
-    """What the wire's index means, in the three shapes a response puts it in.
+    """What the wire's index means, in the two shapes a client is given it in.
 
     A field with no presence says "none" with 0, since no log has an index 0, and a
     refusal that never reached a state machine is the case that uses it.  A refusal the
     machine did make carries the index the answer was seen at, which is a basis like any
-    other: a key behind a lock was observed at one.  And a read named at an index that
-    was not applied in time comes back with that index, so that the same read can be
-    asked again at it elsewhere - which is the request rather than an answer, and the
-    in-process carrier leaves the field unset for it.  A client that read the third as a
-    basis would be a client whose result depends on which side of a wire it is on, which
-    is the one thing this layer is for.
+    other: a key behind a lock was observed at one.
+
+    There is no third shape, and that half is the servicer's: a read named at an index
+    it could not be applied at is a refusal like any other, with no basis on it, so
+    there is nothing here for a client to decide about one.
     """
     never_reached_a_machine = client_pb2.GetResponse(error_code=client_pb2.NOT_LEADER)
     assert RemoteNodeClient._read_index_of(never_reached_a_machine) is None, (
@@ -392,6 +391,20 @@ def test_the_basis_a_response_carries_is_read_the_way_the_node_meant_it():
     assert RemoteNodeClient._read_index_of(locked) == 7, (
         "the machine answered, and the lock was observed at an index")
 
-    timed_out = client_pb2.GetResponse(error_code=client_pb2.TIMEOUT, read_index=10 ** 6)
-    assert RemoteNodeClient._read_index_of(timed_out) is None, (
-        "what the request named and what the node answered at are not the same fact")
+
+def test_a_result_carries_the_index_the_node_answered_at():
+    """The constructor the client fills in, so that a basis can be passed and not only set.
+
+    ``ReadResult.read_index`` is the node's to fill and the servicer sends what that says,
+    so the wire's field is a translation of this one rather than a second copy of a number
+    that happens to agree with it.  Pinned here directly because the field spent a while
+    with no way to pass it in, and taking that away again would go unnoticed: the only
+    caller is this client, and a result that dropped the basis compares equal on every
+    field the cross-wire test listed before it.
+    """
+    answered = ReadResult.success(b"v", commit_ts=9, read_index=42)
+
+    assert answered.success and answered.value == b"v"
+    assert (answered.commit_ts, answered.read_index) == (9, 42)
+    assert ReadResult.success(b"v").read_index is None, (
+        "a read that said nothing has no basis, rather than a basis of zero")

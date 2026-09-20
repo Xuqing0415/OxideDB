@@ -430,7 +430,9 @@ def test_a_read_named_at_an_index_this_replica_cannot_reach_crosses_as_timeout()
     one whose apply loop is slower than the caller is willing to wait.  The wait is
     shortened so that the test does not sit through it - ``APPLY_TIMEOUT`` is the default
     and not the value - and the code crosses as TIMEOUT rather than REFUSED, because the
-    same read made again is not the same mistake.
+    same read made again is not the same mistake.  The index the read was named at does
+    not cross with it, for a single key or over a range: nothing answered at it, so
+    there is no answer for a basis to be the basis of.
     """
     node = _leader(apply_timeout=0.2)
     stub = _stub(_served(node))
@@ -442,10 +444,18 @@ def test_a_read_named_at_an_index_this_replica_cannot_reach_crosses_as_timeout()
                        timeout=TIMEOUT)
 
     assert refused.error_code == client_pb2.TIMEOUT
-    assert refused.read_index == beyond_any_log, (
-        "the basis the caller named comes back with the refusal, so that the same read can "
-        "be made again at it on another replica")
+    assert refused.read_index == 0, (
+        "no basis crosses, because there was no answer for one to be the basis of - the "
+        "index the read was named at is the request, and the caller already has it")
     assert refused.message, "and the reason says how far behind this replica is"
+
+    # A range read refuses this way too, and says nothing about an index either: what
+    # the field means is the answer's, and not the call's.
+    rows = stub.Scan(client_pb2.ScanRequest(start_key=b"a", end_key=b"z",
+                                            read_index=beyond_any_log),
+                     timeout=TIMEOUT)
+    assert rows.error_code == client_pb2.TIMEOUT
+    assert rows.read_index == 0, "a range read that never answered is as of nothing"
 
 
 # -- the index a read is answered at -------------------------------------------

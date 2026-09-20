@@ -14,9 +14,11 @@ because a caller that names none is asking for the server's own default rather t
 index 0 - 0 is not a position a log has been applied at, and a magic value meaning "not
 asked" is a contract the next reader has to be told instead of read, the same choice
 `GetRequest.timestamp` makes.  The responses carry it plain, because a server that read
-something knows how far its log had got when it looked, and so always has one to give;
-`FollowerReadIndexResponse.read_index` is that same field, answering the same question
-about the same index, which is where a caller gets the index to name.
+something knows how far its log had got when it looked, and so has one to give - and a
+server that read nothing, which is what a caller behind the log is told, has none: its
+response says the one thing a client may not name.  `FollowerReadIndexResponse.read_index`
+is that same field, answering the same question about the same index, which is where a
+caller gets the index to name.
 
 A fifth field is here because of those: `FollowerReadIndexRequest` carries a flag saying
 that the question is for the node it was asked of and nobody else.  Two callers ask this

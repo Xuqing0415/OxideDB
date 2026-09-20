@@ -183,16 +183,8 @@ class RemoteNodeClient:
         has an index 0 - and a refusal that never reached a state machine is the case
         that uses it.  A refusal the machine did make carries the index the answer was
         seen at, which is a basis like any other: a key behind a lock was observed at
-        one.
-
-        A read named at an index that was not applied in time is the exception, and it
-        is not a basis: the index comes back so that the same read can be asked again
-        at it somewhere else, which is the request rather than an answer.  The local
-        carrier leaves the field unset for that read, and reading the field back here
-        is what keeps a result from depending on which side of a wire it came from.
+        one.  Both of those are the servicer's to say, and it says what the node said.
         """
-        if response.error_code == client_pb2.TIMEOUT:
-            return None
         return response.read_index or None
 
     @staticmethod

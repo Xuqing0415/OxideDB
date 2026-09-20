@@ -81,11 +81,8 @@ class ClientServicer(ClientServiceServicer):
 
         response = client_pb2.GetResponse(
             error_code=self._wire_code(result.error_code),
-            message=self._message(result),
-            # Which index the answer is as of, out here as well as in the result: the
-            # caller named it, or this node produced it - and it is what a caller with
-            # many reads to make at one snapshot names on the reads that follow.
-            read_index=read_index)
+            message=self._message(result))
+        self._the_basis_of_the_answer(response, result.read_index)
         # Unset rather than empty: a key that is not there at this snapshot is a read
         # that answered, and the caller tells it from a failure by the error code.
         if result.success and result.value is not None:
@@ -111,14 +108,20 @@ class ClientServicer(ClientServiceServicer):
         except ScanRefused as refusal:
             response = client_pb2.ScanResponse(
                 error_code=self._wire_code(refusal.error_code),
-                message=refusal.error_msg or "",
-                read_index=read_index)
+                message=refusal.error_msg or "")
+            # The basis, unless the node never got as far as a state machine.  The rule
+            # is Get's, said out here because a range read that refuses raises instead
+            # of returning a result to take it from.
+            self._the_basis_of_the_answer(
+                response,
+                None if refusal.error_code == ErrorCode.ERR_TIMEOUT else read_index)
             if refusal.key is not None:
                 response.locked_key = refusal.key
             self._add_leader_hint(response, refusal.error_code)
             return response
 
-        response = client_pb2.ScanResponse(error_code=client_pb2.OK, read_index=read_index)
+        response = client_pb2.ScanResponse(error_code=client_pb2.OK)
+        self._the_basis_of_the_answer(response, read_index)
         for key, value, commit_ts in rows:
             entry = response.entries.add()
             entry.key = key
@@ -302,6 +305,25 @@ class ClientServicer(ClientServiceServicer):
     def _message(result) -> str:
         """The shard's prose for a refusal, and nothing at all for an answer."""
         return "" if result.success else (result.error_msg or "")
+
+    @staticmethod
+    def _the_basis_of_the_answer(response, basis):
+        """Say which index the answer is as of, and nothing when it is as of none.
+
+        The field means out here what ``ReadResult.read_index`` means in process - the
+        index this answer was made at - so what goes on the wire is the node's own
+        answer about it, and a node that never reached a state machine has none to
+        give.  The one index in hand then is the one the read was named at, which is
+        the request rather than an answer: a field carrying that on some responses and
+        a basis on others would be one name for two things, and a caller cannot act on
+        a value whose meaning depends on which response it arrived in.
+
+        Nothing is written when there is no basis, because the response field has no
+        presence: 0 is what a response that was answered as of nothing says, and no
+        log has an index 0.
+        """
+        if basis is not None:
+            response.read_index = basis
 
     def _add_leader_hint(self, response, error_code):
         """Name the leader, on the one refusal that has somewhere to send the caller."""
