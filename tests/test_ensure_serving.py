@@ -21,6 +21,11 @@ reading: what the view says it holds, for the publisher that asks it.  They are 
 because that is where a closed group went wrong - the range map still named the shard
 and the shard server still named this node, so a node that had just stopped serving a
 shard would have been written into the table as a replica of it.
+
+The last test is the boundary of this call rather than a case of it: what a cluster
+answers to "who serves this shard" is the routing table's placement, `ensure_serving`
+must not write it, and the call that does is `apply_move_locally`.  The two disagree
+for the length of a move's drain window on purpose.
 """
 
 import os
@@ -333,5 +338,36 @@ def test_the_cluster_closing_twice_is_closing_once(tmp_path):
 
         assert cluster.ensure_serving(0, [1, 2]) == []
         assert cluster.orphan_dirs() == orphans, "and nothing else was put aside"
+    finally:
+        cluster.shutdown()
+
+def test_the_placement_moves_on_its_own_call_and_not_on_this_one(tmp_path):
+    """Where a committed move's two halves live, and why they are two calls.
+
+    ``ensure_serving`` changes the groups this cluster holds; it must not change what this
+    cluster answers to "who serves this shard", because the routing table moves a step
+    earlier: between the two, the table names the new set while the group it left is still
+    up and still answering, which is the window a client that cached the old table finishes
+    its read in.  So the two are made to disagree here - a placement written by hand, then
+    a call that builds and closes groups - and the placement is asserted to be untouched.
+
+    ``_placed_shards`` is written by hand because the only other writer is a committed
+    move, and a test that drove one would be testing the move rather than this boundary.
+    """
+    cluster = _in_process_cluster(tmp_path)
+    try:
+        cluster._placed_shards[0] = [1]
+
+        assert cluster.ensure_serving(0, [1, 2, 3]) == [], "every node already held it"
+        assert cluster.serving_nodes(0) == [1], \
+            "building and closing groups is not the routing table's placement"
+
+        cluster.apply_move_locally(0, [2, 3])
+        assert cluster.serving_nodes(0) == [2, 3]
+        assert _holders(cluster, 0) == [1, 2, 3], \
+            "the placement moved and the groups did not, which is the order a move needs"
+
+        cluster.apply_move_locally(0, [2, 3])
+        assert cluster.serving_nodes(0) == [2, 3], "writing it twice is writing it once"
     finally:
         cluster.shutdown()

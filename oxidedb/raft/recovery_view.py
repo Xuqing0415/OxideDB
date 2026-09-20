@@ -196,7 +196,8 @@ class RecoveryView(Protocol):
         holds a group and is not in the set is closed and its storage put aside for the
         operator, and a member whose group has different members is closed and built again
         - a ``MemoryRaftNode`` takes its peers once and keeps them.  What the routing table
-        holds is not this call's to change: a placement moves when the table moves.  What
+        holds is not this call's to change: a placement moves when the table moves, and
+        :meth:`apply_move_locally` is that call.  What
         it returns is the nodes whose group it closed, so a caller can tell a call that did
         something from one that found the work already done.  Idempotent.
         """
@@ -223,6 +224,26 @@ class RecoveryView(Protocol):
         anything failing.  The source keeps what it had below the point and the shard the
         split created owns the rest.  Idempotent: the same split applied twice is the same
         map.
+        """
+
+    def apply_move_locally(self, shard_id: int, nodes: List[int]) -> None:
+        """Where the table now says ``shard_id`` is served: make that this side's answer.
+
+        The move's half of :meth:`apply_split_locally`, and a call of its own for the same
+        reason: the routing table has two writes, and what each of them changes is local to
+        whoever holds the answer, so it has to change in one step.  What a move's changes is
+        the placement - the set of nodes the shard belongs to from here on - and it is made
+        here *before* the group that left is let go, because between the two the table names
+        the new set while the old group is still answering: everything this side says about
+        the shard in that window - who serves it, which of them leads it, which address it
+        publishes - has to be about the new set, and what it said before belongs to the group
+        that has just left.
+
+        A side that keeps a placement writes it down here.  A process keeps none, because who
+        serves a shard there is read off the group it holds, so for it there is nothing to
+        write and this call changes nothing - and what it must not do instead is go on
+        answering with the group it is leaving, which is :meth:`ensure_serving`, the step
+        after.  Idempotent: the same placement written twice is the same placement.
         """
 
     # -- the table itself -----------------------------------------------------

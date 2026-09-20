@@ -94,19 +94,25 @@ class RecoveryView(Protocol):
     """What a recovery needs from wherever it is running."""
 
     def shard_ids(self) -> List[int]: ...
-    def ranges(self) -> RangeMap: ...
-    def note(self, shard_id: int) -> Optional[Note]: ...
+    def node_ids(self) -> List[int]: ...
+    def range_map(self) -> RangeMap: ...
+    def pending_notes(self, shard_id: int) -> List[PendingNote]: ...
+    def remember_note(self, note: PendingNote) -> None: ...
     def forget_note(self, shard_id: int) -> None: ...
-    def freeze(self, shard_id: int, reason: str) -> None: ...
-    def unfreeze(self, shard_id: int) -> None: ...
+    def serving_nodes(self, shard_id: int) -> Optional[List[int]]: ...
+    def shard_replica_ids(self, shard_id: int) -> List[int]: ...
+    def addresses_on(self, shard_id: int, nodes: List[int]) -> Dict[int, str]: ...
     def leader_client(self, shard_id: int) -> Optional[NodeClient]: ...
     def leader_client_for_nodes(self, shard_id: int,
                                 nodes: List[int]) -> Optional[NodeClient]: ...
-    def serving_nodes(self, shard_id: int) -> List[int]: ...
+    def freeze(self, shard_id: int, reason: str) -> None: ...
+    def unfreeze(self, shard_id: int) -> None: ...
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]: ...
+    def ensure_group_on(self, shard_id: int, nodes: List[int]) -> None: ...
     def apply_split_locally(self, shard_id: int, split_key: bytes,
                             new_shard_id: int) -> None: ...
-    def metadata(self): ...
+    def apply_move_locally(self, shard_id: int, nodes: List[int]) -> None: ...
+    def metadata_client(self): ...
 ```
 
 * **`shard_ids()`** - the shards this process looks after: the keys of its range map,
@@ -115,19 +121,35 @@ class RecoveryView(Protocol):
   group for": that is a different question, an implementation answers it from its groups
   rather than from its range map, and it is the one `ensure_serving` is there to change.
   A read.
-* **`ranges()`** - the ranges this process believes in, the source shard's included.  A
+* **`node_ids()`** - the nodes this side holds at all, which is the set a group built
+  beside the shard is made of: a split's new shard is served by every node, and the group
+  a move builds has the target set as its members and not the source's.  A read.
+* **`range_map()`** - the ranges this process believes in, the source shard's included.  A
   split needs the range it is splitting, a move needs the range it is copying.  A read.
-* **`note(shard_id)`** - the split or the move a replica this process holds wrote down, as
-  it is on disk, or None.  One call for both kinds: which one it is is the note's business
-  and not the caller's.  A read.
+* **`pending_notes(shard_id)`** - every note a replica this process holds wrote down for
+  the shard, as it is on disk, and an empty list when there are none.  One call for both
+  kinds: which kind a note is is the note's own business, and a recovery that picks between
+  notes is reading the one field that says.  A read.
+* **`remember_note(note)`** - write one down, on every replica this side holds for the
+  shard it is about.  Written before the first row moves, because the window between the
+  copy and the proposal is the one place the work exists nowhere else: rows in a group the
+  table has not been told about, and a freeze nothing has recorded.  Idempotent.
 * **`forget_note(shard_id)`** - drop that note on every replica this process holds.  A
   replica whose storage has already been closed cannot be reached, which is why that is a
   no-op here rather than an error.  Idempotent.
-* **`freeze(shard_id, reason)`** - refuse commands that add rows on the replicas this
-  process holds, with the reason the refusal quotes.  Commits and rollbacks still go
-  through: they are the end of a transaction that prewrote before this.  Idempotent.
-* **`unfreeze(shard_id)`** - the reverse, for the source of a split that is done and for a
-  move the table refused.  Idempotent.
+* **`serving_nodes(shard_id)`** - the replica set the routing table names, or - with no
+  table, as in an in-process test - this cluster's own answer.  It is how a cluster that
+  comes back learns how far a move got, so it is a read of the table and of nothing local.
+  None is the process side's third answer, a table that names the shard and a placement of
+  its own it does not have.
+* **`shard_replica_ids(shard_id)`** - the members of the group for the shard, as this side
+  has them.  What a proposal publishes as the new set, and not the same question as
+  `serving_nodes`: a shard being moved has two groups for a moment and this one names the
+  group the side is building rather than the one the table names.  A read.
+* **`addresses_on(shard_id, nodes)`** - where each of `nodes` serves the shard, as those
+  nodes bound it.  Asked of a set, because the nodes a move is going to are not the nodes
+  the shard is served by yet, and a proposal that took its addresses from the shard's own
+  answer would hand the table the addresses of the group it is leaving.  A read.
 * **`leader_client(shard_id)`** - a `NodeClient` for whatever leads the shard, wherever
   that is, or None while nobody does.  This is the only way the recovery moves rows: it
   reads the source and proposes into the target through it, and in a process the client it
@@ -139,9 +161,11 @@ class RecoveryView(Protocol):
   rather than a default argument on the other one: a caller that forgot the set would be
   handed the wrong group's leader, and the wrong group's leader here is the shard the
   rows are being copied out of.  A read.
-* **`serving_nodes(shard_id)`** - the replica set the routing table names, or - with no
-  table, as in an in-process test - this cluster's own answer.  It is how a cluster that
-  comes back learns how far a move got, so it is a read of the table and of nothing local.
+* **`freeze(shard_id, reason)`** - refuse commands that add rows on the replicas this
+  process holds, with the reason the refusal quotes.  Commits and rollbacks still go
+  through: they are the end of a transaction that prewrote before this.  Idempotent.
+* **`unfreeze(shard_id)`** - the reverse, for the source of a split that is done and for a
+  move the table refused.  Idempotent.
 * **`ensure_serving(shard_id, nodes)`** - make what this process holds match that set:
   build its member of the group if it is in the set and holds nothing, close its member if
   it holds one and is not.  What the publisher follows is the group this side holds: the
@@ -149,20 +173,36 @@ class RecoveryView(Protocol):
   both from naming this side - see the last constraint in section 5.  A side with nowhere
   to keep a placement, which a process is, reads its answer to "who serves this shard" off
   the group it holds too, so there the two are one event; a cluster's answer is
-  `_placed_shards`, written one step earlier, and section 4 has that order.  What it
-  returns is the nodes whose group it closed, which is how a caller that ran twice tells a
-  call that did something from one that found the work already done.  What a close leaves
-  on disk - the group's storage, put aside under an orphan name rather than deleted - is
-  the cluster side's half of this and is not written on the process side yet.  Idempotent.
+  `_placed_shards`, written one step earlier by `apply_move_locally`, and section 4 has
+  that order.  What it returns is the nodes whose group it closed, which is how a caller
+  that ran twice tells a call that did something from one that found the work already
+  done.  What a close leaves on disk - the group's storage, put aside under an orphan name
+  rather than deleted - is the cluster side's half of this and is not written on the
+  process side yet.  Idempotent.
+* **`ensure_group_on(shard_id, nodes)`** - build this side's member of the group and close
+  nothing, which is the one asymmetry between the two sides.  A move builds the group its
+  rows are going into while the source is still the group the table names, so the nodes
+  holding that shard are not any one replica set: a cluster holds both groups, and this is
+  how it builds the second; a process holds one, and this is the whole of what it does
+  about the group it is being asked to join.  Idempotent.
 * **`apply_split_locally(shard_id, split_key, new_shard_id)`** - the range map this process
   routes by becomes the new one, so that the publisher sees a cluster that agrees with the
-  table rather than one mid-split.  Idempotent.
-* **`metadata()`** - the routing table's group as a client, for reading placements and for
-  the two writes that finish a split or a move.  Deliberately not named as a type, exactly
-  as in `MetadataPublisher`: the in-process `MetadataClient` and the `RemoteMetadataClient`
-  both answer `table`, `split_shard`, `move_shard` and `list_shards`, and which one a node
-  holds is the difference between a recovery that only works where it leads the group and
-  one that works anywhere.
+  table rather than one mid-split.  A move's second write has the call beside this one,
+  `apply_move_locally`.  Idempotent.
+* **`apply_move_locally(shard_id, nodes)`** - where the table now says the shard is served:
+  the placement, written down before the group that left is let go, because between the two
+  the table names the new set while the old group is still up and still answering - which
+  is the window a client that cached the old table finishes its read in.  A side that keeps
+  a placement writes it here; a process keeps none, because who serves a shard there is
+  read off the group it holds, so it has nothing to write down and must not go on
+  answering with the group it is leaving, which is `ensure_serving`, the step after.
+  Idempotent.
+* **`metadata_client()`** - the routing table's group as a client, for reading placements
+  and for the two writes that finish a split or a move.  Deliberately not named as a type,
+  exactly as in `MetadataPublisher`: the in-process `MetadataClient` and the
+  `RemoteMetadataClient` both answer `table`, `split_shard`, `move_shard` and
+  `list_shards`, and which one a node holds is the difference between a recovery that only
+  works where it leads the group and one that works anywhere.
 
 One boundary worth writing down beside these calls, because it costs a walk through the
 code to find again: `NodeClient.follower_read_index` answers with an index and a reason,
@@ -177,8 +217,8 @@ of finding it.
 
 Everything else the recovery does - reading the source's rows, deciding which row the
 target is missing, building the command, retrying a proposal whose answer never came -
-is written once, in the recovery, against `NodeClient` and `metadata()`.  That is why
-the sketch this document grew out of had two calls that are not here: `copy_rows(...)`
+is written once, in the recovery, against `NodeClient` and `metadata_client()`.  That is
+why the sketch this document grew out of had two calls that are not here: `copy_rows(...)`
 and `propose(...)` are not things the two sides do differently, they are the shared
 implementation reaching through `leader_client`.
 
@@ -228,8 +268,8 @@ thirteen and the three land like this:
   admitted, and it runs before anything is written down, so it sits on the far side of the
   seam drawn above rather than in the recovery.
 * `_serving_nodes` - `serving_nodes`, under the interface's name.  `_placed_shards` is what
-  it reads, and it is written where the routing table is: by `_commit_move`, when the table
-  has agreed, and never by `ensure_serving`.
+  it reads, and it is written where the routing table is: by `apply_move_locally`, which
+  `_commit_move` calls once the table has agreed, and never by `ensure_serving`.
 * `_ensure_shard`, `_retire_source` - `ensure_serving`, which is one call for both
   directions.  `_close_group_on` is what it closes through.  `_ensure_group_on` is *not*
   part of it, and the reason is the one asymmetry between the two implementations: that
@@ -299,14 +339,15 @@ Becomes the view (public, one implementation of `RecoveryView`):
 * `ensure_serving(shard_id, nodes)` is `_retire_source` + `_close_group_on` + a build
   for every node that holds nothing.  It is the second of the two steps `_commit_move`
   takes, and the order between them is what made section 2 and this list read as if they
-  disagreed.  The first step writes the routing table's answer down: `_placed_shards`
-  becomes the set the proposal landed, and the `_migrations` entry that was answering with
-  the old set goes, so from there `serving_nodes` names the new one.  The second step is
-  this call, and it changes the groups the cluster actually holds.  What lies between them
-  is the drain window: the table already names the new set while the old group is still up
-  and still answering, which is what lets a client that routed by the table it cached
-  finish the read it arrived with.  So `ensure_serving` must not write `_placed_shards` -
-  that is the table's answer, and it moves when the table does, one step earlier.
+  disagreed.  The first step writes the routing table's answer down, and it is
+  `apply_move_locally`: `_placed_shards` becomes the set the proposal landed, the
+  `_migrations` entry that was answering with the old set goes, and from there
+  `serving_nodes` names the new one.  The second step is this call, and it changes the
+  groups the cluster actually holds.  What lies between them is the drain window: the table
+  already names the new set while the old group is still up and still answering, which is
+  what lets a client that routed by the table it cached finish the read it arrived with.
+  So `ensure_serving` must not write `_placed_shards` - that is the table's answer, and it
+  moves when the table does, one step earlier.
 
   A process has no such order and loses nothing by that: it has nowhere to keep a
   placement, so who serves a shard there is read off the group it holds, and the two steps
@@ -334,8 +375,11 @@ Stays internal (helpers the recovery calls through the view, or uses itself):
   `RecoveryRunner`'s, held by the cluster as `self._recovery_runner`.  `_finish_move`,
   `_propose_move`, `_commit_move` and `_abort_move` are the other half, and have not.
 * `_orphan_dirs` and `_placed_shards` stay here: what has been set aside and what the
-  routing table names are this cluster's own bookkeeping, and `ensure_serving` and
-  `serving_nodes` are the only doors onto them.
+  routing table names are this cluster's own bookkeeping.  `serving_nodes` reads the
+  second of them and `apply_move_locally` writes it, which is the pair the interface has
+  for it; `ensure_serving` deliberately does neither, because the placement moves when the
+  table moves and not when the groups do - the drain window is exactly the stretch in which
+  the two disagree, and it is what lets a client that cached the table finish its read.
 * `_migrations`, `_pending_splits` and the two `_last_*_error` strings go with the
   recovery body, because they are a running recovery's working state - the boundary
   section 3 draws.  The split's two have gone; `_migrations` and `_last_migration_error`
@@ -371,7 +415,7 @@ The three things that exist nowhere yet, and what each one actually costs.
 and already in the launcher: `_metadata_writer` is a `RemoteMetadataClient` over the
 metadata group's seeds, constructed for the publisher precisely because the in-process
 `MetadataClient` only answers where this node leads the group.  The recovery's
-`metadata()` is that same client, handed in rather than constructed a second time.
+`metadata_client()` is that same client, handed in rather than constructed a second time.
 `serving_nodes` is `list_shards()`, and a placement it does not name means the shard is
 not in the table at all - which is the third answer `recover_migrations` already knows
 how to refuse.

@@ -816,6 +816,33 @@ class ShardedRaftCluster:
         new_range_map[new_shard_id] = (split_key, end)
         self.update_range_map(new_range_map)
 
+    def apply_move_locally(self, shard_id: int, nodes: List[int]) -> None:
+        """Write down that the routing table now names ``nodes`` for ``shard_id``.
+
+        The move's half of :meth:`apply_split_locally`: both are a write the routing table
+        has just made, applied on the side that has to live with it, in one call because a
+        caller that left a step out would be answering about a shard two groups are holding.
+        Two of this cluster's answers are about the shard, and both become the new set's:
+
+        * ``_placed_shards``, which is who serves the shard until the placement this cluster
+          was moved to replaces the one it was started with - and until this call it has
+          been answering with the group the move is leaving.
+        * what the publisher last published about who *leads* the shard, which was about
+          that same group, and the two groups' terms are not comparable: left alone, the
+          publisher would not name the new group's leader until its term passed a term
+          belonging to another group entirely.
+
+        What is not here is the groups themselves: this call changes what this cluster says
+        about the shard, and :meth:`ensure_serving` - the next step, after the drain window -
+        changes what it holds.  Between the two they disagree on purpose, because the table
+        has moved on and a client that cached it has not.
+
+        See :class:`RecoveryView.apply_move_locally`.
+        """
+        self._placed_shards[shard_id] = sorted(set(nodes))
+        if self._metadata_publisher is not None:
+            self._metadata_publisher.forget_leader(shard_id)
+
     def move_shard(self, shard_id: int, target_nodes: List[int],
                    drain: float = MIGRATION_DRAIN_SECONDS) -> bool:
         """Move ``shard_id`` to a new group on ``target_nodes``: freeze, copy, tell, let go.
@@ -1164,8 +1191,10 @@ class ShardedRaftCluster:
 
         1.  This cluster's own answer for the shard becomes the new set, so every question
             it answers about the shard - who serves it, where its leader is, which address
-            to publish - is answered with the group the table names.  The group it left is
-            still up for the next step, and is not the answer to anything.
+            to publish - is answered with the group the table names.  That write is
+            :meth:`apply_move_locally`, one call for the placement and for the leader this
+            cluster last published, because from here on the group it left is not the
+            answer to anything.  The group itself is still up for the next step.
         2.  That group goes on answering for a fixed window (``drain``).  A client routes
             by a table it cached, so the node it was sent to a moment ago is a node it may
             still ask: the window is what lets a client finish the read it arrived with
@@ -1194,14 +1223,12 @@ class ShardedRaftCluster:
         that was already committed - which is an answer and not a failure, and is the
         difference a caller can see between "I did it" and "it was done".
         """
-        self._placed_shards[shard_id] = sorted(set(target_nodes))
+        # The placement, and the leader this cluster last published for the shard, in one
+        # call: both are this cluster's answer for the shard, and both belong to the group
+        # that has just left.  What the shard is *held* by does not change until the step
+        # below, and is meant not to.
+        self.apply_move_locally(shard_id, target_nodes)
         self._migrations.pop(shard_id, None)
-        if self._metadata_publisher is not None:
-            # What it last published about who leads this shard was about the group that
-            # has just left, and the two groups' terms are not comparable: left alone,
-            # the publisher would not name the new group's leader until that group's term
-            # passed a term belonging to another group entirely.
-            self._metadata_publisher.forget_leader(shard_id)
 
         if drain > 0:
             time.sleep(drain)
