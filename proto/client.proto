@@ -186,6 +186,13 @@ message GetWriteRecordResponse {
 }
 
 message FollowerReadIndexRequest {
+    // Ask this node itself, and do not let it pass the question on.  A caller that is
+    // trying to find out who leads has to ask that way: an index that came from another
+    // node cannot tell "this node leads the shard" from "this node knows who does", and
+    // the walk over a group that looks for its leader rests on the difference.  Unset
+    // lets the node ask the leader for one, which is what a caller that only wants a
+    // fresh index wants - it asked this node because this is where its read is going.
+    bool answer_locally = 1;
 }
 
 message FollowerReadIndexResponse {

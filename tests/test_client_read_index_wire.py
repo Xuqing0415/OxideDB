@@ -17,6 +17,15 @@ asked" is a contract the next reader has to be told instead of read, the same ch
 something knows how far its log had got when it looked, and so always has one to give;
 `FollowerReadIndexResponse.read_index` is that same field, answering the same question
 about the same index, which is where a caller gets the index to name.
+
+A fifth field is here because of those: `FollowerReadIndexRequest` carries a flag saying
+that the question is for the node it was asked of and nobody else.  Two callers ask this
+question and they want different things.  A client wants a fresh index so that the node it
+is about to read from can serve the read, and leaves the node free to ask the leader for
+one.  A caller walking a group - `leader_client_for_nodes`, on either side of the seam -
+wants to know which node leads it, and an index that came from somewhere else cannot tell
+it "this node leads" from "this node knows who does", so it says so and is refused by every
+node that does not lead.
 """
 
 from oxidedb.proto import client_pb2 as pb
@@ -58,6 +67,15 @@ def test_the_four_fields_are_where_the_contract_says_they_are():
     assert pb.GetResponse.DESCRIPTOR.fields_by_name["read_index"].number == 6
     assert pb.ScanRequest.DESCRIPTOR.fields_by_name["read_index"].number == 4
     assert pb.ScanResponse.DESCRIPTOR.fields_by_name["read_index"].number == 6
+
+
+def test_a_question_meant_for_one_node_says_so():
+    """The flag that keeps a walk over a group from being answered by every node in it."""
+    request = pb.FollowerReadIndexRequest()
+
+    assert pb.FollowerReadIndexRequest.DESCRIPTOR.fields_by_name["answer_locally"].number == 1
+    assert request.answer_locally is False, "unset leaves the node free to ask the leader"
+    assert pb.FollowerReadIndexRequest(answer_locally=True).answer_locally is True
 
 
 def test_a_row_does_not_carry_one_because_a_row_is_not_a_read():
