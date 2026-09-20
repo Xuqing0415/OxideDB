@@ -29,7 +29,18 @@ for it - that lookup is the table's answer - and the first version of these test
 the target's leader with a factory and a node id instead, saying in a comment that the
 interface could not name it.  It can name it now: ``leader_client_for_nodes(shard_id,
 nodes)``, whose own tests are the two at the end of this file.
+
+The test that keeps that lookup in the copy's body is a gatekeeper rather than a behaviour
+test, in the spirit of ``tests/test_client_boundary.py``, and it is one because running the
+copy here cannot turn the mistake red: this cluster answers a shard it has no entry for with
+every node it holds, and the group a split just built is one of them.  What a process is
+answered with, for the same code, is None.  The body is read instead, and read for the
+argument as well as for the name - the copy asks for the source by id too, and is right to,
+because the source is a shard the routing table does name.
 """
+
+import ast
+import pathlib
 
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -342,3 +353,98 @@ def test_a_set_that_leads_nothing_answers_none():
         assert cluster.leader_client_for_nodes(0, followers) is None, "they are following"
     finally:
         cluster.shutdown()
+
+# -- the name the group being filled is reached by ------------------------------
+
+#: The two lookups, by the attribute each is written as.  One name is a prefix of the
+#: other, so the scan compares whole attribute names rather than looking for text.
+BY_ID = "leader_client"
+BY_NODES = "leader_client_for_nodes"
+
+#: The copy's own name for the shard it is filling, which is what lets a scan tell the two
+#: lookups apart: the source is reached by id in the same body, and only one of the two may
+#: be.  A scan for the lookup alone would have to ban a call that is right.
+FILLING = "new_shard_id"
+
+RUNNER_SOURCE = (pathlib.Path(__file__).resolve().parents[1]
+                 / "oxidedb" / "raft" / "recovery_runner.py")
+
+
+def _definition(source, name):
+    """The definition of ``name`` in ``source``."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not in this source, so nothing would be scanned")
+
+
+def _calls(source, name):
+    """Every attribute call in ``name``'s body: its line, its attribute, its arguments."""
+    found = []
+    for node in ast.walk(_definition(source, name)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            found.append((node.lineno, node.func.attr,
+                          [ast.unparse(argument) for argument in node.args]))
+    return found
+
+
+def _filled_by_id(source):
+    """The lines of the copy where the group being filled is asked for by shard id."""
+    return [line for line, attribute, arguments
+            in _calls(source, "_copy_what_is_missing")
+            if attribute == BY_ID and any(FILLING in argument for argument in arguments)]
+
+
+def test_the_group_the_copy_fills_is_asked_for_by_node_set():
+    """Read off the body, because running the copy here cannot turn this mistake red.
+
+    The group a split fills is not one the routing table names until the split's own
+    proposal lands, so it is asked for as a set of nodes: ``_wait_for_group``, which is
+    ``leader_client_for_nodes`` behind a deadline.  A by-id lookup would reach
+    ``_serving_nodes``, which this cluster answers for a shard it has no entry for with
+    every node it holds - so the copy lands, everything in this file passes, and a process,
+    which keeps no such fallback, is answered None for the same code.
+
+    The source is reached by id in the same body and is meant to be: it is a shard the
+    table does name.  So what is scanned is which lookup the new shard goes to, argument
+    included, and not whether one of the two names appears somewhere.
+    """
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    assert _filled_by_id(source) == []
+
+    reached_as_a_set = [arguments for _, attribute, arguments
+                        in _calls(source, "_copy_what_is_missing")
+                        if attribute == "_wait_for_group"]
+    assert len(reached_as_a_set) == 1, reached_as_a_set
+    assert FILLING in reached_as_a_set[0][0], reached_as_a_set
+
+
+def test_the_lookup_by_node_set_never_falls_back_to_the_shard_id():
+    """The same rule one level down: the name that answers about a set answers only one.
+
+    ``_wait_for_group`` is the single place the group being filled is reached from, so it
+    is the single place a by-id fallback could be written - and a fallback there would be
+    the mistake wearing the name of its fix.
+    """
+    attributes = [attribute for _, attribute, _ in
+                  _calls(RUNNER_SOURCE.read_text(encoding="utf-8"), "_wait_for_group")]
+    assert BY_NODES in attributes
+    assert BY_ID not in attributes
+
+
+def test_the_scan_catches_the_group_filled_asked_for_by_id():
+    """The control: the same body with the target reached by id is caught.
+
+    Without this, the test above would pass just as well if the scan were reading the
+    wrong method, or reading nothing at all.
+    """
+    source = RUNNER_SOURCE.read_text(encoding="utf-8")
+    by_set = "target = self._wait_for_group(new_shard_id, self._view.node_ids())"
+    by_id = "target = self._view.leader_client(new_shard_id)"
+    assert source.count(by_set) == 1
+
+    mutated = source.replace(by_set, by_id)
+
+    assert _filled_by_id(mutated) != []
+    assert [attribute for _, attribute, _ in _calls(mutated, "_copy_what_is_missing")
+            if attribute == "_wait_for_group"] == []

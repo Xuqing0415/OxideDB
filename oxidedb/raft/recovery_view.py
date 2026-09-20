@@ -45,20 +45,6 @@ from ..shard.router import RangeMap
 from .recovery_notes import PendingNote
 
 
-class RecoveryInvariantError(RuntimeError):
-    """A side answered something that contradicts a fact a recovery is written against.
-
-    Raised by the recovery rather than reported as a failure of the shard, because the
-    four outcomes a split or a move has are about the work - refused by the table,
-    unanswered, no leader yet, done - and a side that breaks one of the facts stated
-    above has made a mistake that no further attempt will fix.  Recording it as one more
-    try would file a bug as a retry and leave it to be found somewhere else.
-
-    The first fact of this kind is the split's copy: the shard it copies into is one the
-    routing table does not name, so asking for that group by shard id is a question with
-    no honest answer on the other side of the boundary.
-    """
-
 
 @runtime_checkable
 class RecoveryView(Protocol):
