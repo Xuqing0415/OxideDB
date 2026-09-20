@@ -517,6 +517,13 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
                 "and the note is still on disk until the move is finished"
             assert cluster._serving_nodes(0) == MOVE_TO, \
                 "while the cluster already routes to the new group"
+            # ...and the move is still in flight, which is a second thing about the same
+            # window and not the same one.  The phase is what a *lookup* about the shard
+            # reads, and it has moved on; the record is what a *publisher* reads, and it
+            # stays until the group this side is still holding has gone - the group a
+            # publisher landing here would describe the shard out of.
+            assert list(cluster.migrations()) == [0], \
+                "and the move is still in flight while that group is still here"
         finally:
             thread.join(timeout=15)
 

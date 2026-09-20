@@ -318,8 +318,12 @@ class RecoveryRunner:
         """The move this side has begun or picked up for ``shard_id``, if there is one.
 
         A shard with one of these has two groups for a moment - the one the routing table
-        names and the one it is about to - so this is also what says which of the two a
-        lookup about the shard means, and what a view answers while that is true.
+        names and the one it is about to - so a lookup about the shard has to be told which
+        of the two it means.  What answers that is the phase: until the proposal lands the
+        answers are the group the move is leaving, and after it the placement
+        (``MigrationPhase.DONE``).  The record itself outlives that switch by the drain
+        window, which is what keeps a publisher from describing the shard out of the group
+        this side is still holding - see :meth:`_commit_move`.
         """
         return self._migrations.get(shard_id)
 
@@ -894,6 +898,14 @@ class RecoveryRunner:
             or an operator's mistake, finds the rows still here; nobody finds them by
             accident, because nothing looks under that name.  A leaked directory costs
             disk and a lost range costs the data.
+        6.  The in-memory record of the move goes, and last rather than first: while it is
+            here this side is a side with a move in flight, which is what keeps a publisher
+            from describing the shard out of the group this side happens to hold - and until
+            step 4 is done that group is the one the move is leaving.  A publisher that
+            landed in between would write that set back over the one the proposal landed.
+            What the record no longer decides, from step 1 on, is *which* group a lookup
+            about the shard means: that is the phase, which is how a lookup and a publisher
+            can want different things at the same moment.
 
         Every step is a no-op the second time, because the caller may be a side that died
         in the middle of these and started again: closing a shard that is already closed,
@@ -909,7 +921,16 @@ class RecoveryRunner:
         # that has just left.  What the shard is *held* by does not change until the step
         # below, and is meant not to.
         self._view.apply_move_locally(shard_id, target_nodes)
-        self.drop_migration(shard_id)
+
+        # The proposal has landed - the table names ``target_nodes`` for the shard - and
+        # that is the phase: the order is freeze, copy, propose, done.  Set here rather
+        # than by the caller that proposed, because the caller of this method is also a
+        # side that came back and found the table already moved further than its note
+        # says.  From here a lookup about the shard is answered with the group the table
+        # names, while the record below is still what keeps a publisher quiet.
+        state = self.migration_state(shard_id)
+        if state is not None:
+            state.phase = MigrationPhase.DONE
 
         if drain > 0:
             time.sleep(drain)
@@ -918,7 +939,16 @@ class RecoveryRunner:
         # a shard cannot be splitting and moving at once, and the interface drops what a
         # shard has rather than what a caller names.
         self._view.forget_note(shard_id)
-        return self._view.ensure_serving(shard_id, target_nodes)
+        closed = self._view.ensure_serving(shard_id, target_nodes)
+
+        # And the record of the move goes last, which is step 6 of the docstring: a move in
+        # flight is this side saying it has no placement of its own to publish for the
+        # shard, and until the line above the group it would else be answering with is
+        # still held here.  Dropping the record first leaves a window in which this side
+        # holds the group the move left and reports no move in flight, and a publisher
+        # that lands in it writes that set back over the one the proposal landed.
+        self.drop_migration(shard_id)
+        return closed
 
     def _abort_move(self, state: MigrationState) -> List[int]:
         """Give up on a move the routing table refused, and put the shard back.

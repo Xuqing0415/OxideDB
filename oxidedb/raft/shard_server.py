@@ -1256,12 +1256,18 @@ class ShardedRaftCluster:
         that is the one clients are being routed to.
 
         After the proposal lands it means the second of them, which is the placement this
-        cluster was told or moved to (``_placed_shards``).  A shard nothing here has an
-        entry for is served by every node, which is the model this started with and what
-        a shard a split created still gets.
+        cluster was told or moved to (``_placed_shards``).  What says the proposal has
+        landed is the move's *phase* and not the move's going: the record outlives that
+        moment by the whole drain window, because while this side is still holding the
+        group the shard left, a publisher that read this side's placement would be
+        describing the shard out of a group the table has already given away - see
+        :meth:`RecoveryRunner._commit_move`, steps 1 and 6.
+
+        A shard nothing here has an entry for is served by every node, which is the model
+        this started with and what a shard a split created still gets.
         """
         state = self._recovery_runner.migration_state(shard_id)
-        if state is not None:
+        if state is not None and state.phase != MigrationPhase.DONE:
             return list(state.source_nodes)
         if shard_id in self._placed_shards:
             return list(self._placed_shards[shard_id])
