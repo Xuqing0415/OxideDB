@@ -14,8 +14,7 @@ from oxidedb.raft.shard_server import ShardedRaftCluster as ShardedCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 from oxidedb.tso.tso import TSOCluster
 from oxidedb.transaction.coordinator import TransactionCoordinator
-from oxidedb.transaction.smart_client import (Consistency, ReadIndexCache,
-                                              SmartClient)
+from oxidedb.transaction.smart_client import ReadIndexCache, SmartClient
 
 
 class _ClockWithoutAGroup:
@@ -154,21 +153,6 @@ def test_a_consistency_that_is_not_one_of_the_three_is_refused():
         client.get(b"user:1", consistency="Follower")
     with pytest.raises(ValueError, match="not a consistency"):
         client.scan(b"a", b"z", consistency="eventual")
-
-
-def test_a_level_this_client_does_not_implement_is_refused_rather_than_answered():
-    """A read the client cannot make at the level asked is not quietly made at another.
-
-    Answering it strongly would be the one failure a caller cannot detect: it would get an
-    answer, and nothing in it would say that the level it asked for was ignored.  So the
-    level that is not implemented raises, and says which one it was.  It used to be two:
-    a follower read is made now, and a level that is made is pinned where it is served -
-    over a real cluster, in ``test_client_routing.py`` - rather than by a raise here.
-    """
-    client = _a_client_that_covers_no_keys()
-
-    with pytest.raises(NotImplementedError, match=Consistency.CACHED):
-        client.get(b"user:1", consistency=Consistency.CACHED)
 
 
 def test_an_index_the_client_has_is_kept_for_the_reads_that_come_next():

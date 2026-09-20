@@ -46,7 +46,8 @@ from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (ErrorCode, MVCCStateMachine, ReadResult,
                                         ScanRefused)
 from oxidedb.transaction.coordinator import TransactionCoordinator
-from oxidedb.transaction.smart_client import Consistency, SmartClient
+from oxidedb.transaction.smart_client import (Consistency, ReadIndexCache,
+                                               SmartClient)
 from oxidedb.tso.tso import TSOCluster
 
 KEY_A = b"key0"      # first byte 0x6b -> shard 0
@@ -560,16 +561,21 @@ class _NodeThatNamesItsBasis:
     """A node that answers at an index of its own, the way a node that served a read does.
 
     A refusal is not an answer as of anything, so this is the shape every read that reached a
-    state machine comes back in - and the basis is the node\'s to fill in, because the machine
+    state machine comes back in - and the basis is the node's to fill in, because the machine
     it read from is handed entries to apply and not the positions they were written at.
+
+    ``named`` is what each read asked this node to answer at, in order: None when the read
+    named nothing and left the index to the node, which is what every level but the one that
+    remembers says.
     """
 
     def __init__(self, value, read_index):
         self._value = value
         self._read_index = read_index
+        self.named = []
 
     def get(self, key, timestamp=None, read_index=None):
-        assert read_index is None, "a level the node obtains the index for names none"
+        self.named.append(read_index)
         return ReadResult.success(self._value, read_index=self._read_index)
 
 
@@ -582,13 +588,15 @@ def test_a_read_keeps_the_index_the_node_answered_it_at():
     it: a first follower read is what makes a cached one possible at all.
     """
     addresses = {1: "node1:9001", 2: "node2:9001"}
-    factory = _AddressBookFactory({addresses[2]: _NodeThatNamesItsBasis(b"v1", 7)})
+    node = _NodeThatNamesItsBasis(b"v1", 7)
+    factory = _AddressBookFactory({addresses[2]: node})
     router = RoutingCache(_FakeCluster({}),
                           _FakeTableSource(_table_with_addresses(1, addresses)),
                           factory=factory, local_node_id=2)
     client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
 
     assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+    assert node.named == [None], "this level names no index: the node obtained one"
     # The cache has no other handle: what a level will read at is not something a caller of a
     # read is meant to reach for, so the test reaches in rather than opening one.
     assert client._read_index_cache.cached_index(0) == 7, (
@@ -596,31 +604,169 @@ def test_a_read_keeps_the_index_the_node_answered_it_at():
 
 
 class _NodeThatAnswersARange:
-    """A node that answers a range with rows, wherever it is asked from."""
+    """A node that answers a range with rows, wherever it is asked from.
+
+    ``named`` is what each range was asked for at, in order, the record
+    ``_NodeThatNamesItsBasis`` keeps for a point read.
+    """
 
     def __init__(self, rows):
         self._rows = rows
+        self.named = []
 
     def scan(self, start_key, end_key, timestamp=None, read_index=None):
+        self.named.append(read_index)
         return list(self._rows)
 
 
 def test_a_range_read_at_a_level_that_need_not_lead_goes_to_a_member():
     """A range is a piece per shard it crosses, and a piece is one read of that shard.
 
-    So the level is the piece\'s and not the range\'s: each piece goes to a member of its own
-    shard\'s set, and the caller asked for the level once.  What makes this worth its own test
+    So the level is the piece's and not the range's: each piece goes to a member of its own
+    shard's set, and the caller asked for the level once.  What makes this worth its own test
     is that the pick is per piece - a range read is a loop over shards, and a loop is where a
     lookup gets made once and used for all of them.
     """
     addresses = {1: "node1:9001", 2: "node2:9001"}
-    factory = _AddressBookFactory({addresses[2]: _NodeThatAnswersARange([(b"k", b"v")])})
+    node = _NodeThatAnswersARange([(b"k", b"v")])
+    factory = _AddressBookFactory({addresses[2]: node})
     router = RoutingCache(_FakeCluster({}),
                           _FakeTableSource(_table_with_addresses(1, addresses)),
                           factory=factory, local_node_id=2)
     client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
 
     assert client.scan(b"a", b"z", consistency=Consistency.FOLLOWER) == [(b"k", b"v")]
+    assert node.named == [None], "this level names no index: the node obtained one"
+
+
+# -- the level that reads at an index the client remembers ---------------------
+
+class _RecordingIndexCache:
+    """The client's memory of read indices, with a record of what was asked of it.
+
+    The two halves of the level are a question - is there an index worth naming - and a
+    statement - here is one that was just confirmed - and a test of whether the memory was
+    used, and whether it was refreshed, needs to see both of them.
+    """
+
+    def __init__(self, index=None):
+        self._index = index
+        self.asked = []
+        self.kept = []
+
+    def cached_index(self, shard_id):
+        self.asked.append(shard_id)
+        return self._index
+
+    def remember(self, shard_id, read_index):
+        self.kept.append((shard_id, read_index))
+
+
+def _a_read_client(node, local_node_id=2):
+    """A client whose table names two members for one shard, with ``node`` on the local one.
+
+    Two members and not one, because a set of one would make every level pick the same node
+    and the pick is half of what these levels are; only the local member has a handle, so
+    which member is asked is decided here rather than drawn.
+    """
+    addresses = {1: "node1:9201", 2: "node2:9201"}
+    factory = _AddressBookFactory({addresses[local_node_id]: node})
+    router = RoutingCache(_FakeCluster({}),
+                          _FakeTableSource(_table_with_addresses(1, addresses)),
+                          factory=factory, local_node_id=local_node_id)
+    return SmartClient(None, _FakeCluster({}), router=router, factory=factory)
+
+
+def test_a_cached_read_names_the_index_the_client_was_given():
+    """The level's whole saving: the index is the client's, so nobody is asked for one.
+
+    The first read is a follower read, so the node obtains the index, and the answer comes back
+    with it; the second read names what the client kept.  That a named index means no question
+    is asked for one is the node's half of this, pinned where the wire is (see
+    ``test_client_servicer.py``); what this pins is the client naming it, because a second read
+    that named nothing would be this level quietly becoming the one before it.
+    """
+    node = _NodeThatNamesItsBasis(b"v1", 7)
+    client = _a_read_client(node)
+
+    assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+    assert client.get(KEY_A, consistency=Consistency.CACHED) == b"v1"
+
+    assert node.named == [None, 7], (
+        "the node obtained an index for the first read and was handed one for the second")
+
+
+def test_a_cached_read_with_nothing_remembered_reads_the_way_a_follower_does():
+    """Nothing to name is not a refusal: the read is made at the level before this one.
+
+    A client that has read nothing of this shard has no index of its own to name, and what
+    that means is that the node obtains one - the read the follower level makes - rather than a
+    refusal or a quiet answer from the leader.  What comes back is kept, which is what makes
+    the read after this one the cached read that this one could not be.
+    """
+    node = _NodeThatNamesItsBasis(b"v1", 7)
+    client = _a_read_client(node)
+
+    assert client.get(KEY_A, consistency=Consistency.CACHED) == b"v1"
+
+    assert node.named == [None], "no index to name, so the node obtained one"
+    assert client._read_index_cache.cached_index(0) == 7, (
+        "and the index it answered at was kept for the read that comes next")
+
+
+def test_an_index_that_has_expired_is_not_named():
+    """A remembered index is worth using for a while, and then it is worth asking again.
+
+    How old an index may be is the whole of what the window decides, so a read past it must not
+    read at it anyway.  The clock here is the cache's own and is set to nothing: a test that
+    slept would be pinning how long this machine took to run two reads, which is not the thing
+    being decided, and would fail on a slow one.
+    """
+    node = _NodeThatNamesItsBasis(b"v1", 7)
+    client = _a_read_client(node)
+    client._read_index_cache = ReadIndexCache(ttl=0.0)
+
+    assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+    assert client.get(KEY_A, consistency=Consistency.CACHED) == b"v1"
+
+    assert node.named == [None, None], (
+        "the second read named nothing: what it held was no longer worth reading at")
+
+
+def test_a_read_that_named_an_index_does_not_put_it_back():
+    """What the window bounds is how old the index is, not how long ago it was last used.
+
+    A read at a remembered index confirmed nothing - the index is exactly as old as it was, and
+    the node that answered did not vouch for it being fresher - so the read does not re-stamp
+    it.  A client that did would hold its first index for as long as it kept reading, which is
+    the one thing the window is there to stop.
+    """
+    node = _NodeThatNamesItsBasis(b"v1", 7)
+    cache = _RecordingIndexCache(7)
+    client = _a_read_client(node)
+    client._read_index_cache = cache
+
+    assert client.get(KEY_A, consistency=Consistency.CACHED) == b"v1"
+
+    assert cache.asked == [0], "the index this client held is what the read was answered at"
+    assert cache.kept == [], "and nothing was put back: this read confirmed nothing"
+
+
+def test_a_range_read_names_the_index_the_client_remembers():
+    """A range is one read of each shard it crosses, so a piece names a basis the same way.
+
+    An index is a position in one shard's log, so a range read at it is as consistent as a point
+    read at it.  What a range read cannot do is keep one: the answer it gets is rows and not a
+    result with a basis in it, so there is nothing for it to put back (see the gap on range
+    reads).
+    """
+    node = _NodeThatAnswersARange([(b"k", b"v")])
+    client = _a_read_client(node)
+    client._read_index_cache = _RecordingIndexCache(7)
+
+    assert client.scan(b"a", b"z", consistency=Consistency.CACHED) == [(b"k", b"v")]
+
+    assert node.named == [7], "the piece was asked for at the index this client holds"
 
 
 # -- the two sources a placement can come from ---------------------------------
@@ -914,7 +1060,7 @@ def test_a_follower_read_is_served_by_a_member_of_the_shard_s_set():
     obtains it - so any member of the set can serve the read, and which member is the
     caller's draw.  Pinning that takes a client over a wire: a handle in this process has no
     channel to carry the index question over, so that member of the set is a member the
-    client reaches the leader through, which is ``test_client_servicer.py``\'s subject.
+    client reaches the leader through, which is ``test_client_servicer.py``'s subject.
 
     One handle per read is how a member is told from a walk: a member that had refused would
     have sent the client to another node, which is a second draw.  The value is asserted too,

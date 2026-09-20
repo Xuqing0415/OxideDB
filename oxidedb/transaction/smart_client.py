@@ -37,8 +37,10 @@ class Consistency:
     the caller chose rather than on the caller.
 
     ``CACHED`` is the client's own memory.  A replica answers at an index this client was
-    given earlier, and what the caller pays for skipping the confirmation is the age of
-    that index (see :data:`READ_INDEX_TTL`).
+    given earlier, and what the caller pays for skipping the confirmation is the age of that
+    index (see :data:`READ_INDEX_TTL`) and, when the member it reaches is behind that index,
+    the wait for it to catch up: a read is answered at an index rather than at a moment, so a
+    member that has not applied it yet is one to wait for, not one to refuse.
     """
 
     STRONG = "strong"
@@ -55,6 +57,12 @@ class ReadIndexCache:
     is the same thing to a read that has to be consistent as of now.  Nothing else is kept,
     because nothing else is needed to read at it: the shard, the key and the timestamp all
     come from the caller.
+
+    Keyed by the shard and not by the member that answered - there is no member in the entry
+    at all.  An index is a position in one shard's log, and a position says the same thing
+    whichever node offers it, so the entry survives the client being sent somewhere else: a
+    replica set is how the table spreads reads, and a basis that only held for the member it
+    came from would be thrown away every time the draw moved.
     """
 
     def __init__(self, ttl: float = READ_INDEX_TTL):
@@ -84,7 +92,14 @@ class ReadIndexCache:
 
         Whatever produced it: an index a node answered at is the same promise whether the
         node confirmed it itself or was handed it, and a caller that has just been told one
-        is the caller that can pass it on.
+        is the caller that can pass it on.  Whether that is a strong read or a follower one
+        makes no difference here, so a client that has only ever read strongly still has an
+        index to try the other levels with.
+
+        Kept by the reads that obtained an index, and not by the reads that used one: this is
+        the moment a basis is confirmed, and a read that named an index it was given earlier
+        confirmed nothing - putting it back would push out the window the TTL is, and a client
+        reading in a loop would hold its first index for as long as it kept reading.
         """
         with self._lock:
             self._indices[shard_id] = (read_index, time.monotonic())
@@ -93,19 +108,15 @@ class ReadIndexCache:
 def _check_consistency(consistency: str) -> None:
     """Refuse a read this client cannot make as asked, rather than answering it another way.
 
-    Two refusals, and they are different mistakes: a word that is not a consistency at all,
-    and the one level this client does not implement yet.  Neither is answered strongly,
-    because a caller that asked for a replica read and was given a linearizable one would
-    have no way to tell - which is the one thing a caller chooses this parameter to be able
-    to say.
+    One refusal, and it is the one a caller can act on: a word that is not a consistency at
+    all.  Every level the vocabulary has is made now - the last to arrive being the index this
+    client remembers for itself - so a level that is not made is not a case that can arise
+    here yet.  What this still does is keep a misspelling from being a silent request for the
+    strongest read, which is the one thing a caller that chose a level was trying not to get.
     """
     if consistency not in Consistency.ALL:
         raise ValueError(f"{consistency!r} is not a consistency: "
                          f"{' or '.join(Consistency.ALL)}")
-    if consistency == Consistency.CACHED:
-        raise NotImplementedError(
-            f"a {consistency} read is not implemented yet: this client asks the node it "
-            f"reaches for the index, and cannot yet read at one of its own remembering")
 
 
 class SmartClient:
@@ -170,8 +181,10 @@ class SmartClient:
         ``consistency`` is which copy of the data may answer, and it is the one thing
         about a read that a caller chooses: ``strong`` - the default, and what every
         caller got before there was a choice - is the shard's leader confirming an
-        index, and :class:`Consistency` describes the others.  A level this client
-        cannot make the read at raises rather than being answered as one it can.
+        index, and :class:`Consistency` describes the others.  All of them are made, and
+        that is what the parameter is for: a read is answered at the level that was asked for
+        and not as one of its neighbours, since a caller that was given a stronger read than
+        it asked for has no way to tell that it happened.
         """
         _check_consistency(consistency)
 
@@ -180,13 +193,21 @@ class SmartClient:
             if shard_id is None:
                 raise RuntimeError(f"No shard holds {key!r}")
 
+            # What this read names, when it names anything: the level that remembers is the
+            # one that passes an index on, and every other level leaves the node to obtain one.
+            named = self._index_to_name(shard_id, consistency)
+
             def _read(client):
-                answer = client.get(key)
+                answer = client.get(key, read_index=named)
                 if answer.error_code == ErrorCode.ERR_LOCKED:
                     if not self._coordinator.await_lock(key):
                         raise RuntimeError(
                             f"Key {key!r} outlived its lock TTL: "
                             "the shard could not settle it")
+                    # Settling a lock is a commit, and it can be a commit past the index this
+                    # read named: asked again at that index, the read would meet the same lock
+                    # the shard has just settled.  So the second read names none and the node
+                    # obtains a fresh basis - fresher than this level promised, never staler.
                     answer = client.get(key)
                 return answer
 
@@ -200,8 +221,9 @@ class SmartClient:
             # The basis this answer was given at, kept for the reads that will not ask for
             # one (see ``Consistency.CACHED``): a reader that has just been told an index is
             # the reader that can pass it on.  Only a read that reached the state machine has
-            # one - a refusal is not an answer as of anything - so that is the whole test.
-            if result.read_index is not None:
+            # one - a refusal is not an answer as of anything - and only a read that obtained
+            # one keeps it; see ``ReadIndexCache.remember``.
+            if named is None and result.read_index is not None:
                 self._read_index_cache.remember(shard_id, result.read_index)
 
             return result.value
@@ -226,6 +248,23 @@ class SmartClient:
         if consistency == Consistency.STRONG:
             return None
         return self._leaders.replica_for_shard(shard_id)
+
+    def _index_to_name(self, shard_id: int, consistency: str) -> Optional[int]:
+        """The index this read is to be answered at, when the client has one to name it by.
+
+        ``CACHED`` is the level that is answered at an index this client was given earlier, so
+        this is where remembering turns into reading: the entry is keyed by shard alone and
+        stays good across a change of member, and what is left to decide is whether there is
+        one that is fresh enough to use.
+
+        None for every other level, and for ``CACHED`` with nothing remembered or nothing fresh
+        enough.  A read that names no index leaves the node to obtain one, which is what every
+        read did before there was a cache at all - so a miss is a read at the level before
+        this one and not a refusal.
+        """
+        if consistency != Consistency.CACHED:
+            return None
+        return self._read_index_cache.cached_index(shard_id)
 
     def read(self, txn_id: int, key: bytes) -> Optional[bytes]:
         """Read ``key`` at the transaction's start timestamp, not at the newest one.
@@ -390,7 +429,9 @@ class SmartClient:
         the caller asked for: a range is a piece per shard it crosses, and each piece is
         one read of that shard rather than a second kind of read.  A piece read at a level
         that need not lead is served by a member of that shard's set, which is what the
-        level means one shard at a time.
+        level means one shard at a time; a piece at the level that remembers names the index
+        this client holds for that shard, and a range read has no basis of its own to keep
+        because the answer it gets is rows rather than a result with one.
         """
         _check_consistency(consistency)
 
@@ -403,9 +444,10 @@ class SmartClient:
             if piece_start >= piece_end:
                 continue
 
+            named = self._index_to_name(shard_id, consistency)
             answer = ask_shard(
                 self._leaders, shard_id,
-                lambda client: client.scan(piece_start, piece_end, timestamp),
+                lambda client: client.scan(piece_start, piece_end, timestamp, named),
                 first=self._member_to_ask(shard_id, consistency))
             if answer is None:
                 raise RuntimeError(f"No leader for shard {shard_id}")
