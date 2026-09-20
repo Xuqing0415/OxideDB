@@ -127,9 +127,11 @@ class RemoteNodeClient:
 
         return {"start_ts": response.start_ts, "commit_ts": response.commit_ts}
 
-    def follower_read_index(self) -> Tuple[Optional[int], Optional[str]]:
+    def follower_read_index(self, answer_locally: bool = False
+                            ) -> Tuple[Optional[int], Optional[str]]:
         response = self._call(self._stub.FollowerReadIndex,
-                              client_pb2.FollowerReadIndexRequest())
+                              client_pb2.FollowerReadIndexRequest(
+                                  answer_locally=answer_locally))
         if response.error_code != client_pb2.OK:
             return None, self._failure(response)[1]
 

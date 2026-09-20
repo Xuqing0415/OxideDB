@@ -6,6 +6,7 @@ import time
 from typing import Any, Dict, List, Optional, Callable, Tuple
 from ..client.node_client import (LocalNodeClient, LocalNodeClientFactory,
                                   NodeClient)
+from ..client.remote_node_client import RemoteNodeClientFactory
 from ..client.routing import ShardLeaders
 from ..metadata.publisher import DEFAULT_PUBLISH_INTERVAL, MetadataPublisher
 from ..metadata.service import PROPOSE_ATTEMPTS, RETRY_BACKOFF
@@ -61,6 +62,11 @@ class ShardServer:
         self._peer_addresses: Optional[Dict[int, str]] = None
         self._base_address: Optional[str] = None
         self._get_peer_shard_node = get_peer_shard_node
+        #: How this node reaches another one over a wire, built when a client service
+        #: asks it to: the leader a question is carried to is named by an address, and an
+        #: address is what a channel is opened to.  None until then, and always None for
+        #: an in-process server, which has no address to open one to.
+        self._peer_clients: Optional[RemoteNodeClientFactory] = None
     
     def set_range_map(self, range_map: Dict[int, tuple]):
         self._range_map = range_map
@@ -149,6 +155,23 @@ class ShardServer:
         if base_address is None:
             return None
         return self._peer_address(base_address, shard_id)
+
+    def _client_at_address(self, shard_id: int, address: str) -> Optional[NodeClient]:
+        """A handle on whatever answers ``address`` for ``shard_id``.
+
+        What a client service on this node needs a peer for: a node asked for a read
+        index that does not lead carries the question to the leader it has heard of, and
+        the address it was given is all it has to carry it with.  Both are opened through
+        a factory, so that two questions put to one node share one channel rather than
+        opening one each.
+
+        Only a networked server gets here.  An in-process one has no address to open a
+        channel to and builds no client service to be asked at, which is why the factory
+        is built here rather than in ``__init__``.
+        """
+        if self._peer_clients is None:
+            self._peer_clients = RemoteNodeClientFactory()
+        return self._peer_clients.get_client_at(shard_id, address)
 
     def start_shards(self, state_machine_factory: Callable[[], StateMachine],
                      storage_factory: Optional[Callable[[int, int], RaftStorage]] = None,
@@ -260,9 +283,14 @@ class ShardServer:
             # The client's six primitives on the same port: a shard's address is where
             # that shard is, and a client sent to one of them should not need a second
             # address to ask it anything.  The hint a refusal carries is therefore an
-            # address of exactly this kind - another node's shard port.
+            # address of exactly this kind - another node's shard port - and it is what a
+            # question carried to the leader is sent to as well.
             add_ClientServiceServicer_to_server(
-                ClientServicer(node, leader_address=lambda: self.leader_address(shard_id)),
+                ClientServicer(
+                    node,
+                    leader_address=lambda: self.leader_address(shard_id),
+                    client_at_address=lambda address: self._client_at_address(
+                        shard_id, address)),
                 server)
             server.add_insecure_port(address)
             server.start()
@@ -317,6 +345,9 @@ class ShardServer:
     def shutdown(self):
         for node in self._shards.values():
             node.shutdown()
+        if self._peer_clients is not None:
+            self._peer_clients.close()
+            self._peer_clients = None
 
 
 
@@ -567,13 +598,18 @@ class ShardedRaftCluster:
         whole answer, and the set is the caller's.  A handle onto a group that has gone
         away - the target of a move that was refused and is being tried again - answers
         as a follower for the same reason, so it is skipped rather than used.
+
+        Each node is asked to answer for itself, which is the other half of asking it the
+        same question: one that carried the question to the leader it has heard of would
+        answer with the leader's index, and the walk would come back with a follower
+        instead of the node that leads.
         """
         factory = self._node_client_factory()
         for node_id in nodes:
             client = factory.get_client(shard_id, node_id)
             if client is None:
                 continue
-            read_index, _ = client.follower_read_index()
+            read_index, _ = client.follower_read_index(answer_locally=True)
             if read_index is not None:
                 return client
         return None

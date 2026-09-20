@@ -24,6 +24,7 @@ import pytest
 
 from _ports import allocate_port, free_addresses
 from _wait import wait_for_keys_leader, wait_until
+from oxidedb.client import RemoteNodeClientFactory
 from oxidedb.proto import client_pb2
 from oxidedb.proto.client_pb2_grpc import (ClientServiceStub,
                                            add_ClientServiceServicer_to_server)
@@ -45,6 +46,7 @@ _BUILT_NODES = []
 _BUILT_SERVERS = []
 _BUILT_CHANNELS = []
 _BUILT_CLUSTERS = []
+_BUILT_FACTORIES = []
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +62,9 @@ def _stop_what_the_test_started():
         _BUILT_NODES.pop().shutdown()
     while _BUILT_CLUSTERS:
         _BUILT_CLUSTERS.pop().shutdown()
+    for factory in _BUILT_FACTORIES:
+        factory.close()
+    del _BUILT_FACTORIES[:]
 
 
 def _leader():
@@ -73,17 +78,22 @@ def _leader():
     return node
 
 
-def _served(node, leader_address=None) -> str:
+def _served(node, leader_address=None, client_at_address=None) -> str:
     """The node's client primitives on a port of this test's own making.
 
     The server is the test's rather than the node's, which is what lets a node that has
     been shut down - and so has stopped leading - go on answering: the refusal tests are
     about a node that says no, not about one that has gone quiet.
+
+    ``client_at_address`` is how the node answers a question it cannot answer itself:
+    the forwarding tests hand in a way to reach another node, and the tests that do not
+    leave the forwarding with nowhere to go.
     """
     address = f"127.0.0.1:{allocate_port(span=1)}"
     server = grpc.server(ThreadPoolExecutor(max_workers=4))
     add_ClientServiceServicer_to_server(
-        ClientServicer(node, leader_address=leader_address), server)
+        ClientServicer(node, leader_address=leader_address,
+                       client_at_address=client_at_address), server)
     server.add_insecure_port(address)
     server.start()
     _BUILT_SERVERS.append((server, address))
@@ -299,3 +309,81 @@ def test_a_follower_names_the_node_that_leads_a_real_cluster():
     hint = wait_until(only_followers_point_at_the_leader, timeout=10,
                       message="the followers never named the node that leads shard 0")
     assert hint not in (None, ""), "a cluster in network mode has an address to name"
+
+
+def test_a_follower_carries_a_read_index_question_to_the_leader():
+    """The one read a node cannot answer on its own, and how it is answered anyway.
+
+    A follower holds no index of its own to offer, and the caller that asked it did not
+    pick it at random: that is where its read is going.  So the question is carried to
+    the leader this node has heard of, and what comes back is this node's answer.
+
+    Asked not to pass it on, the same node answers what it answered before it could
+    carry anything: not the leader, and where the leader is.  Every walk over a group
+    that is looking for its leader rests on that half - a node that carried the question
+    would answer it as well, with somebody else's index.
+    """
+    cluster = ShardedRaftCluster(num_nodes=3, num_shards=1)
+    _BUILT_CLUSTERS.append(cluster)
+    cluster.start_network(state_machine_factory=lambda: MVCCStateMachine(),
+                          peer_addresses=free_addresses())
+    wait_for_keys_leader(cluster, [KEY])
+
+    leader_id = cluster.shard_leader(0)[0]
+    addresses = cluster.shard_addresses(0)
+    follower_id = next(node_id for node_id in addresses if node_id != leader_id)
+    stub = _stub(addresses[follower_id])
+
+    def both_answers():
+        """Both, once this node has settled on somebody else leading.
+
+        A node that began an election just before the winner did stays a candidate
+        until the winner's first heartbeat arrives, and a candidate has no leader to
+        carry a question to - so the pair is taken again until this is a real follower.
+        """
+        carried = stub.FollowerReadIndex(
+            client_pb2.FollowerReadIndexRequest(), timeout=TIMEOUT)
+        local = stub.FollowerReadIndex(
+            client_pb2.FollowerReadIndexRequest(answer_locally=True), timeout=TIMEOUT)
+        if carried.error_code != client_pb2.OK:
+            return None
+        if local.error_code != client_pb2.NOT_LEADER:
+            return None
+        return carried, local
+
+    carried, local = wait_until(
+        both_answers, timeout=10,
+        message="the follower never carried a read index question to the leader")
+
+    assert carried.read_index >= 1, "an index the leader had confirmed"
+    assert not carried.HasField("leader_address"), "an answer carries no hint"
+    assert local.leader_address == addresses[leader_id], (
+        "the node that cannot answer names the one that can")
+
+
+def test_a_follower_whose_leader_did_not_answer_refuses_without_a_hint():
+    """A hop this node could not make is still an answer about leadership.
+
+    The caller asked a node, and the node has the one useful thing to say: not me.  What
+    it must not do is name the address it has just failed to reach - that is the one
+    place the caller should not be sent next - so the hint is dropped and the address is
+    left in the message, where whoever reads it can see where the question went.
+    """
+    quiet = f"127.0.0.1:{allocate_port(span=1)}"
+    factory = RemoteNodeClientFactory(timeout=0.5)
+    _BUILT_FACTORIES.append(factory)
+    node = _leader()
+    stub = _stub(_served(
+        node, leader_address=lambda: quiet,
+        client_at_address=lambda address: factory.get_client_at(0, address)))
+
+    # A node that has stopped leading: it cannot confirm an index itself, and the
+    # question goes to an address nothing is listening on.
+    node.shutdown()
+
+    response = stub.FollowerReadIndex(
+        client_pb2.FollowerReadIndexRequest(), timeout=TIMEOUT)
+    assert response.error_code == client_pb2.NOT_LEADER
+    assert not response.HasField("leader_address"), (
+        "the address that has just gone quiet is not somewhere to send the caller")
+    assert quiet in response.message, "and where the question went is in the message"

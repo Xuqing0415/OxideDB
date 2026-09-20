@@ -651,7 +651,10 @@ class NodeClusterView:
         follower read index, which is a node that has confirmed an entry of its own term
         with a quorum - so the first node that answers with one is the node to talk to, and
         no leader hint is followed: every member of the group is in ``nodes``, so the walk
-        over the set is the whole answer.
+        over the set is the whole answer.  Each node is asked to answer for itself, because
+        one that carried the question to its leader would answer with the leader's index,
+        and the walk would come back with the follower it asked instead of the node that
+        leads.
 
         A node that does not answer at all is skipped rather than failing the walk, which is
         the difference between the two sides of this seam: a cluster's handles are objects
@@ -669,7 +672,7 @@ class NodeClusterView:
             if client is None:
                 continue
             try:
-                read_index, _ = client.follower_read_index()
+                read_index, _ = client.follower_read_index(answer_locally=True)
             except NodeUnreachable:
                 continue
             if read_index is not None:

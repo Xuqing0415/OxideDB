@@ -108,13 +108,17 @@ class NodeClient(Protocol):
         did, without the row itself being visible to the reader asking.
         """
 
-    def follower_read_index(self) -> Tuple[Optional[int], Optional[str]]:
+    def follower_read_index(self, answer_locally: bool = False
+                            ) -> Tuple[Optional[int], Optional[str]]:
         """The index a read on this node may be served at, and why not when there is
         none.
 
         A node that does not lead says so rather than reading locally and hoping;
         carrying the question to the leader is what the wire version of this call
-        exists for.
+        exists for.  ``answer_locally`` is for the caller that does not want that: it
+        asks to find out what this node itself can say, because an index that came from
+        the leader through this node cannot tell "this node leads" from "this node knows
+        who does".
         """
 
 
@@ -165,7 +169,15 @@ class LocalNodeClient:
     def get_write_record(self, key: bytes) -> Optional[Dict[str, Any]]:
         return self._node._state_machine.get_write_record(key)
 
-    def follower_read_index(self) -> Tuple[Optional[int], Optional[str]]:
+    def follower_read_index(self, answer_locally: bool = False
+                            ) -> Tuple[Optional[int], Optional[str]]:
+        """This node's own answer, which ``answer_locally`` has nothing to change.
+
+        A handle in this process *is* the node: there is no wire to carry the question
+        over and nobody to pass it to, so both answers are the same one.  The parameter
+        is accepted rather than refused so that a caller written against the seam reads
+        the same on either side of it.
+        """
         return self._node._read_index()
 
 
