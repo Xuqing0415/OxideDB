@@ -292,7 +292,7 @@ def test_a_refusal_over_a_wire_keeps_its_code_and_names_the_leader():
 
 
 def test_a_refusal_the_shard_made_for_its_own_reason_arrives_as_refused():
-    """The price of a four-value classification, pinned so that it cannot drift.
+    """The price of a five-value classification, pinned so that it cannot drift.
 
     A write conflict is the shard's own code - 102 - and it does not cross the wire: a client
     is told REFUSED and rebuilds it as the code for a command the machine would not apply,

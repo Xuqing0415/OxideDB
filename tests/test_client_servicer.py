@@ -25,13 +25,14 @@ import pytest
 from _ports import allocate_port, free_addresses
 from _wait import wait_for_keys_leader, wait_until
 from oxidedb.client import RemoteNodeClientFactory
-from oxidedb.proto import client_pb2
+from oxidedb.groups import local_code, wire_code
+from oxidedb.proto import client_pb2, groups_pb2
 from oxidedb.proto.client_pb2_grpc import (ClientServiceStub,
                                            add_ClientServiceServicer_to_server)
 from oxidedb.raft.client_servicer import ClientServicer
 from oxidedb.raft.node import MemoryRaftNode, NodeState
 from oxidedb.raft.shard_server import ShardedRaftCluster
-from oxidedb.raft.state_machine import (CommandType, MVCCStateMachine,
+from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
                                         serialize_command)
 
 KEY = b"key0"          # first byte 0x6b -> shard 0
@@ -387,3 +388,28 @@ def test_a_follower_whose_leader_did_not_answer_refuses_without_a_hint():
     assert not response.HasField("leader_address"), (
         "the address that has just gone quiet is not somewhere to send the caller")
     assert quiet in response.message, "and where the question went is in the message"
+
+
+def test_a_shard_that_did_not_get_to_a_decision_is_not_refused():
+    """``ERR_TIMEOUT`` has a value of its own, and a client rebuilds the code it came from.
+
+    A caller that hears REFUSED stops: the shard answered, the answer was no, and asking
+    again changes nothing.  A replica behind the index a read was named at, or a proposal
+    that never committed, is neither of those - the same call made again is not the same
+    mistake - so it crosses as TIMEOUT, and a client of a wire service reads it back as
+    the code it started as.  The groups answer with the same five values, because one
+    piece of client code reads either response.
+
+    What produces one over a port is a read named at an index the replica cannot reach,
+    which needs the servicer to pass ``read_index`` down (see ``docs/design.md``, section
+    4): until that lands this is the mapping pinned, and ``tests/test_raft_cluster.py`` is
+    where the code itself is produced and read in process.
+    """
+    servicer = ClientServicer(_leader())
+
+    assert servicer._wire_code(ErrorCode.ERR_TIMEOUT) == client_pb2.TIMEOUT
+    assert client_pb2.TIMEOUT != client_pb2.REFUSED, (
+        "one answer for a client that has to tell busy from no")
+    assert local_code(client_pb2.TIMEOUT) == ErrorCode.ERR_TIMEOUT
+    assert local_code(groups_pb2.TIMEOUT) == ErrorCode.ERR_TIMEOUT
+    assert wire_code(ErrorCode.ERR_TIMEOUT) == groups_pb2.TIMEOUT

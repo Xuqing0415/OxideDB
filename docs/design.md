@@ -434,9 +434,9 @@ uncommitted.  Linearity was assumed, not established.
    is bounded (`APPLY_TIMEOUT`): a replica whose apply loop has stopped would
    otherwise hold the reader for as long as the node lives, and a read that
    hangs cannot be told from a read that is slow.  Past the bound the read is
-   refused with `ERR_TIMEOUT` - which the wire classifies as a refusal and not
-   as an answer about leadership, because the reader's next move is to ask
-   again or ask elsewhere, not to follow a leader.
+   refused with `ERR_TIMEOUT` - which the wire carries as `TIMEOUT`, an answer of
+   its own rather than a refusal or a word about leadership, because the reader's
+   next move is to ask again and not to ask elsewhere or to give up.
 
 Steps 1-6 are one method, `_read_index`, because `scan` needs exactly the same
 handshake: a range read at a timestamp is only as safe as the replica serving it, so
@@ -822,13 +822,13 @@ The command line draws the same line for the same reason, and had to in order to
 
 **What is still owed is the shape that carries it.**  Two are possible, and the choice
 between them is not decidable on its own.  A code of its own beside `LOCKED` and
-`NOT_LEADER` would widen the client service contract, and it would be the first of the
-shard's own codes to be *named* rather than flattened - so taking it is less a decision
-about this refusal than about how that whole family is treated, which is a question the
-next widening of `ClientService` is the natural place to settle.  `REFUSED` carrying
-something to act on is the other shape: a smaller change to the enum and a larger change to
-what a refusal means, because the field that carries "somewhere else to ask" is an address,
-and a group that is moving has none to give.
+`NOT_LEADER` would widen the client service contract, and it would be the next of the
+shard's own codes to be *named* rather than flattened - `TIMEOUT` is the one before it -
+so taking it is less a decision about this refusal than about how that whole family is
+treated, which is a question the next widening of `ClientService` is the natural place
+to settle.  `REFUSED` carrying something to act on is the other shape: a smaller change
+to the enum and a larger change to what a refusal means, because the field that carries
+"somewhere else to ask" is an address, and a group that is moving has none to give.
 
 **Milestone.**  Nothing writes to the wrong place today - the refusal is honest and the
 caller can read the table - so this is not a correctness debt, and what a client should do

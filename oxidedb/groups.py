@@ -21,13 +21,15 @@ def wire_code(error_code: Optional[int]) -> int:
     """Which of the things a client may act on the group's own code is.
 
     The groups answer with the codes the shard's state machine uses, and a client on the
-    wire is told the same four things a shard's client service tells it.  Only three arrive
+    wire is told the same five things a shard's client service tells it.  Only four arrive
     here: neither group can be blocked by a lock, so nothing maps to LOCKED.
     """
     if error_code is None or error_code == ErrorCode.SUCCESS:
         return groups_pb2.OK
     if is_not_leader(error_code):
         return groups_pb2.NOT_LEADER
+    if error_code == ErrorCode.ERR_TIMEOUT:
+        return groups_pb2.TIMEOUT
     return groups_pb2.REFUSED
 
 
@@ -35,17 +37,20 @@ def local_code(error_code: Optional[int]) -> int:
     """The group's own code for a wire classification a caller has just read.
 
     The other direction of :func:`wire_code`, and the one place a client of a wire
-    service reads a refusal: a shard's client service answers with the same four values as
+    service reads a refusal: a shard's client service answers with the same five values as
     these two groups - that is why the two enums are written out the same way - so the way
     back is written out once as well.
 
-    Only two of the four have a code of their own, because a caller branches on two of
-    them: NOT_LEADER has somewhere to send the caller, and LOCKED is the one a resolver
-    has to unpick.  A refusal that answers no is the code for a command the machine would
-    not apply, which is what it was, and the message that came with it says why.
+    Every value but REFUSED maps back to the code it came from, because each of them is
+    something a caller does differently with: NOT_LEADER has somewhere to send the caller,
+    LOCKED is the one a resolver has to unpick, and TIMEOUT is the one that says the group
+    did not get to a decision, so the same call made again is not the same mistake.
+    REFUSED is what is left, and it is the code for a command the machine would not apply:
+    the message that came with it says why.
     """
     return {groups_pb2.NOT_LEADER: ErrorCode.ERR_NOT_LEADER,
-            groups_pb2.LOCKED: ErrorCode.ERR_LOCKED}.get(
+            groups_pb2.LOCKED: ErrorCode.ERR_LOCKED,
+            groups_pb2.TIMEOUT: ErrorCode.ERR_TIMEOUT}.get(
                 error_code, ErrorCode.ERR_APPLY_ERROR)
 
 

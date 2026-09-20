@@ -7,17 +7,19 @@ and does nothing to an answer except put it in a message and classify it.
 
 The classification is the interesting part, and it is lossy on purpose.  A shard refuses
 in its own codes - a write conflict, a frozen range, a lock - while a client on the wire
-is told one of four things: it worked, ask the leader instead, a lock is in the way, or
-the answer is no.  Those four are what a *client* can act on, and the rest of the codes
-are the shard's own business: nothing above the seam branches on them, and a caller that
-needed to would need the enum to grow.  What a refusal does carry is the message, so an
-operator reading a log can still see what the shard said.
+is told one of five things: it worked, ask the leader instead, a lock is in the way, the
+shard did not get to a decision, or the answer is no.  Those five are what a *client* can
+act on, and the rest of the codes are the shard's own business: nothing above the seam
+branches on them, and a caller that needed to would need the enum to grow.  What a refusal
+does carry is the message, so an operator reading a log can still see what the shard said.
 
-Two refusals are folded together on purpose.  ``ERR_LEADERSHIP_LOST`` means the node was
-losing its leadership while the proposal was in flight, which from a caller's side is the
-same thing as ``ERR_NOT_LEADER``: it should ask whoever leads now.  ``ERR_TIMEOUT`` is not
-folded in - it is not an answer about leadership, and the honest classification for "the
-shard did not get to a decision" is that the command was refused.
+``ERR_LEADERSHIP_LOST`` is folded into ``ERR_NOT_LEADER``, and it is the only code folded
+anywhere: it means the node was losing its leadership while the call was in flight, which
+from a caller's side is the same thing, and the caller asks whoever leads now either way.
+The others keep a value of their own, because each is something a caller does differently
+with - ``ERR_TIMEOUT`` above all, since it says the shard did not get to a decision and the
+same call made again is not the same mistake.  Until the enum had a value for it, "busy"
+and "no" were one answer to a client that has to tell them apart.
 
 Transport failures do not appear here at all, with one exception that is this file's
 own: a node asked for a read index carries the question to the leader it has heard of,
@@ -204,7 +206,7 @@ class ClientServicer(ClientServiceServicer):
     # -- the mapping between the shard's codes and the wire's ---------------
 
     def _wire_code(self, error_code):
-        """Which of the four things a client is allowed to act on this refusal is.
+        """Which of the five things a client is allowed to act on this refusal is.
 
         None is what a successful read carries - the code is only set on a failure - so
         it classifies as OK, the same as the state machine's own ``SUCCESS``.
@@ -215,6 +217,8 @@ class ClientServicer(ClientServiceServicer):
             return client_pb2.NOT_LEADER
         if error_code == ErrorCode.ERR_LOCKED:
             return client_pb2.LOCKED
+        if error_code == ErrorCode.ERR_TIMEOUT:
+            return client_pb2.TIMEOUT
         return client_pb2.REFUSED
 
     @staticmethod

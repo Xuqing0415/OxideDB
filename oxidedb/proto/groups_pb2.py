@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cgroups.proto\x12\x0eoxidedb.groups\"\xae\x02\n\x0bShardRecord\x12\x10\n\x08shard_id\x18\x01 \x01(\x04\x12\x11\n\tstart_key\x18\x02 \x01(\x0c\x12\x0f\n\x07\x65nd_key\x18\x03 \x01(\x0c\x12\r\n\x05nodes\x18\x04 \x03(\x04\x12=\n\taddresses\x18\x05 \x03(\x0b\x32*.oxidedb.groups.ShardRecord.AddressesEntry\x12\x16\n\tleader_id\x18\x06 \x01(\x04H\x00\x88\x01\x01\x12\x13\n\x0bleader_term\x18\x07 \x01(\x04\x12\x1b\n\x0eleader_address\x18\x08 \x01(\tH\x01\x88\x01\x01\x1a\x30\n\x0e\x41\x64\x64ressesEntry\x12\x0b\n\x03key\x18\x01 \x01(\x04\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x0c\n\n_leader_idB\x11\n\x0f_leader_address\"\x13\n\x11ListShardsRequest\"\xc2\x01\n\x12ListShardsResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12+\n\x06shards\x18\x04 \x03(\x0b\x32\x1b.oxidedb.groups.ShardRecord\x12\x0f\n\x07version\x18\x05 \x01(\x04\x42\x11\n\x0f_leader_address\"\x15\n\x13GetTimestampRequest\"\xac\x01\n\x14GetTimestampResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x16\n\ttimestamp\x18\x04 \x01(\x03H\x01\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x0c\n\n_timestamp\")\n\x18GetTimestampBatchRequest\x12\r\n\x05\x63ount\x18\x01 \x01(\x04\"\xcf\x01\n\x19GetTimestampBatchResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x15\n\x08start_ts\x18\x04 \x01(\x03H\x01\x88\x01\x01\x12\x13\n\x06\x65nd_ts\x18\x05 \x01(\x03H\x02\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x0b\n\t_start_tsB\t\n\x07_end_ts*<\n\tErrorCode\x12\x06\n\x02OK\x10\x00\x12\x0e\n\nNOT_LEADER\x10\x01\x12\n\n\x06LOCKED\x10\x02\x12\x0b\n\x07REFUSED\x10\x03\x32\x66\n\x0fMetadataService\x12S\n\nListShards\x12!.oxidedb.groups.ListShardsRequest\x1a\".oxidedb.groups.ListShardsResponse2\xd1\x01\n\nTSOService\x12Y\n\x0cGetTimestamp\x12#.oxidedb.groups.GetTimestampRequest\x1a$.oxidedb.groups.GetTimestampResponse\x12h\n\x11GetTimestampBatch\x12(.oxidedb.groups.GetTimestampBatchRequest\x1a).oxidedb.groups.GetTimestampBatchResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cgroups.proto\x12\x0eoxidedb.groups\"\xae\x02\n\x0bShardRecord\x12\x10\n\x08shard_id\x18\x01 \x01(\x04\x12\x11\n\tstart_key\x18\x02 \x01(\x0c\x12\x0f\n\x07\x65nd_key\x18\x03 \x01(\x0c\x12\r\n\x05nodes\x18\x04 \x03(\x04\x12=\n\taddresses\x18\x05 \x03(\x0b\x32*.oxidedb.groups.ShardRecord.AddressesEntry\x12\x16\n\tleader_id\x18\x06 \x01(\x04H\x00\x88\x01\x01\x12\x13\n\x0bleader_term\x18\x07 \x01(\x04\x12\x1b\n\x0eleader_address\x18\x08 \x01(\tH\x01\x88\x01\x01\x1a\x30\n\x0e\x41\x64\x64ressesEntry\x12\x0b\n\x03key\x18\x01 \x01(\x04\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x0c\n\n_leader_idB\x11\n\x0f_leader_address\"\x13\n\x11ListShardsRequest\"\xc2\x01\n\x12ListShardsResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12+\n\x06shards\x18\x04 \x03(\x0b\x32\x1b.oxidedb.groups.ShardRecord\x12\x0f\n\x07version\x18\x05 \x01(\x04\x42\x11\n\x0f_leader_address\"\x15\n\x13GetTimestampRequest\"\xac\x01\n\x14GetTimestampResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x16\n\ttimestamp\x18\x04 \x01(\x03H\x01\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x0c\n\n_timestamp\")\n\x18GetTimestampBatchRequest\x12\r\n\x05\x63ount\x18\x01 \x01(\x04\"\xcf\x01\n\x19GetTimestampBatchResponse\x12-\n\nerror_code\x18\x01 \x01(\x0e\x32\x19.oxidedb.groups.ErrorCode\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x1b\n\x0eleader_address\x18\x03 \x01(\tH\x00\x88\x01\x01\x12\x15\n\x08start_ts\x18\x04 \x01(\x03H\x01\x88\x01\x01\x12\x13\n\x06\x65nd_ts\x18\x05 \x01(\x03H\x02\x88\x01\x01\x42\x11\n\x0f_leader_addressB\x0b\n\t_start_tsB\t\n\x07_end_ts*I\n\tErrorCode\x12\x06\n\x02OK\x10\x00\x12\x0e\n\nNOT_LEADER\x10\x01\x12\n\n\x06LOCKED\x10\x02\x12\x0b\n\x07REFUSED\x10\x03\x12\x0b\n\x07TIMEOUT\x10\x04\x32\x66\n\x0fMetadataService\x12S\n\nListShards\x12!.oxidedb.groups.ListShardsRequest\x1a\".oxidedb.groups.ListShardsResponse2\xd1\x01\n\nTSOService\x12Y\n\x0cGetTimestamp\x12#.oxidedb.groups.GetTimestampRequest\x1a$.oxidedb.groups.GetTimestampResponse\x12h\n\x11GetTimestampBatch\x12(.oxidedb.groups.GetTimestampBatchRequest\x1a).oxidedb.groups.GetTimestampBatchResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,7 +34,7 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_SHARDRECORD_ADDRESSESENTRY']._loaded_options = None
   _globals['_SHARDRECORD_ADDRESSESENTRY']._serialized_options = b'8\001'
   _globals['_ERRORCODE']._serialized_start=1006
-  _globals['_ERRORCODE']._serialized_end=1066
+  _globals['_ERRORCODE']._serialized_end=1079
   _globals['_SHARDRECORD']._serialized_start=33
   _globals['_SHARDRECORD']._serialized_end=335
   _globals['_SHARDRECORD_ADDRESSESENTRY']._serialized_start=254
@@ -51,8 +51,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_GETTIMESTAMPBATCHREQUEST']._serialized_end=794
   _globals['_GETTIMESTAMPBATCHRESPONSE']._serialized_start=797
   _globals['_GETTIMESTAMPBATCHRESPONSE']._serialized_end=1004
-  _globals['_METADATASERVICE']._serialized_start=1068
-  _globals['_METADATASERVICE']._serialized_end=1170
-  _globals['_TSOSERVICE']._serialized_start=1173
-  _globals['_TSOSERVICE']._serialized_end=1382
+  _globals['_METADATASERVICE']._serialized_start=1081
+  _globals['_METADATASERVICE']._serialized_end=1183
+  _globals['_TSOSERVICE']._serialized_start=1186
+  _globals['_TSOSERVICE']._serialized_end=1395
 # @@protoc_insertion_point(module_scope)

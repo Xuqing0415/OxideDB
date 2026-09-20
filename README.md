@@ -461,7 +461,7 @@ nothing reported on one line rather than as a traceback.
 is the one file here with no business logic in it: six node-level methods and no
 transaction among them, because a `Prewrite` RPC would put the primary-key choice on
 the server and a `Set` would put the timestamp there; an `error_code` of exactly the
-four cases a caller reacts to differently, so transport failures stay in the gRPC
+five cases a caller reacts to differently, so transport failures stay in the gRPC
 status; a leader hint that is present for `NOT_LEADER` and absent otherwise; and the
 difference between a field that is unset and one that is empty, which is the reason
 those fields are `optional` - a key with an empty value and a key with no version are
@@ -621,7 +621,7 @@ Honest list of what is *not* done, roughly in priority order.
   rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 * **A node can be a process, but a client outside one cannot do everything yet.**
   The contract is six node-level primitives in
-  `proto/client.proto`, with a four-value `error_code` and a leader hint.  Two of its
+  `proto/client.proto`, with a five-value `error_code` and a leader hint.  Two of its
   fields are where a value says which version it is, `KeyValuePair.commit_ts` and
   `GetResponse.commit_ts`, and the servicer fills both - on a key, and on every row of a
   scan - which is what lets a recovery copy a row out of another process

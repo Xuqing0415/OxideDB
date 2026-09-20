@@ -12,7 +12,7 @@ package oxidedb.client;
 // not be told where its primary key lives.
 //
 // Every response carries the same two things.  error_code is what happened as a
-// business fact - the four cases a caller reacts to differently - and it is the only
+// business fact - the five cases a caller reacts to differently - and it is the only
 // place a *legitimate* failure lives.  Transport failures (connection refused, a
 // deadline, an unparseable message) stay in the gRPC status, so that a caller can
 // tell "ask the leader instead" from "the wire is down": the first is a retry and the
@@ -31,8 +31,13 @@ enum ErrorCode {
     LOCKED = 2;
     // The shard answered, and the answer was no: a write conflicting with a newer
     // version, a command that does not apply, a range that will not be scanned.  The
-    // detail is in message, and retrying the same call will not help either.
+    // detail is in message, and retrying the same call will not help.
     REFUSED = 3;
+    // The shard did not get to a decision: a replica behind the index a read was named
+    // at, a proposal that never committed.  Nothing was answered, so the same call made
+    // again is not the same mistake - and this is what tells it from the refusals, which
+    // are answers.  The reader should ask again rather than elsewhere.
+    TIMEOUT = 4;
 }
 
 message GetRequest {

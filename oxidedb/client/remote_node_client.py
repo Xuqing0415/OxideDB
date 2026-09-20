@@ -5,14 +5,15 @@ talking to is in this process; this is the side of it that is not.  Every call i
 unary RPC, every answer is rebuilt in the shape ``LocalNodeClient`` returns, and a caller
 that holds one of these cannot tell it from the other except by the error codes it loses.
 
-What a refusal loses on the way is the shard's own code.  The wire carries a four-value
-classification instead - it worked, ask the leader, a lock is in the way, the answer is no
-- and REFUSED comes back here as ``ERR_APPLY_ERROR``, which is the code for a command the
-machine would not apply.  Nothing above the seam branches on the finer distinction, and a
-caller that needed to would need the enum to grow rather than a string to parse.  What does
-survive is ``leader_address``, and it is the reason this file exists: a node that has
-stopped leading can name the address of the node that leads now, which turns a retry after
-an election from a metadata read into one more RPC.
+What a refusal loses on the way is the shard's own code.  The wire carries a five-value
+classification instead - it worked, ask the leader, a lock is in the way, the shard did not
+get to a decision, the answer is no - and REFUSED comes back here as ``ERR_APPLY_ERROR``,
+which is the code for a command the machine would not apply.  Nothing above the seam
+branches on the finer distinction, and a caller that needed to would need the enum to grow
+rather than a string to parse.  What does survive is ``leader_address``, and it is the
+reason this file exists: a node that has stopped leading can name the address of the node
+that leads now, which turns a retry after an election from a metadata read into one more
+RPC.
 
 A node that does not answer at all is ``NodeUnreachable`` and not a refusal.  There is
 nothing in the shard's answer to act on because there was no answer, and the retry that fits

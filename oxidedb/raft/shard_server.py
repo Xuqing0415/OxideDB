@@ -590,8 +590,6 @@ class ShardedRaftCluster:
         :meth:`RecoveryRunner._wait_for_group` waits the same way - a node that merely
         believes it leads is exactly the node whose belief is in question, and here it is
         the one that would be handed a copy.
-        leads is exactly the node whose belief is in question, and here it is the one
-        that would be handed a copy.
 
         No hint is followed, although a node that is not the leader answers with one:
         every member of the group is in ``nodes``, so the walk over the set is the

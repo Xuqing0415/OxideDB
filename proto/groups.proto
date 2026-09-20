@@ -23,13 +23,17 @@ enum ErrorCode {
     // call may well succeed there.
     NOT_LEADER = 1;
     // Never sent by either of these groups - neither of them has locks to be blocked by -
-    // and here so that the four answers mean one thing in this file and in client.proto,
-    // and a client can read the error_code of any response with one piece of code.
+    // and here so that the answers mean one thing in this file and in client.proto, and a
+    // client can read the error_code of any response with one piece of code.
     LOCKED = 2;
     // The group answered, and the answer was no: no table installed yet, no quorum to
     // read a linearizable one from, a batch that could not be allocated.  The detail is
     // in message, and retrying the same call will not help.
     REFUSED = 3;
+    // The group did not get to a decision - a proposal that never committed - so the same
+    // call is worth making again.  Sent by both of these groups, and here for the same
+    // reason LOCKED is: one meaning, one number, in either file.
+    TIMEOUT = 4;
 }
 
 // One shard, as the routing table describes it.

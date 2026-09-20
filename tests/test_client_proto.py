@@ -10,7 +10,7 @@ the lock resolver and the range reader need - and transactions stay where they a
 are, in the client's coordinator, expressed as Propose calls.
 
 What these tests pin is the part that outlives the implementation: which six methods
-exist, that `error_code` has exactly the four cases a caller reacts to differently, that
+exist, that `error_code` has exactly the five cases a caller reacts to differently, that
 `leader_address` is the one place a retry target lives, and that every field survives a
 round trip - including the ones that are deliberately *unset*, where "no value" and "an
 empty value" have to be distinguishable, because a key with an empty value and a key with
@@ -41,15 +41,15 @@ def test_the_service_is_the_node_primitives_and_not_a_transaction_api():
     ]
 
 
-def test_the_error_code_is_the_four_cases_a_caller_reacts_to_differently():
-    """OK, try the leader, resolve the lock, or give up on this call.
+def test_the_error_code_is_the_five_cases_a_caller_reacts_to_differently():
+    """OK, try the leader, resolve the lock, try again, or give up on this call.
 
     Transport failures stay in the gRPC status, so a client can tell a retry from a dead
     wire without parsing a message.
     """
     code = client_pb2.DESCRIPTOR.enum_types_by_name["ErrorCode"]
     assert [value.name for value in code.values] == [
-        "OK", "NOT_LEADER", "LOCKED", "REFUSED",
+        "OK", "NOT_LEADER", "LOCKED", "REFUSED", "TIMEOUT",
     ]
     assert client_pb2.OK == 0, "the zero value is the successful one"
 
@@ -187,12 +187,13 @@ def test_the_group_services_are_the_table_and_the_clock():
     assert [method.name for method in tso.methods] == ["GetTimestamp", "GetTimestampBatch"]
 
 
-def test_a_group_error_code_is_the_same_four_a_shard_uses():
+def test_a_group_error_code_is_the_same_five_a_shard_uses():
     """So one piece of client code can read either response.
 
     These two groups never send LOCKED - neither of them has locks - and the number is
     still the same one client.proto gives it, because a shared meaning is what lets a
-    caller treat "ask the leader" the same way wherever it is refused.
+    caller treat "ask the leader" the same way wherever it is refused.  TIMEOUT is not
+    like LOCKED: a proposal to either group can fail to commit, so both files send it.
     """
     shard = {value.name: value.number
              for value in client_pb2.DESCRIPTOR.enum_types_by_name["ErrorCode"].values}
