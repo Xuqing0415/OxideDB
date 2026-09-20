@@ -1,7 +1,8 @@
 """A client that read the routing table, and a shard that moves out from under it.
 
 A move leaves a window behind itself - the group the shard left goes on answering after the
-table has moved on (``ShardedRaftCluster._commit_move``) - and that window exists for exactly
+table has moved on (``RecoveryRunner._commit_move``) - and that window exists for
+exactly
 one caller: a client that routes by a table it read before the move and asks the group the
 table named.  ``tests/test_move_proposal.py`` checks the window from the cluster's side: that
 the group is still up and its port still bound while it is open.  These tests put a client on

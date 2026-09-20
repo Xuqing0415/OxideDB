@@ -107,7 +107,7 @@ class RaftStorage(ABC):
         Nothing, for a storage that keeps nothing open between calls, which is why it is
         not abstract.  It is here for the one caller that has to have the files released
         before it touches them: a group being closed for good, whose directory is about to
-        be moved aside (see ``ShardedRaftCluster._commit_move``).  A whole cluster closing
+        be moved aside (see ``RecoveryRunner._commit_move``).  A whole cluster closing
         releases its storages as part of that; one group closing on its own has no such
         owner, so it asks the storage itself.
 

@@ -176,7 +176,7 @@ def _copy_rows(cluster):
 
     target_node.propose = recording_propose
     try:
-        assert cluster._copy_rows(cluster.leader_client(0), target_client, state)
+        assert cluster._recovery_runner._copy_rows(cluster.leader_client(0), target_client, state)
     finally:
         del target_node.propose
 

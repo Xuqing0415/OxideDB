@@ -255,7 +255,7 @@ def test_the_set_a_move_replaces_is_the_tables_and_not_this_processes(tmp_path):
         told = _ToldClient(table)
         cluster._metadata_client = told
 
-        result = cluster._propose_move(0, MOVE_TO)
+        result = cluster._recovery_runner._propose_move(0, MOVE_TO)
 
         assert result.ok, result.message
         assert len(told.calls) == 1, "one proposal, and the table it was made against"
@@ -276,7 +276,7 @@ def test_a_table_that_does_not_hold_the_shard_refuses_rather_than_says_nothing(t
         told = _ToldClient(RoutingTable(version=1, shards={}))
         cluster._metadata_client = told
 
-        result = cluster._propose_move(0, MOVE_TO)
+        result = cluster._recovery_runner._propose_move(0, MOVE_TO)
 
         assert result.outcome == ProposalOutcome.REJECTED, \
             "a table that answered is not a table that was silent"
@@ -294,7 +294,7 @@ def test_a_cluster_with_no_table_has_nothing_to_propose():
     try:
         assert cluster.metadata_client() is None
 
-        result = cluster._propose_move(0, [1, 2])
+        result = cluster._recovery_runner._propose_move(0, [1, 2])
 
         assert result.ok, "an in-process cluster has no client to disagree with"
         assert "no routing table" in result.message
@@ -376,7 +376,8 @@ def test_a_move_the_table_refuses_puts_the_shard_back_and_keeps_what_was_copied(
         source = cluster.get_shard_server(SERVING[0]).get_shard_node(0)
         assert source is not None and not source.writes_frozen
         assert cluster.migrations() == {}, "no move in flight"
-        assert cluster._load_migration_record(0) is None, "and nothing written down"
+        assert cluster._recovery_runner._load_migration_record(0) is None, \
+            "and nothing written down"
         assert cluster._serving_nodes(0) == SERVING
         assert client.table(refresh=True).shard(0).nodes == SERVING, "the table did not move"
 
@@ -461,7 +462,7 @@ def test_a_table_that_cannot_be_reached_leaves_the_shard_frozen_and_retryable(tm
             frozen = cluster.get_shard_server(node_id).get_shard_node(0)
             assert frozen.writes_frozen and frozen.freeze_reason == "migration"
         assert cluster.migration_state(0).phase == MigrationPhase.PROPOSING
-        assert cluster._load_migration_record(0) is not None
+        assert cluster._recovery_runner._load_migration_record(0) is not None
         assert cluster._serving_nodes(0) == SERVING
         assert client.table(refresh=True).shard(0).nodes == SERVING, "nothing was proposed"
 
@@ -476,7 +477,7 @@ def test_a_table_that_cannot_be_reached_leaves_the_shard_frozen_and_retryable(tm
         cluster._metadata_client = original
         assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW), cluster.migration_error()
         assert client.table(refresh=True).shard(0).nodes == MOVE_TO
-        assert cluster._load_migration_record(0) is None
+        assert cluster._recovery_runner._load_migration_record(0) is None
         assert cluster._serving_nodes(0) == MOVE_TO
         for node_id in SERVING:
             assert cluster.get_shard_server(node_id).get_shard_node(0) is None
@@ -496,13 +497,14 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
         cluster._metadata_client = _UnreachableClient(original)
         assert cluster.move_shard(0, MOVE_TO, SHORT_WINDOW) is False, "stopped with the copy made"
         cluster._metadata_client = original
-        assert cluster._propose_move(0, MOVE_TO).ok
+        assert cluster._recovery_runner._propose_move(0, MOVE_TO).ok
 
         # A window long enough to be sampled inside, and a sample taken a tenth of the way
         # in, so that what is asserted is about the window rather than about how busy the
         # machine was.
         window = 3.0
-        thread = threading.Thread(target=cluster._commit_move, args=(0, MOVE_TO),
+        thread = threading.Thread(target=cluster._recovery_runner._commit_move,
+                                  args=(0, MOVE_TO),
                                   kwargs={"drain": window}, daemon=True)
         thread.start()
         try:
@@ -511,7 +513,7 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
                 "the group is still up while the window is open"
             with socket.create_connection(_host_port(source_address), timeout=2):
                 pass
-            assert cluster._load_migration_record(0) is not None, \
+            assert cluster._recovery_runner._load_migration_record(0) is not None, \
                 "and the note is still on disk until the move is finished"
             assert cluster._serving_nodes(0) == MOVE_TO, \
                 "while the cluster already routes to the new group"
@@ -520,7 +522,7 @@ def test_the_group_the_shard_left_keeps_answering_until_the_window_closes(tmp_pa
 
         assert not thread.is_alive(), "the window is a wait, not a hang"
         assert cluster.get_shard_server(SERVING[0]).get_shard_node(0) is None
-        assert cluster._load_migration_record(0) is None
+        assert cluster._recovery_runner._load_migration_record(0) is None
     finally:
         cluster.shutdown()
         metadata.shutdown()
@@ -538,9 +540,11 @@ def test_finishing_a_move_twice_is_finishing_it_once(tmp_path):
         # The cluster that comes back to a finished move: the proposal is made again
         # because the answer may have been lost, and the machine recognises the move it
         # already applied rather than applying a second one.
-        assert cluster._propose_move(0, MOVE_TO).ok, "a lost answer is proposed again"
+        assert cluster._recovery_runner._propose_move(0, MOVE_TO).ok, \
+            "a lost answer is proposed again"
         orphans = cluster.orphan_dirs()
-        assert cluster._commit_move(0, MOVE_TO, drain=0) == [], "nothing left to close"
+        assert cluster._recovery_runner._commit_move(0, MOVE_TO, drain=0) == [], \
+            "nothing left to close"
         assert cluster.orphan_dirs() == orphans, "and nothing left to move aside"
 
         assert client.table(refresh=True).version == after.version, "one move, one write"

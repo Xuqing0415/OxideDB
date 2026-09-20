@@ -25,6 +25,7 @@ half of it.
 
 from _wait import wait_until
 from oxidedb.metadata.service import RoutingTable, ShardPlacement
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import MigrationPhase, ShardedRaftCluster
 from oxidedb.raft.state_machine import (ApplyResult, CommandType, ErrorCode, MVCCStateMachine)
 from oxidedb.raft.storage import EngineRaftStorage
@@ -180,7 +181,7 @@ def test_the_shard_is_frozen_while_its_rows_are_copied(tmp_path, monkeypatch):
     """
     cluster = _started_cluster(tmp_path, shard_nodes={0: [1]})
     seen = {}
-    original = ShardedRaftCluster._move_row
+    original = RecoveryRunner._move_row
 
     def spy_move_row(self, source, target, key, value, version):
         if not seen:
@@ -193,7 +194,7 @@ def test_the_shard_is_frozen_while_its_rows_are_copied(tmp_path, monkeypatch):
                 _set(node._state_machine, b"x_new", b"v", 999))
         return original(self, source, target, key, value, version)
 
-    monkeypatch.setattr(ShardedRaftCluster, "_move_row", spy_move_row)
+    monkeypatch.setattr(RecoveryRunner, "_move_row", spy_move_row)
     try:
         _write_rows(cluster, count=3)
         assert cluster.move_shard(0, MOVE_TO) is False, "the table was never reached"
@@ -281,7 +282,8 @@ def test_a_move_that_died_is_finished_by_the_next_start(tmp_path):
     revived = _started_cluster(tmp_path, shard_nodes={0: [1]})
     try:
         assert revived.migrations() == {}, "the note was picked up, not left standing"
-        assert revived._load_migration_record(0) is None, "and it goes with the move"
+        assert revived._recovery_runner._load_migration_record(0) is None, \
+            "and it goes with the move"
         assert revived._serving_nodes(0) == MOVE_TO, "the new group is the shard's"
         assert _group(revived, 1, 0) is None, "and the group it left is gone"
         for node_id in MOVE_TO:

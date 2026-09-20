@@ -6,13 +6,14 @@ has in its hand.  ``RecoveryView`` is what a side is asked for and this is what 
 kept apart on purpose: the flow lives here so that the cluster's two start-up paths and a
 node started as a process cannot drift into three slightly different protocols.
 
-The split's half of that flow is here, and the cluster reaches it through this object:
-``recover_splits`` for the two start-up paths, and ``pending_split``, ``remember_split``
-and ``finish_split`` for a split that cluster begins itself - which writes the note down
-and hands the rest over.  The move's half is still written in ``shard_server`` and moves
-next, so for now the leaves the two branches share, the rows of a range and the locks in
-it, are written twice: here against a client, and there against a node object the side
-beginning the work already has in its hand.
+Both halves of that flow are here, and a side reaches them through this object: the two
+start-up paths call ``recover_splits`` and ``recover_migrations``, and the call that
+begins a split or a move uses the entries in between - ``pending_split``,
+``remember_split`` and ``finish_split`` for a split, ``remember_migration`` and
+``finish_move`` for a move - which write the note down and hand the rest over.  What is
+still written twice is what those beginning calls read: the rows of a range and the locks
+in it, here against a client, and in ``shard_server`` against the node object a side that
+is beginning the work already has in its hand.
 
 The state is the part worth settling before anything moves, because it is the part of the
 flow that is not a call.  ``_pending_splits`` and ``_migrations`` are the in-memory copy
@@ -22,14 +23,22 @@ reason comes from the process side: a process has nowhere to keep a placement or
 working table, and it does not need one - the note in the shard's own storage is the
 durable copy, and what a recovery needs in memory is rebuilt from it on the way up.  A
 view asked to hold these would be holding what the disk already carries.
+
+The move's record and the three answers its proposal can come back with -
+``MigrationState``, ``MigrationPhase``, ``ProposalOutcome`` and ``ProposalResult`` - are
+defined here as well, with the state they describe.  Not for tidiness: this module is
+reached from ``shard_server`` the moment either is imported, so a body written here
+cannot import what it needs back out of the file that reaches in.
 """
 
 import time
 
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..client.node_client import NodeClient
-from .recovery_notes import PendingNote, SPLIT_RECORD_PREFIX
+from ..metadata.service import PROPOSE_ATTEMPTS, RETRY_BACKOFF
+from .recovery_notes import MIGRATION_RECORD_PREFIX, PendingNote, SPLIT_RECORD_PREFIX
 from .recovery_view import RecoveryView
 from .state_machine import (ApplyResult, CommandType, ErrorCode, ScanRefused,
                             serialize_command)
@@ -45,6 +54,80 @@ LEADER_TIMEOUT = 10.0
 #: noticed a moment after it does, long enough not to spin.
 LEADER_POLL_SECONDS = 0.05
 
+#: How long a shard that has moved goes on answering on the node it left, in seconds.
+#: Clients route by a table they cached, so the node one of them was sent to a moment
+#: ago is a node it may still ask: the group stays up for a fixed window after the table
+#: has moved on, and then it goes.  A fixed window is the only honest one - "until every
+#: client has noticed" is not something a server can know - and it is a parameter of the
+#: call that waits it out, so a test does not have to wait it out for real.
+MIGRATION_DRAIN_SECONDS = 30.0
+
+class MigrationPhase:
+    """Where a move of a shard has got to.
+
+    A shard being moved is a shard in two places at once, and which of these a move is in
+    is how a caller - and a cluster that has just come back - tells "nothing has happened
+    yet" from "the rows are in the new group and the switch is owed".  The order is the
+    protocol: freeze, copy, propose, done.
+    """
+
+    FREEZING = "freezing"
+    COPYING = "copying"
+    PROPOSING = "proposing"
+    DONE = "done"
+
+
+class ProposalOutcome:
+    """The three answers a proposal to the routing table comes back with.
+
+    Read as what the caller knows now, because that is what decides the caller's next
+    move - and for a move, the next move is either finishing it or giving up on it.
+    """
+
+    #: The group applied it.  Whether it applied it just now or the first time it was
+    #: asked, the table says what the caller wanted it to say.
+    OK = "ok"
+    #: The group answered no, and would answer no again: the caller asked for something
+    #: the table will not hold, and a retry is the same question.
+    REJECTED = "rejected"
+    #: Nothing answered.  The proposal may or may not have landed and the caller cannot
+    #: tell the difference - which is the one outcome a move may not treat as failure.
+    UNREACHABLE = "unreachable"
+
+
+@dataclass
+class ProposalResult:
+    """What came of one proposal.  See :class:`ProposalOutcome`."""
+
+    outcome: str
+    #: What the group said when it refused, or why nothing answered.  For a human, and
+    #: for the refusals the wire flattens into one code: the message is where "the shard
+    #: is not in the table" and "the set overlaps the one leaving" are still told apart.
+    message: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome == ProposalOutcome.OK
+
+
+@dataclass
+class MigrationState:
+    """One move of one shard, as the cluster making it remembers it."""
+
+    shard_id: int
+    #: Where the shard is going: a replica set, named by the caller of ``move_shard``.
+    target_nodes: List[int]
+    #: Where it is coming from, which is the set that answers for it - and the one the
+    #: routing table names - until the proposal lands.
+    source_nodes: List[int] = field(default_factory=list)
+    phase: str = MigrationPhase.FREEZING
+    #: The keys this move has copied into the new group so far.
+    copied_keys: List[bytes] = field(default_factory=list)
+    #: The rows as they were read at the freeze, which is the one moment at which they
+    #: are the whole truth about the range.  In this process only: a cluster that comes
+    #: back reads them out of the source again rather than out of a note.
+    rows: List[Tuple[bytes, bytes]] = field(default_factory=list)
+
 
 class RecoveryRunner:
     """The flow that finishes a split or a move, over the side it is handed.
@@ -59,9 +142,10 @@ class RecoveryRunner:
         self._view = view
         #: What a split is doing, per shard: the in-memory copy of the note it wrote.
         self._pending_splits: Dict[int, Dict[str, Any]] = {}
-        #: What a move is doing, per shard.  The value is a ``MigrationState``, which
-        #: lives in ``shard_server`` today; where it lands is the move's work to answer.
-        self._migrations: Dict[int, Any] = {}
+        #: What a move is doing, per shard, as a ``MigrationState``.  The in-memory copy
+        #: of the note on disk: written by the side that begins a move, and rebuilt out
+        #: of the note by a side that comes back - the split's arrangement, one size up.
+        self._migrations: Dict[int, MigrationState] = {}
         #: Why the last split or move could not finish, for an operator or a caller.
         self._last_split_error: Optional[str] = None
         self._last_migration_error: Optional[str] = None
@@ -131,6 +215,68 @@ class RecoveryRunner:
             settled[pending["new_shard_id"]] = (pending["split_key"], end)
         return [now] if settled == now else [now, settled]
 
+    def recover_migrations(self) -> List[int]:
+        """Finish the moves this side was in the middle of when it stopped.
+
+        A move writes down what it is doing before it does it - the shard, the set it is
+        leaving, the set it is going to - and the note is dropped only once the routing
+        table names the new group and the one it left has gone.  A side that comes back
+        and finds one is a side that was moving a shard when the process stopped, and the
+        routing table is what says how far it got:
+
+        * the table names the set the move was going to, so the proposal landed and what
+          is left is the half after it: the note goes and the group the shard left is let
+          go, which is :meth:`_commit_move` and nothing else.  Nothing is copied again -
+          the rows are already in the group the table names, which is the group the copy
+          was made for.
+        * the table still names the set the move was leaving, so nothing was proposed,
+          and the move is picked up where a retry of it is: freeze, copy what the new
+          group is missing, propose - which is :meth:`finish_move`.
+        * the table names neither, which is an operator who moved the shard by hand or a
+          second move computed from the same table.  There is no answer here that is not
+          a guess, and guessing between two live groups is how a range ends up served by
+          one of them while its rows are in the other, so the shard stays frozen and the
+          caller is told what the table says.
+
+        The rows come back out of the source rather than out of the note, for the split's
+        reason: a note carrying a copy of the rows would be a second copy taken at some
+        earlier moment, and a copy of a copy is how a move loses a row.
+
+        Returns the shards whose move it finished.  A move it could not finish - the
+        source has no leader yet, the table cannot be reached, the table names a set that
+        is neither of the two - is left frozen and still remembered, and the next call
+        picks it up.  Every step is a no-op the second time, so a caller that is not sure
+        whether the last call got there may simply ask again.
+        """
+        self.load_pending_migrations()
+        return self.finish_pending_migrations()
+
+    def load_pending_migrations(self) -> None:
+        """Read the move notes this side's shards left behind, and freeze them.
+
+        A note means a move of that shard was in flight when the process stopped: its
+        rows may already be in the new group, and the routing table may or may not name
+        it.  The one thing that must not happen while that is unknown is the shard taking
+        rows - a row written into it now would be one the new group does not have, on a
+        shard the table may already have given away - so the source goes back to being
+        frozen here, and stays frozen until the move is finished.  Finishing one is
+        :meth:`recover_migrations`, which reads the routing table to find out which half
+        of it is left.
+        """
+        for shard_id in sorted(self._view.shard_ids()):
+            if self.migration_state(shard_id) is not None:
+                continue
+            state = self._load_migration_record(shard_id)
+            if state is None:
+                continue
+            self.hold_migration(state)
+            self._view.freeze(shard_id, "migration", state.source_nodes)
+
+    def finish_pending_migrations(self) -> List[int]:
+        """Finish every move this side knows it was in the middle of."""
+        return [shard_id for shard_id in sorted(self._migrations)
+                if self._resume_migration(shard_id)]
+
     def split_error(self) -> Optional[str]:
         """Why the last split could not finish, if it could not."""
         return self._last_split_error
@@ -138,6 +284,58 @@ class RecoveryRunner:
     def pending_splits(self) -> Dict[int, Dict[str, Any]]:
         """The splits that are waiting for the routing table, for callers that look."""
         return dict(self._pending_splits)
+
+    # -- the move's state, which is the recovery's and not the side's ----------------
+
+    def migration_error(self) -> Optional[str]:
+        """Why the last move could not be started or copied, if it could not."""
+        return self._last_migration_error
+
+    def record_migration_error(self, reason: str) -> None:
+        """Say why a move could not be started, or could not be carried on.
+
+        The one call here that a side beginning a move makes, and the reason it exists: the
+        beginning of a move is not a recovery - it is ``move_shard``, which refuses for
+        reasons of its own (nowhere to move to, a set that already serves the shard, a shard
+        with no leader) - and what it has to say about a refusal is the same kind of string a
+        recovery leaves when a copy or a proposal cannot be finished.  A caller reads both
+        through :meth:`migration_error`, so both land in one place, and it is the recovery's.
+        """
+        self._last_migration_error = reason
+
+    def migration_state(self, shard_id: int) -> Optional[MigrationState]:
+        """The move this side has begun or picked up for ``shard_id``, if there is one.
+
+        A shard with one of these has two groups for a moment - the one the routing table
+        names and the one it is about to - so this is also what says which of the two a
+        lookup about the shard means, and what a view answers while that is true.
+        """
+        return self._migrations.get(shard_id)
+
+    def migrations(self) -> Dict[int, MigrationState]:
+        """Every move this side has not finished, keyed by the shard being moved."""
+        return dict(self._migrations)
+
+    def hold_migration(self, state: MigrationState) -> None:
+        """Keep the move a side has just begun, beside the note it has just written.
+
+        The note is the durable half, and the side that begins the move writes it because
+        that side is the one that knows the replica set whose storage it belongs in.  This
+        is the half that does not survive a restart, which is why it is the recovery's: a
+        recovery is what reads the note back and puts an entry here again.
+        """
+        self._migrations[state.shard_id] = state
+
+    def drop_migration(self, shard_id: int) -> None:
+        """Let go of the move this side was in the middle of.
+
+        The note's own going is :meth:`RecoveryView.forget_note` and a call of its own: a
+        move is over when the routing table has the range, and the note goes in the same
+        breath.  This is the in-memory record and nothing else, dropped by the side that
+        was carrying it when it either finishes the move or gives up on it.
+        """
+        self._migrations.pop(shard_id, None)
+
 
     # -- what a side that is beginning a split calls ---------------------------
 
@@ -197,6 +395,109 @@ class RecoveryRunner:
         self._view.forget_note(pending["shard_id"])
         self._view.unfreeze(pending["shard_id"],
                            self._view.shard_replica_ids(pending["shard_id"]))
+        return True
+
+    # -- what a side that is beginning a move calls ----------------------------
+
+    def remember_migration(self, state: MigrationState) -> None:
+        """Write a move down, on every replica of the shard being moved.
+
+        The window this covers is the split's, one size larger: between the copy and the
+        proposal the rows are in a group the routing table has never heard of, and a
+        process that dies there comes back with no idea that a shard of its own is in two
+        places.  So the intent goes into the source shard's own storage - the thing that
+        does survive a restart - before the first row moves.
+
+        What is not in the note is how far the move got.  A phase that said "done" would
+        be a lie the moment the process writing it died; what a side that comes back
+        knows is that the move did not finish, and what it does about that is freeze the
+        source and copy again, which is what a retry does anyway.
+        """
+        note = PendingNote.move(state.shard_id, state.source_nodes, state.target_nodes)
+        self._view.remember_note(note)
+
+    def finish_move(self, state: MigrationState,
+                    drain: float = MIGRATION_DRAIN_SECONDS) -> bool:
+        """Copy the rows into the new group, tell the table, and let the old group go.
+
+        Called for the first attempt and for every retry of it - by the call that begins
+        a move and by :meth:`_resume_migration` - and idempotent for the reason the
+        split's is: a row already in the new group at the same timestamp is the row, and
+        copying it again would be a second timestamp on a row that already has one - the
+        source has been frozen since the rows were read, so nothing it holds has moved on.
+
+        The group is built here rather than before the freeze because the rows were read
+        first: a target node that already served the shard is a node the call that begins
+        a move refuses to move onto, so building it is adding a group where there was
+        none - and the group it replaces nothing of is the one the copy is written into.
+
+        ``drain`` is the window the group it left goes on answering for, handed to
+        :meth:`_commit_move`: a caller making the move waits it out, and a side finishing
+        one it found in the shard's own storage does not.
+        """
+        shard_id = state.shard_id
+        source = self._wait_for_group(shard_id, state.source_nodes)
+        if source is None:
+            self.record_migration_error(f"shard {shard_id} has no leader")
+            return False
+
+        if not state.rows:
+            # A move this process did not start: a side that came back found the note,
+            # which says which shard was moving and where to, and nothing else - so the
+            # rows are read out of the source, which has been frozen since it started and
+            # is the only place they exist, rather than out of the note.
+            start, end = self._view.range_map()[shard_id]
+            # And the check the caller that begins a move makes, because this is the same
+            # read: a lock in the range may be a commit that has not been applied yet, and
+            # a copy taken over one is a row read at a moment when it is about to change.
+            # The note stays, the shard stays frozen, and the lock clears on its own.
+            if self._locks_in_range(source, start, end):
+                self.record_migration_error(
+                    f"a transaction holds a lock in shard {shard_id}; its rows cannot be "
+                    f"read at one moment while one is in flight")
+                return False
+            # The rows as they stand, which is what the caller that begins a move reads
+            # out of the shard's own state: one range read over the group's leader, at the
+            # newest committed version, which is the read the copy below is about to make
+            # again for the versions it needs.
+            state.rows = [(key, value)
+                          for key, value, _ in source.scan_versions(start, end)]
+
+        # The target's own members and nothing closed, which is not the placement: the
+        # source is still the group the table names, so this is a group built beside it
+        # rather than instead of it, and its members are the target nodes alone.
+        self._view.ensure_group_on(shard_id, state.target_nodes)
+
+        target = self._wait_for_group(shard_id, state.target_nodes)
+        if target is None:
+            self.record_migration_error(
+                f"the new group for shard {shard_id} on {state.target_nodes} elected no "
+                f"leader")
+            return False
+
+        state.phase = MigrationPhase.COPYING
+        if not self._copy_rows(source, target, state):
+            return False
+
+        state.phase = MigrationPhase.PROPOSING
+        result = self._propose_move(shard_id, state.target_nodes)
+        if result.outcome == ProposalOutcome.REJECTED:
+            # The table answered no, and would answer no again.  The shard goes back to
+            # serving, because a refusal is not a reason to leave a range unserved, and
+            # this is the end of the move rather than a state to retry out of.
+            self.record_migration_error(result.message)
+            self._abort_move(state)
+            return False
+
+        if result.outcome == ProposalOutcome.UNREACHABLE:
+            # Nothing answered, so the proposal may or may not have landed, and the one
+            # thing that must not happen is the shard taking rows for a range the table
+            # may already have given away.  Frozen, written down, and waiting for the
+            # caller to ask again - which is where a side that comes back finds it too.
+            self.record_migration_error(result.message)
+            return False
+
+        self._commit_move(shard_id, state.target_nodes, drain=drain)
         return True
 
     # -- the split's body -------------------------------------------------------
@@ -319,6 +620,263 @@ class RecoveryRunner:
 
         self._last_split_error = result.error_msg
         return False
+
+    # -- the move's body --------------------------------------------------------
+
+    def _resume_migration(self, shard_id: int) -> bool:
+        """Pick a move back up.  See :meth:`recover_migrations`."""
+        state = self.migration_state(shard_id)
+        if state is None:
+            return False
+
+        # The freeze is a local fact, and it died with the process that set it.  It goes
+        # back on before anything else here happens: the shard may already be the new
+        # group's, and a row let into the old one now is a row nothing will carry across.
+        # This is also what makes the call safe to make twice.
+        self._view.freeze(shard_id, "migration", state.source_nodes)
+
+        client = self._view.metadata_client()
+        if client is None:
+            # No table to disagree with: this side's own range map is the whole world to
+            # it, so nothing was proposed anywhere and the move finishes the way a retry
+            # of it does.
+            return self.finish_move(state, drain=0)
+
+        try:
+            table = client.table(refresh=True)
+        except RuntimeError as nothing_read:
+            # The same two shapes the proposal loop folds into one: an in-process group
+            # with no leader, and a client that found no address to ask.  Nothing was read,
+            # so nothing is known, and the move waits for the next call.
+            self.record_migration_error(str(nothing_read))
+            return False
+
+        placement = table.shard(shard_id)
+        if placement is None:
+            self.record_migration_error(
+                f"shard {shard_id} is not in the routing table, and a move of it was in "
+                f"flight")
+            return False
+
+        if sorted(placement.nodes) == sorted(state.target_nodes):
+            # The proposal landed before the process stopped, so the shard is the new
+            # group's and the note is all that is left of the move.  The group has to be
+            # built here first: a restarted side builds the shards it was told to serve,
+            # and the one the table names is not necessarily one of them.
+            # Built, but not the placement yet: the note this move wrote into the source
+            # is dropped by :meth:`_commit_move` before that group goes, so the source has
+            # to still be holding its storage when the cleanup gets there.
+            self._view.ensure_group_on(shard_id, state.target_nodes)
+            # No drain and no proposal.  A window is what lets a client that cached the old
+            # table finish the read it arrived with, and this process has been down long
+            # enough that no read is still waiting on it - waiting the window out was the
+            # caller's step, in the call that switched the table.
+            self._commit_move(shard_id, state.target_nodes, drain=0)
+            return True
+
+        if sorted(placement.nodes) == sorted(state.source_nodes):
+            # Nothing was proposed, so the copy is where the move stopped - or never
+            # started - and the call that finishes it is the one a caller retrying the
+            # move would make.
+            return self.finish_move(state, drain=0)
+
+        self.record_migration_error(
+            f"shard {shard_id} is moving from {state.source_nodes} to "
+            f"{state.target_nodes}, and the routing table says {placement.nodes}")
+        return False
+
+    def _copy_rows(self, source: NodeClient, target: NodeClient,
+                   state: MigrationState) -> bool:
+        """Copy the rows the new group does not already have, as the versions they are.
+
+        Written against the seam and nothing else: a row's version comes out of a range
+        read, the write record out of ``get_write_record``, and the row goes in through
+        ``propose``.  That is what lets one body serve a cluster copying between groups of
+        its own nodes and a process copying between groups whose leaders are in other
+        processes - and a copy that reached around the client would work in this process
+        and nowhere else, and would work here silently, because a local state machine
+        always answers.
+
+        ``state.rows`` is what the caller read at the freeze, which is a pair per row:
+        which version each one is at is a fact about the shard that holds it, so it is
+        asked of the shard.  When the read that fills ``state.rows`` answers with the
+        versions as well the rows will carry them, and this becomes one read where it is
+        now two.
+        """
+        start, end = self._view.range_map()[state.shard_id]
+        versions = {key: version
+                    for key, _, version in source.scan_versions(start, end)}
+        for key, value in state.rows:
+            expected = versions.get(key)
+            if expected is None:
+                # The source no longer has it, so there is nothing left to move.
+                continue
+            if target.get(key).commit_ts == expected:
+                # A read that could not answer carries no version, and 0 is what a row
+                # that is not there carries too.  Either way the row goes in, which is
+                # idempotent for a row that is already at this version.
+                continue
+            result = self._move_row(source, target, key, value, expected)
+            if not result.success:
+                # A row the new group refused is a row it does not have, and a move that
+                # carried on would leave a shard whose table entry names a group that is
+                # missing one of its rows.
+                self.record_migration_error(
+                    f"the new group refused a row of shard {state.shard_id}: "
+                    f"{result.error_msg}")
+                return False
+            state.copied_keys.append(key)
+        return True
+
+    def _propose_move(self, shard_id: int, target_nodes: List[int]) -> ProposalResult:
+        """Tell the routing table that ``shard_id`` is served by ``target_nodes`` now.
+
+        The last step of a move and the only one a client can see, so it is written as
+        the one thing it may never do: describe a replica set the caller made up.  The set
+        being replaced is read out of the table at the attempt that uses it, rather than
+        taken from this side's own answer - the table's machine refuses a move whose
+        expectation of the current set is wrong (code 14), so a caller that guessed would
+        be refused every time two moves were computed from one table, and this side's own
+        answer is exactly the stale thing a 14 exists to catch.
+
+        The three outcomes are the three a caller can act on.  A refusal is final: the
+        machine would answer the same command the same way, and the loop does not ask it
+        twice.  No answer is not final - it means the command may or may not have landed -
+        and the second attempt is how the caller finds out, because the machine recognises
+        a move it has already applied and answers it as a success rather than as a second
+        write.
+
+        What is not here is any reading of *which* rule refused (12 through 16).  Each has
+        a code of its own in the machine and the wire flattens them all into one, so the
+        reason survives only in the message - see the README.  Nothing below branches on
+        it, and a caller that wants to (a 14 is worth re-reading the table for, a 15 is
+        worth walking away from) is reading prose, which is the debt and not the design.
+        """
+        client = self._view.metadata_client()
+        if client is None:
+            # No table to tell.  A side with no routing table has its own range map and
+            # nothing else; that map is the whole world to it.  There is nothing to
+            # tell, which is what a split says in the same position.
+            return ProposalResult(ProposalOutcome.OK, "there is no routing table to tell")
+
+        addresses = self._view.addresses_on(shard_id, target_nodes)
+        last_error = None
+        for attempt in range(PROPOSE_ATTEMPTS):
+            try:
+                table = client.table(refresh=True)
+            except RuntimeError as nothing_read:
+                # One exception for two shapes on purpose: the in-process client raises a
+                # RuntimeError when its group has no leader, and the one across a wire
+                # raises ``NodeUnreachable`` - which is one - when no address answered.
+                # Both mean the same thing here: nothing was asked, so nothing is known.
+                last_error = str(nothing_read)
+                time.sleep(RETRY_BACKOFF * (attempt + 1))
+                continue
+
+            placement = table.shard(shard_id)
+            if placement is None:
+                return ProposalResult(
+                    ProposalOutcome.REJECTED,
+                    f"shard {shard_id} is not in the routing table")
+
+            result = client.move_shard(shard_id, placement.nodes, target_nodes, addresses)
+            if result.success:
+                return ProposalResult(ProposalOutcome.OK)
+
+            if result.error_code != ErrorCode.ERR_NOT_LEADER:
+                return ProposalResult(ProposalOutcome.REJECTED, result.error_msg)
+
+            # Not the leader, and the client has already followed every name it was
+            # given - so either the group changed under it or nothing answered at all.
+            # Reading the table again is the only way to tell those apart, and it is
+            # where the next attempt starts.
+            last_error = result.error_msg
+            time.sleep(RETRY_BACKOFF * (attempt + 1))
+
+        return ProposalResult(ProposalOutcome.UNREACHABLE, last_error)
+
+    def _commit_move(self, shard_id: int, target_nodes: List[int],
+                     drain: float = MIGRATION_DRAIN_SECONDS) -> List[int]:
+        """Make the new group the shard's, and let the group it left go.
+
+        Called once the routing table says the shard is served by ``target_nodes`` - by
+        the move that proposed it, and by a side that comes back and finds that it is.
+        The order is not free:
+
+        1.  This side's own answer for the shard becomes the new set, so every question it
+            answers about the shard - who serves it, where its leader is, which address to
+            publish - is answered with the group the table names.  That write is
+            :meth:`RecoveryView.apply_move_locally`, one call for the placement and for the
+            leader this side last published, because from here on the group it left is not
+            the answer to anything.  The group itself is still up for the next step.
+        2.  That group goes on answering for a fixed window (``drain``).  A client routes
+            by a table it cached, so the node it was sent to a moment ago is a node it may
+            still ask: the window is what lets a client finish the read it arrived with
+            instead of meeting a closed port.  It cannot take new rows - it has been
+            frozen since before the copy, and stays frozen through all of this - so what
+            it can still answer is a read of what the copy already carried away.
+        3.  The move's note goes, while the storage holding it is still open.  The note is
+            what a side that comes back reads to find a move in flight; after this there is
+            none to find, and a note left inside a storage about to be closed could not be
+            deleted at all.
+        4.  The group goes: its node, its port and its storage, on every node that is not
+            in the new set.
+        5.  What is left on disk is renamed rather than deleted -
+            ``orphan-shard-<id>-<when>``, in the directory the shard's own storage lived
+            in.  A table that has to be put back, after a bug in the machine that holds it
+            or an operator's mistake, finds the rows still here; nobody finds them by
+            accident, because nothing looks under that name.  A leaked directory costs
+            disk and a lost range costs the data.
+
+        Every step is a no-op the second time, because the caller may be a side that died
+        in the middle of these and started again: closing a shard that is already closed,
+        deleting a note that is already gone and renaming a directory that is no longer
+        there are all answers rather than errors.
+
+        What it returns is the nodes whose group it closed, so an empty list is a move
+        that was already committed - which is an answer and not a failure, and is the
+        difference a caller can see between "I did it" and "it was done".
+        """
+        # The placement, and the leader this side last published for the shard, in one
+        # call: both are this side's answer for the shard, and both belong to the group
+        # that has just left.  What the shard is *held* by does not change until the step
+        # below, and is meant not to.
+        self._view.apply_move_locally(shard_id, target_nodes)
+        self.drop_migration(shard_id)
+
+        if drain > 0:
+            time.sleep(drain)
+
+        # Every note this side holds for the shard, which is a move's and not a split's:
+        # a shard cannot be splitting and moving at once, and the interface drops what a
+        # shard has rather than what a caller names.
+        self._view.forget_note(shard_id)
+        return self._view.ensure_serving(shard_id, target_nodes)
+
+    def _abort_move(self, state: MigrationState) -> List[int]:
+        """Give up on a move the routing table refused, and put the shard back.
+
+        A refusal is final - the machine would answer the same command the same way - so
+        this is the end of the move and not a state to retry out of.  What it undoes is
+        everything except the copy: the source goes back to taking rows, because it is the
+        group the table still names and a refusal is not a reason to leave a range
+        unserved; the note goes, because there is no move in flight to find; and the group
+        that was built to receive the rows is closed and put aside like any other storage
+        of a shard that is not served here, so that one shard does not go on having two
+        live groups.
+
+        The rows themselves are kept, under the orphan name.  A caller that means to try
+        again - with a target set the table will take - does not find them, which is right:
+        the new group is built fresh and the copy is the whole of the range rather than
+        part of a move that was refused.  An operator who wants to know what was copied
+        before it was refused does find them, which is the other half of why nothing here
+        deletes anything.
+        """
+        shard_id = state.shard_id
+        self.drop_migration(shard_id)
+        self._view.forget_note(shard_id)
+        self._view.unfreeze(shard_id, state.source_nodes)
+        return self._view.close_group_on(shard_id, state.target_nodes)
 
     # -- the split's leaves -----------------------------------------------------
 
@@ -446,3 +1004,20 @@ class RecoveryRunner:
                       and record["commit_ts"] == version else None),
         )
         return target.propose(command)
+
+    # -- the move's leaves ------------------------------------------------------
+
+    def _load_migration_record(self, shard_id: int) -> Optional[MigrationState]:
+        """The move this side's shard was in the middle of, as its replicas wrote it.
+
+        Read through the view, the same way as the split's note above and for the same
+        reason: which notes this side holds, and which kind each one is, is the side's
+        answer and the note's own.  At most one is here today: a shard cannot be splitting
+        and moving at once.
+        """
+        for note in self._view.pending_notes(shard_id):
+            if note.kind == MIGRATION_RECORD_PREFIX:
+                return MigrationState(shard_id=shard_id,
+                                      target_nodes=list(note.target_nodes),
+                                      source_nodes=list(note.source_nodes))
+        return None

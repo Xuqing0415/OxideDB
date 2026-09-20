@@ -28,7 +28,9 @@ the rows readable out of the group the table now names; a move whose proposal la
 the process died is only cleaned up, and is neither copied nor proposed again; a move that
 finished leaves no note to pick up; a table that names a third set, or cannot be read at
 all, leaves the shard frozen and still remembered; and a lock in the range a move would copy
-stops it in the same way, because that read is the read the call that began the move made.
+stops it in the same way, because that read is the read the call that began the move made;
+and that a shard being moved answers for itself while it is in flight, out of the recovery's
+one record of it rather than out of a copy this cluster keeps.
 """
 
 import os
@@ -41,6 +43,7 @@ from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
 from oxidedb.raft.recovery_notes import PendingNote, write_note
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
 from oxidedb.raft.storage import EngineRaftStorage
@@ -169,7 +172,7 @@ def _a_move_that_died_before_the_proposal(tmp_path, monkeypatch, addresses, meta
         raise RuntimeError("the process died with the rows copied and nowhere told")
 
     with monkeypatch.context() as patch:
-        patch.setattr(ShardedRaftCluster, "_propose_move", died_before_the_table_was_told)
+        patch.setattr(RecoveryRunner, "_propose_move", died_before_the_table_was_told)
         with pytest.raises(RuntimeError):
             cluster.move_shard(0, MOVE_TO)
     return cluster, client
@@ -186,7 +189,7 @@ def test_a_move_that_died_before_the_proposal_is_finished_on_the_next_start(
         try:
             # The state the restart has to pick up from: the rows are in the new group, the
             # move is written down, and the table has not been told any of it.
-            assert cluster._load_migration_record(0) is not None
+            assert cluster._recovery_runner._load_migration_record(0) is not None
             assert client.table(refresh=True).shard(0).nodes == SERVING
             new_group = cluster.get_shard_server(MOVE_TO[0]).get_shard_node(0)
             assert new_group._state_machine._storage.get_latest_version(
@@ -196,14 +199,14 @@ def test_a_move_that_died_before_the_proposal_is_finished_on_the_next_start(
             _close(opened)
 
         copied = []
-        original = ShardedRaftCluster._move_row
+        original = RecoveryRunner._move_row
 
         def counting_move_row(self, source, target, key, value, version):
             copied.append(key)
             return original(self, source, target, key, value, version)
 
         with monkeypatch.context() as patch:
-            patch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
+            patch.setattr(RecoveryRunner, "_move_row", counting_move_row)
             revived = _start_cluster(tmp_path, addresses, metadata,
                                      shard_nodes={0: SERVING})
             try:
@@ -214,7 +217,8 @@ def test_a_move_that_died_before_the_proposal_is_finished_on_the_next_start(
                 wait_until(lambda: not revived.migrations() or revived.recover_migrations(),
                            message="the move was never picked up")
 
-                assert revived._load_migration_record(0) is None, "the note goes with the move"
+                assert revived._recovery_runner._load_migration_record(0) is None, \
+            "the note goes with the move"
                 assert revived._serving_nodes(0) == MOVE_TO
                 for node_id in SERVING:
                     assert revived.get_shard_server(node_id).get_shard_node(0) is None,                         "the group the shard left is gone"
@@ -252,13 +256,14 @@ def test_a_move_that_landed_and_died_before_the_cleanup_is_only_cleaned_up(
                 raise RuntimeError("the process died with the table told")
 
             with monkeypatch.context() as patch:
-                patch.setattr(ShardedRaftCluster, "_commit_move",
+                patch.setattr(RecoveryRunner, "_commit_move",
                               died_before_the_old_group_was_let_go)
                 with pytest.raises(RuntimeError):
                     cluster.move_shard(0, MOVE_TO)
 
             assert client.table(refresh=True).shard(0).nodes == MOVE_TO, "the table was told"
-            assert cluster._load_migration_record(0) is not None, "and the note is still here"
+            assert cluster._recovery_runner._load_migration_record(0) is not None, \
+            "and the note is still here"
             for node_id in SERVING:
                 assert cluster.get_shard_server(node_id).get_shard_node(0) is not None
         finally:
@@ -267,8 +272,8 @@ def test_a_move_that_landed_and_died_before_the_cleanup_is_only_cleaned_up(
 
         told = []
         copied = []
-        original_move_row = ShardedRaftCluster._move_row
-        original_propose_move = ShardedRaftCluster._propose_move
+        original_move_row = RecoveryRunner._move_row
+        original_propose_move = RecoveryRunner._propose_move
 
         def counting_propose_move(self, shard_id, target_nodes):
             told.append(target_nodes)
@@ -279,8 +284,8 @@ def test_a_move_that_landed_and_died_before_the_cleanup_is_only_cleaned_up(
             return original_move_row(self, source, target, key, value, version)
 
         with monkeypatch.context() as patch:
-            patch.setattr(ShardedRaftCluster, "_propose_move", counting_propose_move)
-            patch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
+            patch.setattr(RecoveryRunner, "_propose_move", counting_propose_move)
+            patch.setattr(RecoveryRunner, "_move_row", counting_move_row)
             revived = _start_cluster(tmp_path, addresses, metadata,
                                      shard_nodes={0: SERVING})
             try:
@@ -289,7 +294,8 @@ def test_a_move_that_landed_and_died_before_the_cleanup_is_only_cleaned_up(
 
                 assert told == [], "a move the table already names is not proposed again"
                 assert copied == [], "and nothing is copied again"
-                assert revived._load_migration_record(0) is None, "the note goes with the move"
+                assert revived._recovery_runner._load_migration_record(0) is None, \
+            "the note goes with the move"
                 assert revived._serving_nodes(0) == MOVE_TO
                 for node_id in SERVING:
                     assert revived.get_shard_server(node_id).get_shard_node(0) is None
@@ -319,7 +325,7 @@ def test_a_move_that_finished_leaves_nothing_to_pick_up(tmp_path):
     try:
         assert revived.recover_migrations() == []
         assert revived.migrations() == {}
-        assert revived._load_migration_record(0) is None
+        assert revived._recovery_runner._load_migration_record(0) is None
         assert not os.path.isdir(str(tmp_path / f"shard0_node{SERVING[0]}")),             "the group the shard left is under an orphan name, not the one it answered on"
         _the_rows_are_where_the_table_says(revived, client)
     finally:
@@ -349,7 +355,8 @@ def test_a_table_that_names_a_third_set_leaves_the_move_to_a_person(tmp_path, mo
             assert cluster.recover_migrations() == []
             assert "routing table says [5]" in cluster.migration_error()
             assert cluster.migrations()[0].target_nodes == MOVE_TO, "the move stands"
-            assert cluster._load_migration_record(0) is not None, "and so does its note"
+            assert cluster._recovery_runner._load_migration_record(0) is not None, \
+                "and so does its note"
 
             leader = cluster.get_leader_for_key(KEYS[0])[1]
             assert leader.writes_frozen and leader.freeze_reason == "migration"
@@ -390,7 +397,7 @@ def test_a_table_that_cannot_be_read_leaves_the_move_frozen_and_retryable(
             cluster._metadata_client = client
             assert cluster.recover_migrations() == [0]
             assert client.table(refresh=True).shard(0).nodes == MOVE_TO
-            assert cluster._load_migration_record(0) is None
+            assert cluster._recovery_runner._load_migration_record(0) is None
             assert cluster.migrations() == {}
             _the_rows_are_where_the_table_says(cluster, client)
         finally:
@@ -441,7 +448,8 @@ def test_a_move_that_finds_a_lock_keeps_its_note_and_waits(tmp_path):
             assert list(revived.migrations()) == [0], "and the note is kept for the next call"
             assert "lock" in (revived.migration_error() or ""), (
                 "refused over the lock, and not for some other reason")
-            assert revived._load_migration_record(0) is not None, "the note is still on disk"
+            assert revived._recovery_runner._load_migration_record(0) is not None, \
+            "the note is still on disk"
             assert revived.get_shard_server(SERVING[0]).get_shard_node(0).writes_frozen, (
                 "and the shard stays frozen while that is true")
             assert revived.get_shard_server(MOVE_TO[0]).get_shard_node(0) is None, (
@@ -452,3 +460,43 @@ def test_a_move_that_finds_a_lock_keeps_its_note_and_waits(tmp_path):
             revived.shutdown()
     finally:
         metadata.shutdown()
+
+def test_a_shard_that_is_moving_is_answered_for_out_of_the_one_record_of_the_move(
+        tmp_path, monkeypatch):
+    """Two groups, and which of them a lookup about the shard means, is the move's own answer.
+
+    ``_serving_nodes`` is what every answer about *the* shard goes through - who serves it,
+    where its leader is, which address to publish - so a move in flight has to be visible to
+    it: a lookup that went on answering with the placement would hand out the group whose rows
+    are already being copied out of it.  The record is the recovery's and there is one of it,
+    which is what makes letting go of it the thing that hands the shard back.
+    """
+    addresses = free_addresses(num_nodes=5)
+    metadata = _start_metadata()
+    try:
+        cluster, _ = _a_move_that_died_before_the_proposal(
+            tmp_path, monkeypatch, addresses, metadata)
+        try:
+            state = cluster.migration_state(0)
+            assert state is not None, "the move is in flight"
+            assert state is cluster._recovery_runner.migration_state(0)
+            assert cluster._serving_nodes(0) == SERVING
+
+            # A placement that disagrees with the record, which is what a landed proposal
+            # looks like from here: the record still wins, because the set the table names
+            # is not the one a copy of this range would read.
+            cluster._placed_shards[0] = list(MOVE_TO)
+            assert cluster._serving_nodes(0) == list(state.source_nodes)
+
+            # Nothing but the record says this shard is moving, so letting go of it is what
+            # hands the shard back to the placement - and a second copy of the moves in
+            # flight here would be a routing answer that can disagree with the recovery.
+            cluster._recovery_runner.drop_migration(0)
+            assert cluster._serving_nodes(0) == list(MOVE_TO)
+            assert not hasattr(cluster, "_migrations")
+            assert not hasattr(cluster, "_last_migration_error")
+        finally:
+            cluster.shutdown()
+    finally:
+        metadata.shutdown()
+
