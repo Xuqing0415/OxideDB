@@ -354,6 +354,83 @@ def test_a_walk_that_finds_nobody_sends_the_client_back_to_the_table():
     assert router.refreshes == 1, "the set was spent, so the table was read"
 
 
+# -- a member of a set, for a read that need not lead --------------------------
+
+class _RecordingFactory:
+    """A factory that remembers what it was asked for, with a say in what it has.
+
+    ``reachable`` is the set of node ids it holds a handle for, or None for all of them -
+    which is the table's own answer when every member of a set is listening.
+    """
+
+    def __init__(self, reachable=None):
+        self.asked = []
+        self._reachable = reachable
+
+    def get_client(self, shard_id, node_id, address=None):
+        self.asked.append((shard_id, node_id, address))
+        if self._reachable is not None and node_id not in self._reachable:
+            return None
+        return _AddressableClient(_FakeNode(value=b"v1"), address)
+
+    def get_client_at(self, shard_id, address):
+        return None
+
+    def forget_client(self, shard_id, node_id):
+        pass
+
+
+def test_a_read_that_need_not_lead_is_given_a_member_of_the_shard_s_set():
+    """The set the table publishes, one member at a time, instead of the leader.
+
+    A read that carries its own index can be answered by any member, so the lookup that used
+    to answer "the leader" answers "a member" - and which one is the point rather than an
+    implementation detail: a client that read from the node the table names would be reading
+    from the leader again, and many clients spreading over the set is the whole reason to
+    read from a replica.  The address is the placement's, because a factory that opens a
+    channel has nowhere else to learn one.
+
+    The draw is random, so the spread is pinned over many of them rather than on one: what
+    is asserted is that every member was drawn and nothing else ever was.
+    """
+    addresses = {1: "node1:5001", 2: "node2:5002", 3: "node3:5003"}
+    factory = _RecordingFactory()
+    cache = RoutingCache(None, _FakeTableSource(_table_with_addresses(1, addresses)),
+                         factory=factory)
+
+    handles = [cache.any_replica_for(0) for _ in range(60)]
+
+    assert all(handle is not None for handle in handles)
+    assert {(node_id, address) for _, node_id, address in factory.asked} == set(
+        addresses.items()), "members of the set, at their own addresses, and all of them"
+
+
+def test_a_member_this_client_has_no_handle_for_is_passed_over():
+    """What is handed out is a member a client can reach, and None when that is nobody.
+
+    The table names a replica set, which is not the same thing as a set of nodes this client
+    can talk to: a member it has no address for yet, or one whose channel has gone, is a
+    member to try and not a member to stop at.  A set with none of them reachable is None
+    rather than a raise, the same answer the leader lookup gives a shard with no leader - and
+    so is a shard the table does not name at all.
+    """
+    factory = _RecordingFactory(reachable={2})
+    cache = RoutingCache(
+        None, _FakeTableSource(_table_with_addresses(1, {1: "a:1", 2: "a:2"})),
+        factory=factory)
+
+    assert cache.any_replica_for(0).address == "a:2", (
+        "the member with a handle, and not whichever was tried first")
+    assert all(node_id in (1, 2) for _, node_id, _ in factory.asked)
+
+    silent = RoutingCache(None, _FakeTableSource(_table_with_addresses(1, {1: "a:1"})),
+                          factory=_RecordingFactory(reachable=set()))
+    assert silent.any_replica_for(0) is None
+
+    unnamed = RoutingCache(None, _FakeTableSource(_table(1, nodes=())))
+    assert unnamed.any_replica_for(0) is None, "a shard the table names nobody for"
+
+
 # -- the two sources a placement can come from ---------------------------------
 
 class _ClusterThatSaysWhoLeads:

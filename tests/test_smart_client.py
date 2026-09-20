@@ -14,7 +14,8 @@ from oxidedb.raft.shard_server import ShardedRaftCluster as ShardedCluster
 from oxidedb.raft.state_machine import MVCCStateMachine, CommandType
 from oxidedb.tso.tso import TSOCluster
 from oxidedb.transaction.coordinator import TransactionCoordinator
-from oxidedb.transaction.smart_client import SmartClient
+from oxidedb.transaction.smart_client import (Consistency, ReadIndexCache,
+                                              SmartClient)
 
 
 class _ClockWithoutAGroup:
@@ -125,6 +126,82 @@ def test_a_write_with_nowhere_to_send_it_says_why():
 
     with pytest.raises(RuntimeError, match="No shard holds"):
         client.put(b"user:1", b"alice")
+
+
+def _a_client_that_covers_no_keys():
+    """A client whose table covers nothing, which is enough to be asked for a read.
+
+    None of the consistency tests below get as far as a shard: what they pin is what this
+    client says about a request it will not make, and the level is checked before any of the
+    routing is used.
+    """
+    factory = LocalNodeClientFactory(None)
+    cache = RoutingCache(None, _TableThatCoversNothing(), factory=factory)
+    return SmartClient(_ClockWithoutAGroup(), None, router=cache, factory=factory)
+
+
+def test_a_consistency_that_is_not_one_of_the_three_is_refused():
+    """A caller that misspells a level is told, rather than given the default.
+
+    The three words are the whole of a caller's vocabulary here, and a typo would otherwise
+    be a silent request for the strongest read - which is the one thing a caller that chose a
+    consistency was trying not to get.  A range read is the same request and takes the same
+    parameter, so it is refused in the same way.
+    """
+    client = _a_client_that_covers_no_keys()
+
+    with pytest.raises(ValueError, match="not a consistency"):
+        client.get(b"user:1", consistency="Follower")
+    with pytest.raises(ValueError, match="not a consistency"):
+        client.scan(b"a", b"z", consistency="eventual")
+
+
+def test_a_level_this_client_does_not_implement_is_refused_rather_than_answered():
+    """A replica read is not quietly a leader read.
+
+    Answering it strongly would be the one failure a caller cannot detect: it would get an
+    answer, and nothing in it would say that the level it asked for was ignored.  So the two
+    levels that are not implemented raise, and each says which one it was.
+    """
+    client = _a_client_that_covers_no_keys()
+
+    for level in (Consistency.FOLLOWER, Consistency.CACHED):
+        with pytest.raises(NotImplementedError, match=level):
+            client.get(b"user:1", consistency=level)
+
+
+def test_an_index_the_client_has_is_kept_for_the_reads_that_come_next():
+    """What the cache holds: one index per shard, and nothing else.
+
+    A caller that has an index can read at it without asking anybody, which is the whole of
+    what a cached read is.  What it must not do is mix two shards up: an index is a position
+    in one log, and a position in one shard's log says nothing about another shard's.
+    """
+    cache = ReadIndexCache()
+
+    assert cache.cached_index(0) is None, "nothing has been read yet"
+    cache.remember(0, 42)
+    cache.remember(1, 7)
+
+    assert cache.cached_index(0) == 42
+    assert cache.cached_index(1) == 7
+    assert cache.cached_index(2) is None
+
+
+def test_an_index_stops_being_worth_using_once_it_is_old_enough():
+    """Time is the whole of what invalidates an entry.
+
+    Nothing tells this cache that an index has stopped being worth reading at - the log it
+    came from does not go away - so the window is the only thing standing between a caller
+    and an answer older than it agreed to, and an entry inside the window is still good.
+    """
+    cache = ReadIndexCache(ttl=0.01)
+
+    cache.remember(0, 42)
+    assert cache.cached_index(0) == 42, "fresh when it has just been kept"
+
+    time.sleep(0.02)
+    assert cache.cached_index(0) is None
 
 
 def test_read_index_consistency():

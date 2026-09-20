@@ -25,10 +25,15 @@ may ask instead, since the table publishes a replica set and only one of its mem
 and ``refresh_for_shard`` is the read it makes when none of them answers.  ``ask_shard`` in
 ``client/routing.py`` is the caller that walks them in that order.
 
+That same set is what a read that need not go to the leader reads from, and it does not have
+to be refused first to get there: ``any_replica_for`` hands out a member of it, because a
+read now carries the index it is to be answered at and any member can answer one.
+
 It says nothing about how a client reaches a shard once it knows where that shard is: the
 factory does, and what this file decides is which node the factory is asked for.
 """
 
+import random
 import threading
 import time
 from typing import List, Optional
@@ -182,6 +187,42 @@ class RoutingCache:
             if address is not None and address not in addresses:
                 addresses.append(address)
         return addresses
+
+    def any_replica_for(self, shard_id: int) -> Optional[NodeClient]:
+        """A client for one of the nodes that serves ``shard_id``, leader or not.
+
+        What a read that need not go to the leader needs, and it can exist at all because a
+        read carries the index it is to be answered at: any member of the set can answer one
+        at an index a leader confirmed (see ``raft/client_servicer.py``), so the replica set
+        the table publishes is somewhere a client may read rather than only a list to walk
+        after a refusal.
+
+        Picked at random, and that is the point rather than an implementation detail: a
+        client reading from the node the table names would be reading from the leader again,
+        and the reason to read from a replica is that the reads of many clients are spread
+        over the set.  Which member is picked is not a fact about the shard - leading is the
+        only job any of them has - so nothing here prefers one.
+
+        The local node is not one of the things this file knows.  A cache is given a cluster
+        or, for a client outside every cluster, nothing at all (``cli.py``), and neither says
+        which member this process is - so a client that is itself a replica cannot be
+        preferred here without being told which one it is, and nothing tells it.
+
+        None when the table names nobody for the shard, or when the factory has no handle for
+        any member of the set: a set nothing can reach is not a set to pick from.
+        """
+        placement = self.table().shard(shard_id)
+        if placement is None or not placement.nodes:
+            return None
+
+        node_ids = list(placement.nodes)
+        random.shuffle(node_ids)
+        for node_id in node_ids:
+            handle = self._factory.get_client(shard_id, node_id,
+                                              placement.addresses.get(node_id))
+            if handle is not None:
+                return handle
+        return None
 
     def routes(self) -> RangeMap:
         """The ranges of the table this cache holds: which shard covers which keys.
