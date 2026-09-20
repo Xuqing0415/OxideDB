@@ -200,10 +200,9 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   lets the group the shard left go, keeping its storage under an orphan name rather than
   deleting it.  A split or a move that died part way through is picked up on the next start
   out of the note the source shard left and the answer the routing table gives - by
-  `ShardedRaftCluster`, which is the cluster object the tests start, and not yet by a node
-  started through `launcher.py`; that is the first entry under Known gaps.  See Known gaps
-  too for what is still missing around all of this: something that decides to move a shard
-  in the first place, and follower reads.
+  `ShardedRaftCluster` and by a node started through `launcher.py`, which drives the same
+  recovery in the same order.  See Known gaps for what is still missing around all of
+  this: something that decides to move a shard in the first place, and follower reads.
 
 ## Storage engines (plan E)
 
@@ -537,45 +536,19 @@ Three environment notes:
 
 Honest list of what is *not* done, roughly in priority order.
 
-* **Recovery is not wired into `launcher.py`, so a process that dies mid-move does not pick
-  it up.**  `recover_splits` and `recover_migrations`, and the notes they read through
-  `RecoveryRunner.load_pending_splits` and `load_pending_migrations`, are reached from
-  `start` and `start_network` and nowhere else, through a `RecoveryRunner` that both a
-  cluster and a process could hold - so the cluster object the
-  tests start recovers and a node started as a process does not.  A process killed between a
-  move's copy and its proposal comes back with the note unread and, worse, with the source
-  shard unfrozen: the freeze is a flag in memory, nothing puts it back, and the group the
-  table has already given away takes new rows again - a double write and a range served by
-  one group whose rows are in another.  A split killed before its proposal has the same hole
-  without the double-write half, because a split copies rather than moves.  The tests for
-  this - `tests/test_migration_recovery.py` and `tests/test_split_recovery.py` - both drive
-  `ShardedRaftCluster`, so no test here covers the path a deployed node takes.  Fixing it is
-  mostly moving that logic somewhere both start-up paths can call.  The split's half has
-  moved: `RecoveryRunner` (`oxidedb/raft/recovery_runner.py`) holds `_pending_splits` and
-  asks for the rest through `RecoveryView`, and `ShardedRaftCluster` delegates to it.  The
-  move's half is still written against the cluster's own `_migrations`, `_placed_shards`,
-  `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group
-  has none of those.
-  It is not only moving it, though.  A copied row is stamped with the version it already is,
-  and none of the six primitives said which version a row is at - a write record is written
-  by a transaction's commit and not by a plain `SET` - so the client service had to carry a
-  version-stamped read before any recovery could copy a row out of another process
-  (`docs/recovery.md`, section 5).  That read is in place: the servicer fills `commit_ts` on
-  a key and on every row of a scan, and `scan_versions` is where a recovery reads it.  The
-  recovery that uses it is the part still missing.
-  A split has one boundary of its own: a node's ports are its shard
-  segment with the two groups above it, so a cluster can serve `SHARD_SEGMENT` shards and
-  a split asking for the shard after that has to be refused - a check the split path does
-  not make yet (`docs/recovery.md`, section 5).
+* **A split cannot be asked for the shard beyond a node's port segment.**  A node's ports
+  are its shard segment with the two groups above it, so a cluster can serve
+  `SHARD_SEGMENT` shards and a split asking for the shard after that has to be refused -
+  a check the split path does not make yet (`docs/recovery.md`, section 5).
 * **A recovery that refuses has nothing that asks it again.**  `recover_splits` and
-  `recover_migrations` are called from `start` and `start_network` and by a caller that
-  wants them, and by nothing else: a note left over because its range held a lock, or
+  `recover_migrations` are called from each of the three start-up paths and by a caller
+  that wants them, and by nothing else: a note left over because its range held a lock, or
   because the table could not be read, waits for the next restart.  The lock clears on its
   own - a TTL, or the lock cleaner - but the note does not, and the shard stays frozen while
   it waits.  The natural hook is the lock cleaner's pass, which already knows that a range
   has unlocked; what is missing is a decision about which object owns the retry, because the
-  cleaner reaches a cluster through `_shard_servers` and the process side has no `recover_*`
-  to call yet.
+  cleaner reaches a cluster through `_shard_servers` and the recovery it would call is the
+  one both start-up paths already call.
 * **`lock_time` comes from the local wall clock.**  Each replica writes
   `time.time()` into the lock record while applying the same log entry, so
   replicas hold TTLs that differ by a few milliseconds and the value is not
@@ -628,11 +601,12 @@ Honest list of what is *not* done, roughly in priority order.
 * **A node can be a process, but a client outside one cannot do everything yet.**
   The contract is six node-level primitives in
   `proto/client.proto`, with a four-value `error_code` and a leader hint.  Two of its
-  fields are declared and not filled yet: `KeyValuePair.commit_ts` and
-  `GetResponse.commit_ts` are where a value says which version it is, and no servicer
-  sets either.  Recovery needs them before it can copy a row out of another process
-  (`docs/recovery.md`, section 5), and the shape was worth settling before the
-  filling - `tests/test_client_wire_versions.py` is what holds it.
+  fields are where a value says which version it is, `KeyValuePair.commit_ts` and
+  `GetResponse.commit_ts`, and the servicer fills both - on a key, and on every row of a
+  scan - which is what lets a recovery copy a row out of another process
+  (`docs/recovery.md`, section 5).  `NodeClient.scan_versions` and
+  `ReadResult.commit_ts` are how a caller reads it, and
+  `tests/test_client_wire_versions.py` is what holds the shape.
   `oxidedb/client/node_client.py` is the protocol a caller meets a shard through,
   `LocalNodeClient` implements it over a node in this process and `RemoteNodeClient` over
   a channel, `raft/client_servicer.py` serves it from the same port a shard's Raft traffic
@@ -762,10 +736,9 @@ Honest list of what is *not* done, roughly in priority order.
   entry for it is the move's to write, and a first pass that wrote the cluster's own answer
   would undo a proposal that had landed.  A cluster that comes back finds the note, freezes
   the shard again - the freeze is a local fact, and it died with the process that set it - and
-  finishes the move itself: `recover_migrations`, which `ShardedRaftCluster` calls as it
-  starts - a node started through `launcher.py` runs none of this yet, which is the first
-  entry under Known gaps - and which a caller may call again, because every step of it is a
-  no-op the second time.  The routing
+  finishes the move itself: `recover_migrations`, which both start-up paths call as they
+  start, and which a caller may call again, because every step of it is a no-op the second
+  time.  The routing
   table is what says how much of the move is left, and its three answers are the three
   below read backwards: the set the move was going to means the proposal landed and only the
   half after it is left, the set it was leaving means the copy is where the move stopped and

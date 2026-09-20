@@ -1,29 +1,34 @@
 # Recovery for a shard that was moving when the process stopped
 
-One shard leaves a note on every replica that says what it was in the middle of, and
-one of the two ways this repository starts a cluster reads it.  This is the design for
-the other one: what the recovery needs from the thing it runs inside, so that a node in
-a process of its own can pick up a split or a move the way the in-process cluster does.
+One shard leaves a note on every replica that says what it was in the middle of, and both
+ways this repository starts a cluster read it: `ShardedRaftCluster`, and a node that is a
+process of its own.  This is the design of the interface the second of them runs the
+recovery through - what the recovery needs from the thing it runs inside, so that a
+process can pick up a split or a move the way the in-process cluster does.
 
-It is written before the code because the shape of that interface decides whether the
-second implementation can exist at all.  The first attempt at it - "give the process
-path a cluster object" - cannot be built: the first thing recovery does is freeze the
-shard, and a process cannot freeze a group it does not hold.
+It was written before the code because the shape of that interface decides whether the
+second implementation can exist at all, and it is built: `NodeClusterView`
+(`oxidedb/launcher.py`) is that implementation, it holds a `RecoveryRunner` the way a
+cluster object does, and `ClusterNode.start` drives it in the order section 6 gives.
+The first attempt at it - "give the process path a cluster object" - cannot be built:
+the first thing recovery does is freeze the shard, and a process cannot freeze a group it
+does not hold.
 
 ## 1. The problem
 
-`ShardedRaftCluster` recovers and a node started as a process does not.  `recover_splits`
-and `recover_migrations` (`oxidedb/raft/shard_server.py`) are called from its `start` and
-its `start_network`, and both hand the work over: the notes are read through
+`ShardedRaftCluster` recovered and a node started as a process did not.  `recover_splits`
+and `recover_migrations` (`oxidedb/raft/shard_server.py`) were called from its `start` and
+its `start_network` alone, and both hand the work over: the notes are read through
 `RecoveryRunner.load_pending_splits` and `load_pending_migrations`
 (`oxidedb/raft/recovery_runner.py`), and the working state of both kinds of recovery -
 `_pending_splits`, `_migrations` and the two error strings - lives on the runner rather
 than on the side it was handed.  Everything else is asked of that side through the view,
 `_placed_shards`, `_orphan_dirs` and `_shard_servers` among it.  `ClusterNode`
 (`oxidedb/launcher.py`), which is what runs when a node is a process, holds one node of
-each group and none of those three - and no runner, which is this document's subject.
+each group and none of those three - which is why the recovery asks for them through the
+view, and why the runner lives on the view rather than on the node.
 
-What the gap costs, in the order it bites:
+What the gap cost, in the order it bit:
 
 * A process killed between a move's copy and its proposal comes back with the note
   unread and the source shard *unfrozen*.  A freeze is `_writes_frozen`, a flag in
@@ -36,8 +41,8 @@ What the gap costs, in the order it bites:
   table never hears about it.
 * The tests that cover this - `tests/test_migration_recovery.py` and
   `tests/test_split_recovery.py` - both drive `ShardedRaftCluster`, so nothing in the
-  suite covers the path a deployed node takes.  "Killed at every step, restarted,
-  converges" has only ever been met by the cluster object.
+  suite covered the path a deployed node takes.  "Killed at every step, restarted,
+  converges" had only ever been met by the cluster object.
 
 Two qualifications, because they decide how urgent this is rather than whether it is
 real:
@@ -49,9 +54,9 @@ real:
   about, so the gap is latent rather than live.
 * That is the argument for doing it now rather than when it starts to hurt: the feature
   that lets a move be started from outside a test is the feature that turns this gap
-  into data that has gone somewhere nobody can find it.  The README now says which of
-  the two start-up paths recovers, so a reader is not told a guarantee the product does
-  not keep.
+  into data that has gone somewhere nobody can find it.  The README said which of the
+  two start-up paths recovers, so a reader was not told a guarantee the product did not
+  keep.
 
 **A split's range has to move in one call, and that is the router's doing rather than a
 preference about names.**  `locate` (`oxidedb/shard/router.py`) routes a key that falls
@@ -614,12 +619,12 @@ recovery, it is in front of it.
 
 ## 6. Order, failure, tests
 
-**Order.**  The launcher's `ClusterNode.start` becomes the cluster's `start`, in the
-cluster's order:
+**Order.**  The launcher's `ClusterNode.start` drives the same recovery as the cluster's
+`start`, in the cluster's order:
 
 1. the groups are built (`_start_metadata_group`, `_start_tso_group`, `_start_shards`);
-2. the notes are *loaded* - every shard with one is frozen again, before anything could
-   take a row for it;
+2. the notes are *loaded* - a move's shard is frozen again here, and a split's at the
+   first step of finishing it, both before anything could take a row for it;
 3. the publisher starts, because it is what tells the table's group that this node's
    shards exist;
 4. the notes are *finished*, which is the part that reads the table, copies rows and
@@ -660,15 +665,19 @@ intermediate state the mover left it in - the one state that cannot lose a row.
    call it wraps - the split's move did edit three of them, and `docs/design.md` says why
    that is not a test changing.  If an assertion needs editing, the move went wrong.
 2. A hand-made note in a real process - `tests/_notes.py` writes one, and
-   `tests/test_recovery_over_processes.py` is the test that starts a node over it, marked
-   `xfail` until this work lands.  The note goes into the shard's own storage
+   `tests/test_recovery_over_processes.py` is the test that starts a node over it.  The
+   note goes into the shard's own storage
    (`<data-dir>/shard-N`, through `RaftStorage.save_admin`: a node's bookkeeping is a note
    by name and not a file), under `MIGRATION_RECORD_PREFIX/{shard_id}` or
    `SPLIT_RECORD_PREFIX/{shard_id}`, holding the msgpack record `RecoveryRunner.remember_migration`
-   or `RecoveryRunner.remember_split` writes.  Start the node and assert the job is
-   finished - the table names the target set, the source is closed and set aside.  This
-   is deterministic in a way a kill is not, and it drives the same path: a node that
-   comes up with a note is a node whose predecessor died.
+   or `RecoveryRunner.remember_split` writes.  Start the node and assert what happened to
+   the note.  What the test there asserts is the freeze - the note is read, the source
+   comes back refusing rows, and the note is still on disk because the range is not in the
+   table to be split.  The other ending, where the table already names the range and the
+   restart proposes the split and finishes it, wants a node that ran once before the note
+   was written, and is not in that file yet.  This is deterministic in a way a kill is
+   not, and it drives the same path: a node that comes up with a note is a node whose
+   predecessor died.
 3. A kill, for the part the hand-made note cannot show: start a real cluster through
    `tests/_cluster.py`, begin a move, `kill()` one node between its copy and its
    proposal, start it again, and assert that the move ends and a client can write the
