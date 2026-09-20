@@ -539,8 +539,10 @@ Honest list of what is *not* done, roughly in priority order.
 
 * **Recovery is not wired into `launcher.py`, so a process that dies mid-move does not pick
   it up.**  `recover_splits` and `recover_migrations`, and the notes they read through
-  `_load_pending_splits` and `_load_pending_migrations`, live on `ShardedRaftCluster` and are
-  called from its `start` and `start_network` and nowhere else, so the cluster object the
+  `RecoveryRunner.load_pending_splits` and `_load_pending_migrations`, are reached from
+  `start` and `start_network` and nowhere else - the split's half through a
+  `RecoveryRunner` that both a cluster and a process could hold, the move's still written
+  on `ShardedRaftCluster` - so the cluster object the
   tests start recovers and a node started as a process does not.  A process killed between a
   move's copy and its proposal comes back with the note unread and, worse, with the source
   shard unfrozen: the freeze is a flag in memory, nothing puts it back, and the group the
@@ -549,9 +551,12 @@ Honest list of what is *not* done, roughly in priority order.
   without the double-write half, because a split copies rather than moves.  The tests for
   this - `tests/test_migration_recovery.py` and `tests/test_split_recovery.py` - both drive
   `ShardedRaftCluster`, so no test here covers the path a deployed node takes.  Fixing it is
-  mostly moving that logic somewhere both start-up paths can call: it is written against the
-  cluster's own `_migrations`, `_pending_splits`, `_placed_shards`, `_orphan_dirs` and
-  `_shard_servers`, and a `ClusterNode` holding one node of each group has none of those.
+  mostly moving that logic somewhere both start-up paths can call.  The split's half has
+  moved: `RecoveryRunner` (`oxidedb/raft/recovery_runner.py`) holds `_pending_splits` and
+  asks for the rest through `RecoveryView`, and `ShardedRaftCluster` delegates to it.  The
+  move's half is still written against the cluster's own `_migrations`, `_placed_shards`,
+  `_orphan_dirs` and `_shard_servers`, and a `ClusterNode` holding one node of each group
+  has none of those.
   It is not only moving it, though.  A copied row is stamped with the version it already is,
   and none of the six primitives said which version a row is at - a write record is written
   by a transaction's commit and not by a plain `SET` - so the client service had to carry a
@@ -836,7 +841,7 @@ Honest list of what is *not* done, roughly in priority order.
 * **The remote metadata client's two placement-changing writes are smoke-tested, not
   driven.**  `RemoteMetadataClient.split_shard` was missing outright until a move needed
   its twin, and the failure that would have caused is an `AttributeError` inside
-  `ShardedRaftCluster._publish_split` - unseen because every cluster that splits a shard in
+  `RecoveryRunner._publish_split` - unseen because every cluster that splits a shard in
   `tests/` holds the in-process client.  Both writes are now tested as far as the wire:
   that the command arrives as itself and is checked by the machine
   (`tests/test_group_clients.py`).  What is still owed is a cluster driven end to end

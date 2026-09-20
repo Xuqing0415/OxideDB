@@ -14,11 +14,14 @@ shard, and a process cannot freeze a group it does not hold.
 
 `ShardedRaftCluster` recovers and a node started as a process does not.  `recover_splits`
 and `recover_migrations` (`oxidedb/raft/shard_server.py`) are called from its `start` and
-its `start_network`, they read the notes through `_load_pending_splits` and
-`_load_pending_migrations`, and they are written against that cluster's own `_migrations`,
-`_pending_splits`, `_placed_shards`, `_orphan_dirs` and `_shard_servers`.  `ClusterNode`
-(`oxidedb/launcher.py`), which is what runs when a node is a process, holds one node of
-each group and none of those five.
+its `start_network`, they read the notes through `RecoveryRunner.load_pending_splits`
+(`oxidedb/raft/recovery_runner.py`) and `_load_pending_migrations`, and the move's half of
+what follows is written against that cluster's own `_migrations`, `_placed_shards`,
+`_orphan_dirs` and `_shard_servers`.  The split's half has moved out to the runner, which
+holds `_pending_splits` itself and asks the side it runs on for everything else.
+`ClusterNode` (`oxidedb/launcher.py`), which is what runs when a node is a process, holds
+one node of each group and none of those four - and no runner, which is this document's
+subject.
 
 What the gap costs, in the order it bites:
 
@@ -61,12 +64,13 @@ answer rather than a failure, and it is why the interface in section 2 has one
 
 ## 2. The interface
 
-**The interface is per process, and that is not a preference.**  `_remember_split`
-writes a note on *every replica* of the shard it is about, and says why: "the note says
-which shard is being split, and any replica holding that shard can be the one that finds
-it".  The design already assumes that recovery is done by the replica that comes back,
-not by a coordinator that looks at the group.  A `freeze_the_group(shard_id)` call -
-the shape a cluster-object interface wants - cannot be expressed from one process at all.
+**The interface is per process, and that is not a preference.**  The split's
+`RecoveryRunner.remember_split` writes a note on *every replica* of the shard it is about,
+and says why: "the note says which shard is being split, and any replica holding that
+shard can be the one that finds it".  The design already assumes that recovery is done
+by the replica that comes back, not by a coordinator that looks at the group.  A
+`freeze_the_group(shard_id)` call - the shape a cluster-object interface wants - cannot
+be expressed from one process at all.
 
 So the unit of recovery is *the replicas this process holds*, and the invariant is the
 union: every process freezes what it has, reads the notes on what it has, and the set
@@ -194,7 +198,7 @@ about how wide the interface is.
 **The seam is at the note, and everything after one is written down is the recovery's
 side of it.**  `_num_shards` hands a split its new shard's id, `_drain_shard` waits out the
 writes the freeze admitted, and the rows a move copies are read - all three *before*
-`_remember_split` or `_remember_migration` writes anything.  That part belongs to whatever
+`RecoveryRunner.remember_split` or `_remember_migration` writes anything.  That part
 begins the work: `split_shard` and `move_shard` today, and a process that can begin one
 whenever it grows that.  The recovery neither needs it nor could get it: the note carries
 what the beginning decided, the new shard's id among it.  Everything after the note -
@@ -206,6 +210,9 @@ them: `_pending_splits` and `_migrations` are written by the beginning - the ent
 there is the in-memory copy of the note - and finished by the recovery, which is why
 `possible_ranges` reads the first of them; and `_last_migration_error` is written by both,
 by `move_shard`'s precondition refusals before the note and by the finish path after it.
+The split's two are on the runner now, and the beginning reaches them through it:
+`remember_split` writes the note and the entry in one call, and `pending_split` is the
+question `split_shard` asks before beginning a second split of the same shard.
 
 The differential was thirteen primitives only `ShardedRaftCluster` has, nine both sides
 already have, and three neither has.  The nine go straight in (`shard_ids`, `range_map`,
@@ -241,14 +248,19 @@ thirteen and the three land like this:
   than a new one.  `_leader_on` is `leader_client_for_nodes`, which is the same walk
   over a set of nodes with the client handed back instead of the object.
 * `_rows_above`, `_committed_rows`, `_locks_in_range` - internal, over
-  `leader_client(shard_id).scan(...)`.
+  `leader_client(shard_id).scan(...)`.  The split's copies of the first and the third are
+  in the runner, and the `_locks_in_range` there asks the question by reading the range
+  and taking a refusal over a lock for the answer; the cluster keeps the move's.
 * `_move_row`, `_copy_rows`, `_copy_what_is_missing` - internal, over
   `leader_client(...).propose(...)`, `leader_client(...).get_write_record(...)` and
   `leader_client(...).scan_versions(...)`.  Each was written a second time beside
   the body that reached through node objects, to show the seam could carry a copy
   at all and that the two proposed the same bytes for the same rows
   (`tests/test_copy_row.py`).  The proof is spent and the node-object body is gone:
-  what is left is the one the callers reach, which is the one a process can run.
+  what is left is the one the callers reach, which is the one a process can run.  The
+  split's two went with the rest of its branch, into `RecoveryRunner._copy_what_is_missing`
+  and `RecoveryRunner._move_row`; `_copy_rows` is the move's, and reaches the same
+  `_move_row` through the cluster, which delegates to the runner's.
 * `_client_for_node` - the cluster side's way of handing the copy a client, and
   deliberately not an interface method.  Its argument is a node object, which is the
   one thing a process does not have, so the rule at the top of this section excludes
@@ -256,9 +268,9 @@ thirteen and the three land like this:
   wrapper around the same node, so nothing downstream can tell which produced it.
 * `_addresses_on` - not needed by the recovery: the addresses a move proposes are the ones
   the nodes it is proposing to serve at, and whoever holds those nodes works them out.
-* `_finish_split`, `_publish_split` - internal to the recovery.
-  `_apply_split_locally` is the exception: it is the view's, under the name
-  `apply_split_locally`.
+* `_finish_split`, `_publish_split` - internal to the recovery, and since the split's
+  branch moved, the runner's: `finish_split` and `_publish_split`.  `_apply_split_locally`
+  is the exception: it is the view's, under the name `apply_split_locally`.
 * `_finish_move`, `_propose_move`, `_commit_move`, `_abort_move` - internal to the
   recovery.
 * `split_error`, `migration_error`, `pending_splits`, `migration_state`, `migrations` - the
@@ -266,9 +278,9 @@ thirteen and the three land like this:
 
 One reader crosses that line and has to be said out loud: `possible_ranges` asks the
 publisher's question - both maps a cluster mid-split could be in - and the second of them
-comes out of `_pending_splits`.  When that table moves into the recovery, `possible_ranges`
-asks the recovery for it rather than reading it here: a caller of the boundary, not a
-second owner of the state.
+comes out of `_pending_splits`.  That table has moved into the recovery, and
+`possible_ranges` now asks the runner for it rather than reading it here: a caller of the
+boundary, not a second owner of the state.
 
 The three that exist nowhere yet are the process-side answers, and they are section 5.
 
@@ -309,41 +321,47 @@ Becomes the view (public, one implementation of `RecoveryView`):
   of a set and keeps the first that answers a follower read index, which is the client
   service's own way of saying "I lead and I have confirmed it with a quorum".
 * `apply_split_locally` is `_apply_split_locally`.
-* `metadata()` is `self._metadata_client`.
+* `metadata_client()` is `self._metadata_client`.
 
 Stays internal (helpers the recovery calls through the view, or uses itself):
 
 * `_shard_nodes`, `_nodes_on`, `_addresses_on`, `_drain_shard`, `_rename_storage`,
   `_close_group_on`, `_ensure_group_on`, `_shard_leader_node`, `_wait_for_leader_on`,
-  `_wait_for_shard_leader`, `_shard_leader_on`, `_load_split_record`,
-  `_load_migration_record`, `_remember_*`, `_forget_*`.
-* `_finish_split`, `_publish_split`, `_copy_what_is_missing`, `_finish_move`,
-  `_propose_move`, `_commit_move`, `_abort_move`: these are the *recovery's* body, not
-  the view's.  They move into it, so that the two start-up paths cannot drift into two
-  slightly different protocols.
+  `_wait_for_shard_leader`, `_shard_leader_on`, `_load_migration_record`,
+  `_remember_migration`, `_forget_migration`.
+* `_finish_split`, `_publish_split`, `_copy_what_is_missing`, `_load_split_record` - the
+  split's half of the *recovery's* body, not the view's, and they have moved: they are
+  `RecoveryRunner`'s, held by the cluster as `self._recovery_runner`.  `_finish_move`,
+  `_propose_move`, `_commit_move` and `_abort_move` are the other half, and have not.
 * `_orphan_dirs` and `_placed_shards` stay here: what has been set aside and what the
   routing table names are this cluster's own bookkeeping, and `ensure_serving` and
   `serving_nodes` are the only doors onto them.
-* `_migrations`, `_pending_splits` and the two `_last_*_error` strings move with the
+* `_migrations`, `_pending_splits` and the two `_last_*_error` strings go with the
   recovery body, because they are a running recovery's working state - the boundary
-  section 3 draws.  Three of them are written from the beginning too: `split_shard` and
-  `move_shard` put the entry in the table the note is the disk copy of, and `move_shard`'s
-  precondition refusals are most of where `_last_migration_error` is written
-  (`_last_split_error` is the finish path's alone).  So the beginning reaches them through
-  `self._recovery`, the way the public accessors and `possible_ranges` do.
+  section 3 draws.  The split's two have gone; `_migrations` and `_last_migration_error`
+  go when the move's body does, and until then the cluster keeps those and the runner's
+  own copies of them are fields nothing reads.  Three of them are written from the
+  beginning too: `split_shard` and `move_shard` put the entry in the table the note is the
+  disk copy of, and `move_shard`'s precondition refusals are most of where
+  `_last_migration_error` is written (`_last_split_error` is the finish path's alone).  So
+  the beginning reaches them through `self._recovery_runner`, the way the public accessors
+  and `possible_ranges` do.
 
 What the public entry points become:
 
 ```python
-def recover_splits(self) -> List[int]:        # kept: the tests and the operator's hand
-    return self._recovery.recover(kind="split")
+def recover_splits(self) -> List[int]:      # kept: the tests and the operator's hand
+    return self._recovery_runner.recover_splits()
 
 def recover_migrations(self) -> List[int]:
-    return self._recovery.recover(kind="migrate")
+    self._load_pending_migrations()
+    return self._finish_pending_migrations()
 ```
 
 `start` and `start_network` keep the order they have - start the shards, load the notes,
-start the publisher, finish - because that order is load-bearing (see section 6).
+start the publisher, finish - because that order is load-bearing (see section 6).  It is
+why the split's half is two calls on the runner, `load_pending_splits` and
+`finish_pending_splits`, with `recover_splits` being those two in a row.
 
 ## 5. The process side
 
@@ -404,9 +422,12 @@ both turn out to be expressible with them:
   the version space holds the *old* version of that row - which nothing downstream could
   tell from a row that is simply the row.  So all four calls that read a range in order to
   move it check `_locks_in_range` first and refuse over a lock: `split_shard` and
-  `move_shard`, and now `recover_splits` and `recover_migrations` at the point where each
-  of them reads the rows - the same read, in the same place, for the same reason.  What a
-  refusing recovery leaves is the state section 6 describes: the note on disk, the shard
+  `move_shard`, and now `recover_splits` and `recover_migrations`, at the point where each
+  of them reads the rows - the same read, in the same place, for the same reason.  One of
+  the four asks it differently: the check that moved with the split's recovery is
+  `RecoveryRunner._locks_in_range`, which asks by reading the range and takes a refusal
+  over a lock for the answer, where the cluster's three ask the shard's own storage.  What
+  a refusing recovery leaves is the state section 6 describes: the note on disk, the shard
   frozen, and the lock clearing on its own, since it belongs to a transaction.
 * The command is a `serialize_command(CommandType.SET, ...)` call with the value's
   timestamp and the write record's `start_ts`, and it is a module-level function in
@@ -471,8 +492,9 @@ to respect:
   `base + 100 * num_shards`, so the shard a first split creates wanted the port the
   metadata group was already holding.  `grpc` raises out of `add_insecure_port` for a port
   that is already bound rather than reporting a failure, so a recovery wired in as it
-  stood would not have come up - and `_resume_split` builds the new shard's group *after*
-  freezing the source, so that would have been a start that died with the shard frozen.
+  stood would not have come up - and `RecoveryRunner._resume_split` builds the new
+  shard's group *after* freezing the source, so that would have been a start that died
+  with the shard frozen.
   The layout is now three fixed segments - shard `s` at `base + s`, the two groups at
   `base + SHARD_SEGMENT` and above - so a split's new shard has a port of its own, and the
   bound is `SHARD_SEGMENT`, which `ClusterConfig.validate` refuses a configuration above.
@@ -561,18 +583,20 @@ intermediate state the mover left it in - the one state that cannot lose a row.
 
 1. The in-process tests that exist (`tests/test_migration_recovery.py`,
    `tests/test_split_recovery.py`) are the behavior contract for the refactor: they
-   drive `ShardedRaftCluster`, and they must pass unchanged.  If they need editing, the
-   move of the bodies went wrong.
+   drive `ShardedRaftCluster`, and their assertions must pass unchanged.  What may be
+   edited is a spy's own shape, because a spy is written against the signature of the
+   call it wraps - the split's move did edit three of them, and `docs/design.md` says why
+   that is not a test changing.  If an assertion needs editing, the move went wrong.
 2. A hand-made note in a real process - `tests/_notes.py` writes one, and
    `tests/test_recovery_over_processes.py` is the test that starts a node over it, marked
    `xfail` until this work lands.  The note goes into the shard's own storage
    (`<data-dir>/shard-N`, through `RaftStorage.save_admin`: a node's bookkeeping is a note
    by name and not a file), under `MIGRATION_RECORD_PREFIX/{shard_id}` or
-   `SPLIT_RECORD_PREFIX/{shard_id}`, holding the msgpack record `_remember_migration` or
-   `_remember_split` writes.  Start the node and assert the job is finished - the table
-   names the target set, the source is closed and set aside.  This is deterministic in a
-   way a kill is not, and it drives the same path: a node that comes up with a note is a
-   node whose predecessor died.
+   `SPLIT_RECORD_PREFIX/{shard_id}`, holding the msgpack record `_remember_migration`
+   or `RecoveryRunner.remember_split` writes.  Start the node and assert the job is
+   finished - the table names the target set, the source is closed and set aside.  This
+   is deterministic in a way a kill is not, and it drives the same path: a node that
+   comes up with a note is a node whose predecessor died.
 3. A kill, for the part the hand-made note cannot show: start a real cluster through
    `tests/_cluster.py`, begin a move, `kill()` one node between its copy and its
    proposal, start it again, and assert that the move ends and a client can write the
