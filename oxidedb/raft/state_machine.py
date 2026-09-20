@@ -114,7 +114,7 @@ class ApplyResult:
 class ReadResult:
     def __init__(self, success: bool, value: Optional[bytes] = None, error_code: Optional[int] = None,
                  error_msg: Optional[str] = None, leader_address: Optional[str] = None,
-                 commit_ts: int = 0):
+                 commit_ts: int = 0, read_index: Optional[int] = None):
         self.success = success
         self.value = value
         #: The version ``value`` is, when it is one: the timestamp that version was
@@ -127,6 +127,17 @@ class ReadResult:
         #: Where the leader is, when the node answering this read is not it and knows
         #: who is.  See the same field on :class:`ApplyResult`.
         self.leader_address = leader_address
+        #: The consistency basis of the answer: the index it is as of.  A caller that
+        #: named one gets it back, and a read that named none is answered at the commit
+        #: index the node confirmed with a quorum.  Unset when the read never reached a
+        #: state machine, because a refusal is not an answer as of anything.
+        #:
+        #: It is the index the read was promised at, not the newest thing applied by the
+        #: time the caller looks: the promise is what a reader is entitled to, and it is
+        #: what lets two reads share one index.  The machine cannot fill this in - it is
+        #: given entries to apply and not the positions they were written at - so the
+        #: node that served the read does, and leaves it unset when it did not.
+        self.read_index = read_index
     
     @staticmethod
     def success(value: Optional[bytes], commit_ts: int = 0):

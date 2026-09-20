@@ -64,12 +64,13 @@ message GetResponse {
     // them, so a read of one carries the same thing a scan carries beside each row.
     // It says nothing unless value is set.
     int64 commit_ts = 5;
-    // The index this answer was read at.  A read always happens at one - the commit
-    // index the server confirmed, or the index the caller named - so a server always
-    // has one to send, and a caller that named an index can check that the answer is
-    // new enough.  It is not a version: nothing about it is stamped onto the value,
-    // and a snapshot read asked for by timestamp is still answered at whatever index
-    // has been applied.
+    // The consistency basis of this answer: the index it is as of.  A caller that named
+    // one gets it back, and a read that named none is answered at the commit index the
+    // server confirmed with a quorum, so a server always has one to send.  It is the
+    // index the read was promised at and not how far this replica happens to have
+    // applied by the time the answer is written - that is a fact about the node and it
+    // moves on its own - and it is not a version: nothing is stamped onto the value by
+    // it, and no snapshot read is decided by it.
     int64 read_index = 6;
 }
 
@@ -111,8 +112,8 @@ message ScanResponse {
     // is why the local scan raises instead of answering - the key is what the caller
     // needs to resolve it.
     optional bytes locked_key = 5;
-    // See GetResponse.read_index: the index the range was read at.  The rows carry the
-    // versions they are at; this is how far the log the reader looked at had got.
+    // See GetResponse.read_index: the same basis, for a range.  The rows carry the
+    // versions they are at; this is the index the whole answer is consistent as of.
     int64 read_index = 6;
 }
 

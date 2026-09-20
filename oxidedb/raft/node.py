@@ -1295,6 +1295,11 @@ class MemoryRaftNode:
         that has never led at all.  So the quorum and the leadership it proves are
         skipped, and with them the check after the wait - what is left is the wait,
         and an index this replica cannot reach is refused exactly as above.
+
+        The answer says which index it is as of (see ``ReadResult.read_index``): the
+        one the caller named, or the one this node confirmed.  It is the point the
+        answer is promised to be at, and not the newest thing this node happens to have
+        applied by the time the caller looks.
         """
         own_handshake = read_index is None
         if own_handshake:
@@ -1312,7 +1317,14 @@ class MemoryRaftNode:
             if own_handshake and self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
 
-            return self._state_machine.get(key, timestamp)
+            result = self._state_machine.get(key, timestamp)
+            # Which index the answer is as of.  The machine cannot say: it is handed
+            # entries to apply and not the positions they were written at, which is the
+            # same reason ApplyResult.index comes from here.  A read that never reached
+            # the machine above leaves it unset, because a refusal is not an answer as
+            # of anything.
+            result.read_index = read_index
+            return result
 
     def scan(self, start_key: bytes, end_key: bytes,
              timestamp: Optional[int] = None,

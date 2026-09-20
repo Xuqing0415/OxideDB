@@ -136,6 +136,10 @@ class TestRaftCluster:
             read = node.get(b"named", read_index=written.index)
             assert read.success, read.error_msg
             assert read.value == b"value"
+            assert read.read_index == written.index
+            # A read that named no index says which one this node confirmed instead, and
+            # here that is the same number: the write is the last thing that committed.
+            assert node.get(b"named").read_index == written.index
 
             rows = node.scan(b"named", b"namee", read_index=written.index)
             assert rows == [(b"named", b"value")]
@@ -168,6 +172,7 @@ class TestRaftCluster:
             read = follower.get(b"named", read_index=written.index)
             assert read.success, read.error_msg
             assert read.value == b"value"
+            assert read.read_index == written.index, "the index the caller named is the one"
 
             without = follower.get(b"named")
             assert not without.success, "a follower answered a read with no index"
@@ -198,6 +203,8 @@ class TestRaftCluster:
             assert not result.success, "a read was answered from a machine behind its log"
             assert result.error_code == ErrorCode.ERR_TIMEOUT, result.error_msg
             assert "applied" in result.error_msg, result.error_msg
+            assert result.read_index is None, (
+                "a read that never reached a state machine is as of no index at all")
             assert elapsed < 4, (
                 f"the read took {elapsed:.1f}s to be refused: a named index does not "
                 f"lift the bound on the wait")
