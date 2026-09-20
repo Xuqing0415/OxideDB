@@ -23,6 +23,7 @@ from _wait import wait_for_keys_leader, wait_for_metadata_client, wait_until
 from oxidedb.client import LocalNodeClientFactory
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import ApplyResult, CommandType, ErrorCode, MVCCStateMachine
 from oxidedb.shard.router import locate
@@ -234,13 +235,13 @@ def test_a_split_the_table_never_hears_keeps_the_shard_frozen_and_is_retried():
 def test_a_split_whose_answer_is_lost_is_not_applied_a_second_time(monkeypatch):
     metadata, cluster = _cluster_with_metadata()
     copies = []
-    original = ShardedRaftCluster._move_row
+    original = RecoveryRunner._move_row
 
     def counting_move_row(self, source, target, key, value, version):
         copies.append(key)
         return original(self, source, target, key, value, version)
 
-    monkeypatch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
+    monkeypatch.setattr(RecoveryRunner, "_move_row", counting_move_row)
     try:
         source = _write_both_rows(cluster)
         client = wait_for_metadata_client(metadata)

@@ -20,6 +20,7 @@ import threading
 from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_leader, wait_until
 from oxidedb.raft.node import RaftCluster
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
 from oxidedb.shard.router import locate
@@ -124,7 +125,7 @@ def test_the_source_shard_is_frozen_while_its_rows_are_copied(monkeypatch):
     """
     cluster = _started_cluster()
     seen = {}
-    original = ShardedRaftCluster._move_row
+    original = RecoveryRunner._move_row
 
     def spy_move_row(self, source, target, key, value, version):
         if not seen:
@@ -136,7 +137,7 @@ def test_the_source_shard_is_frozen_while_its_rows_are_copied(monkeypatch):
                 _set(node._state_machine, b"x_new", b"v", 999))
         return original(self, source, target, key, value, version)
 
-    monkeypatch.setattr(ShardedRaftCluster, "_move_row", spy_move_row)
+    monkeypatch.setattr(RecoveryRunner, "_move_row", spy_move_row)
     try:
         wait_for_keys_leader(cluster, [KEPT_KEY, MOVED_KEY])
         source = cluster.get_leader_for_key(MOVED_KEY)[1]

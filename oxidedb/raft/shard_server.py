@@ -16,15 +16,10 @@ from ..transaction.lock_cleaner import LockCleaner
 from ..transaction.lock_resolver import DEFAULT_LOCK_TTL
 from .recovery_notes import (MIGRATION_RECORD_PREFIX, SPLIT_RECORD_PREFIX, PendingNote,
                              forget_note, read_note, write_note)
-from .recovery_view import RecoveryInvariantError
+from .recovery_runner import LEADER_TIMEOUT, RecoveryRunner
 
 #: How often the cluster's own lock cleaner looks for abandoned locks, in seconds.
 DEFAULT_LOCK_CLEANER_INTERVAL = 30.0
-
-#: How long a split waits for the shard it created to elect a leader, in seconds.
-#: An election takes a few hundred milliseconds; a group that has not held one by
-#: now is a group this split cannot finish, not something to wait for for ever.
-SPLIT_LEADER_TIMEOUT = 10.0
 
 #: How long a shard that has moved goes on answering on the node it left, in seconds.
 #: Clients route by a table they cached, so the node one of them was sent to a moment
@@ -41,8 +36,7 @@ MIGRATION_DRAIN_SECONDS = 30.0
 #: routing table's group is holding.
 SHARD_SEGMENT = 1000
 from .node import MemoryRaftNode, RaftCluster, NodeState
-from .state_machine import (StateMachine, CommandType, ApplyResult, ErrorCode,
-                            serialize_command)
+from .state_machine import StateMachine, ApplyResult, ErrorCode
 from .storage import RaftStorage, JSONFileStorage
 
 
@@ -409,14 +403,12 @@ class ShardedRaftCluster:
         self._lock_cleaner = None
         self._metadata_client = None
         self._metadata_publisher: Optional[MetadataPublisher] = None
-        #: Splits whose rows are in the new shard's group but whose range the routing
-        #: table has not been told about, keyed by the shard being split.  A retry has
-        #: to finish the split that is in here rather than start a second one: the rows
-        #: are already in the new group, and a second id would point the table at a
-        #: group nothing was ever copied into.
-        self._pending_splits: Dict[int, Dict[str, Any]] = {}
-        #: Why the last split could not be published, if it could not be.
-        self._last_split_error: Optional[str] = None
+        #: The recovery's own body, run against this cluster: the splits and the moves
+        #: that are in flight, and why the last attempt at either could not finish.  It
+        #: belongs to the recovery rather than to a side - ``docs/recovery.md``, section
+        #: 3 - so this cluster reaches it through here, and so does the beginning of a
+        #: split, which puts the entry in it that the note is the disk copy of.
+        self._recovery_runner = RecoveryRunner(self)
         #: Moves of a shard that have not finished, keyed by the shard being moved.  A
         #: shard with one of these has two groups for a moment - the one the routing
         #: table names and the one it is about to - and this is what says which of them
@@ -493,10 +485,10 @@ class ShardedRaftCluster:
         # The notes are read before anything publishes and acted on after: a publisher
         # that started first could see the table a step ahead of this cluster and take
         # this cluster's own split for someone else's keyspace.
-        self._load_pending_splits()
+        self._recovery_runner.load_pending_splits()
         self._load_pending_migrations()
         self.start_metadata_publisher(metadata, metadata_publish_interval)
-        self._finish_pending_splits()
+        self._recovery_runner.finish_pending_splits()
         self._finish_pending_migrations()
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards")
     
@@ -518,10 +510,10 @@ class ShardedRaftCluster:
             self._shard_servers[node_id] = server
         
         self.start_lock_cleaner(lock_cleaner_interval, lock_cleaner_ttl)
-        self._load_pending_splits()
+        self._recovery_runner.load_pending_splits()
         self._load_pending_migrations()
         self.start_metadata_publisher(metadata, metadata_publish_interval)
-        self._finish_pending_splits()
+        self._recovery_runner.finish_pending_splits()
         self._finish_pending_migrations()
         print(f"Sharded cluster started with {self._num_nodes} nodes and {self._num_shards} shards (network mode)")
 
@@ -598,17 +590,11 @@ class ShardedRaftCluster:
         cluster's own placement, which is what the publisher needs to tell apart from
         somebody else's - so it is given both rather than one and left to guess.
 
-        One entry when nothing is in flight, which is the usual case.
+        One entry when nothing is in flight, which is the usual case.  See
+        :meth:`RecoveryRunner.possible_ranges`: the splits in flight are the recovery's
+        state, so the second map is asked of it rather than worked out here.
         """
-        now = self.range_map()
-        settled = dict(now)
-        for pending in self._pending_splits.values():
-            start, end = settled.get(pending["shard_id"], (None, None))
-            if start is None:
-                continue
-            settled[pending["shard_id"]] = (start, pending["split_key"])
-            settled[pending["new_shard_id"]] = (pending["split_key"], end)
-        return [now] if settled == now else [now, settled]
+        return self._recovery_runner.possible_ranges()
 
     def shard_leader(self, shard_id: int) -> Optional[Tuple[int, int]]:
         """The node leading ``shard_id``, and the term it leads at, if one does."""
@@ -748,13 +734,13 @@ class ShardedRaftCluster:
         id, the same rows, the same proposal - rather than for a second one.  Returns
         whether the split is now what the table says.
         """
-        pending = self._pending_splits.get(shard_id)
+        pending = self._recovery_runner.pending_split(shard_id)
         if pending is not None:
             if pending["split_key"] != split_key:
                 # A different split of a shard that is already half-split.  There is no
                 # answer this could give that would not lose one of the two.
                 return False
-            return self._finish_split(pending)
+            return self._recovery_runner.finish_split(pending)
 
         old_range = self._range_map.get(shard_id)
         if old_range is None:
@@ -795,76 +781,22 @@ class ShardedRaftCluster:
             self._num_shards += 1
             pending = {"shard_id": shard_id, "split_key": split_key,
                        "new_shard_id": new_shard_id, "rows": rows}
-            self._pending_splits[shard_id] = pending
-
             # Written down before anything is moved: a process that dies in the middle
-            # of the copy has to come back knowing what it was doing.  Then the new
-            # shard is built the way each server built the shards it started with -
-            # same state machine, same storage, and in network mode a port at the
-            # address the table is about to publish.
-            self._remember_split(pending)
+            # of the copy has to come back knowing what it was doing - and the note and
+            # the copy of it in memory are one act, which is why the recovery writes
+            # both.  Then the new shard is built the way each server built the shards it
+            # started with - same state machine, same storage, and in network mode a
+            # port at the address the table is about to publish.
+            self._recovery_runner.remember_split(pending)
             self.ensure_serving(new_shard_id, sorted(self._shard_servers))
 
             copied = True
-            return self._finish_split(pending)
+            return self._recovery_runner.finish_split(pending)
         finally:
             if not copied:
                 # Nothing of this split exists anywhere, so there is nothing a write
                 # could land outside of: the shard goes back to answering as it was.
                 self._unfreeze_shard(shard_id)
-
-    def _finish_split(self, pending: Dict[str, Any]) -> bool:
-        """Copy what the new shard is missing, then tell the routing table.
-
-        Called for the first attempt and for every retry of it.  A retry that finds rows
-        already in the new shard - which is what a split whose proposal was refused, or
-        whose response was lost, or that died part way through the copy, comes back to -
-        copies only the rest: the source has been frozen since they were read, so a row
-        that is already there is the row, and copying it again would be work for nothing.
-        What is left is the proposal, which the group recognises as the split it already
-        applied.
-        """
-        if not self._copy_what_is_missing(pending):
-            return False
-
-        if not self._publish_split(pending):
-            return False
-
-        # Re-range this process first: from here on it is the map the table has, and
-        # the publisher - which compares the two - sees a split that is finished rather
-        # than a cluster whose ranges disagree with it.
-        self.apply_split_locally(pending["shard_id"], pending["split_key"],
-                                 pending["new_shard_id"])
-        self._pending_splits.pop(pending["shard_id"], None)
-        self._forget_split(pending)
-        self._unfreeze_shard(pending["shard_id"])
-        return True
-
-    def _publish_split(self, pending: Dict[str, Any]) -> bool:
-        """Tell the routing table that the new shard owns the right half.
-
-        A refusal is not the end of the split: the shard stays frozen and the caller
-        comes back through :meth:`_finish_split`, which is the same proposal again.
-        What must not happen is a thaw.  The rows are in a group the table has not
-        been told about, and a client routing by the old table would be sent to the
-        source shard for keys whose data has already been copied out of it.
-        """
-        client = self._metadata_client
-        if client is None:
-            # No table to tell.  An in-process cluster has its own range map and
-            # nothing else; that map is the whole world to it.
-            return True
-
-        new_shard_id = pending["new_shard_id"]
-        result = client.split_shard(
-            pending["shard_id"], pending["split_key"], new_shard_id,
-            self.shard_replica_ids(new_shard_id), self.shard_addresses(new_shard_id),
-        )
-        if result.success:
-            return True
-
-        self._last_split_error = result.error_msg
-        return False
 
     def apply_split_locally(self, shard_id: int, split_key: bytes,
                             new_shard_id: int) -> None:
@@ -883,72 +815,6 @@ class ShardedRaftCluster:
         new_range_map[shard_id] = (start, split_key)
         new_range_map[new_shard_id] = (split_key, end)
         self.update_range_map(new_range_map)
-
-    def _copy_what_is_missing(self, pending: Dict[str, Any]) -> bool:
-        """Move the rows of the right half that the new shard does not already hold.
-
-        A retry starts from whatever the process that died had managed to copy, so the
-        question is asked per row rather than per split: a split that got one row across
-        before it stopped has one row less to move, and one that got none has all of
-        them.  Asking it per split would re-copy the rows that did make it, which is the
-        same data written twice and a second timestamp on a row that already had one.
-
-        The version already in the new shard, at the same timestamp, is the row - the
-        source has been frozen since they were read, so it cannot have moved on.  A row
-        the source no longer has is skipped: it was deleted, and there is nothing left to
-        move.  A row the new shard has at another timestamp is not the same row, and is
-        copied over.
-
-        The new shard is read through a leader that has committed an entry of its own
-        term: a row being in the group's log and the group's leader being able to see it
-        are two different things straight after a restart (see
-        :meth:`_wait_for_shard_to_catch_up`), and believing the second when only the
-        first is true would lose the row.
-
-        Both ends are reached through the seam, like the move's copy: this is the same
-        loop over a different set of rows, and the two being separate bodies here is what
-        the recovery's own extraction is meant to end.
-        """
-        target = self._wait_for_shard_to_catch_up(pending["new_shard_id"])
-        source = self._shard_leader_node(pending["shard_id"])
-        if target is None or source is None:
-            self._last_split_error = (f"shard {pending['new_shard_id']} or "
-                                      f"{pending['shard_id']} has no leader")
-            return False
-
-        # The new shard is not a shard the routing table names: for a split it is the one
-        # the split's own proposal is about to name, and until that lands the table has no
-        # entry for it.  So the group the copy goes into is asked for by node set - which
-        # is what ``leader_client_for_nodes`` is for - and not by shard id: asking by id
-        # would reach the every-node fallback ``_serving_nodes`` keeps for a shard it has
-        # no entry for, which happens to include the group just built, and a process keeps
-        # no such fallback and would be answered None.  A caller that broke this would be
-        # making a mistake rather than meeting a failure of the shard, so it raises: the
-        # four outcomes of a split are about the work, and a bug filed as one more
-        # attempt is a bug that gets retried instead of fixed.
-        if pending["new_shard_id"] in self._placed_shards:
-            raise RecoveryInvariantError(
-                f"shard {pending['new_shard_id']} is a split's new shard, which the "
-                f"routing table does not name until the split's own proposal lands; "
-                f"asking about its group by shard id would go through the every-node "
-                f"fallback instead of the group the split built")
-        source_client = self._client_for_node(pending["shard_id"], source)
-        target_client = self._client_for_node(pending["new_shard_id"], target)
-
-        # The versions are read over the whole source range rather than per key, because a
-        # key-by-key read is a quorum round each: a range read is one, and the rows it
-        # answers for are the ones this copy is asking about.
-        start, end = self._range_map[pending["shard_id"]]
-        versions = {key: version
-                    for key, _, version in source_client.scan_versions(start, end)}
-        for key, value in pending["rows"]:
-            expected = versions.get(key)
-            if expected is None:
-                continue
-            if target_client.get(key).commit_ts == expected:
-                continue
-            self._move_row(source_client, target_client, key, value, expected)
-        return True
 
     def move_shard(self, shard_id: int, target_nodes: List[int],
                    drain: float = MIGRATION_DRAIN_SECONDS) -> bool:
@@ -1531,25 +1397,14 @@ class ShardedRaftCluster:
     def recover_splits(self) -> List[int]:
         """Finish the splits this cluster was in the middle of when it stopped.
 
-        A split writes down what it is doing before it does it - the shard, the split
-        point, the id of the shard it is creating - and the note is dropped only once
-        the routing table has the new range.  A cluster that comes back and finds one
-        is a cluster whose rows may already be in the new shard's group, or may not be,
-        if it stopped before the copy had finished; either way the answer is the same
-        one a retry gets: freeze the source, copy whatever the new shard is missing,
-        and make the proposal.
-
-        The rows are read back out of the source shard's own state rather than out of
-        the note, so what gets copied is what the shard would answer with.  A note
-        carrying a copy of the rows would be a second copy of the shard, taken at some
-        earlier moment, and a copy of a copy is how a split loses a row.
-
-        Returns the shards whose split it finished.  A split it could not finish - the
-        shard has not elected a leader yet, the table cannot be reached - is left
-        frozen and still remembered, and the next call picks it up.
+        See :meth:`RecoveryRunner.recover_splits`, where the flow is written: this
+        cluster and a node in a process of its own run the same body over themselves,
+        and what differs between them is only what each of them holds.  The two start-up
+        paths call :meth:`RecoveryRunner.load_pending_splits` and
+        :meth:`RecoveryRunner.finish_pending_splits` around the publisher instead, which
+        is the order they need and the order ``docs/recovery.md`` section 6 explains.
         """
-        self._load_pending_splits()
-        return self._finish_pending_splits()
+        return self._recovery_runner.recover_splits()
 
     def recover_migrations(self) -> List[int]:
         """Finish the moves this cluster was in the middle of when it stopped.
@@ -1587,15 +1442,6 @@ class ShardedRaftCluster:
         self._load_pending_migrations()
         return self._finish_pending_migrations()
 
-    def _load_pending_splits(self) -> None:
-        """Read the split notes this cluster's shards left behind, without acting."""
-        for shard_id in sorted(self._range_map):
-            if shard_id in self._pending_splits:
-                continue
-            pending = self._load_split_record(shard_id)
-            if pending is not None:
-                self._pending_splits[shard_id] = pending
-
     def _load_pending_migrations(self) -> None:
         """Read the move notes this cluster's shards left behind, and freeze them.
 
@@ -1616,42 +1462,6 @@ class ShardedRaftCluster:
                 continue
             self._migrations[shard_id] = state
             self._freeze_shard(shard_id, reason="migration", node_ids=state.source_nodes)
-
-    def _finish_pending_splits(self) -> List[int]:
-        """Finish every split this cluster knows it was in the middle of."""
-        return [shard_id for shard_id in sorted(self._pending_splits)
-                if self._resume_split(shard_id)]
-
-    def _resume_split(self, shard_id: int) -> bool:
-        """Pick a split back up.  See :meth:`recover_splits`."""
-        pending = self._pending_splits.get(shard_id)
-        if pending is None:
-            return False
-
-        # It was copied, or it was about to be.  Either way the shard may not take new
-        # rows until the table says where they go, and a restarted node has to be told
-        # again: a freeze is a local fact, and it died with the process that held it.
-        self._freeze_shard(shard_id)
-        self.ensure_serving(pending["new_shard_id"], sorted(self._shard_servers))
-
-        source = self._wait_for_shard_leader(shard_id)
-        if source is None:
-            self._last_split_error = f"shard {shard_id} has no leader"
-            return False
-
-        # The check the call that begins a split makes, made here by the call that finishes
-        # one: this is the same read of the same frozen range, so a lock in it is the same
-        # reason to refuse.  The note stays and the shard stays frozen, which is the state a
-        # retry starts from - and the lock clears on its own.
-        start, end = self._range_map[shard_id]
-        if self._locks_in_range(source, start, end):
-            self._last_split_error = (
-                f"a transaction holds a lock in shard {shard_id}; its rows cannot be copied "
-                f"while one is in flight")
-            return False
-
-        pending["rows"] = self._rows_above(source, shard_id, pending["split_key"])
-        return self._finish_split(pending)
 
     def _finish_pending_migrations(self) -> List[int]:
         """Finish every move this cluster knows it was in the middle of."""
@@ -1761,37 +1571,6 @@ class ShardedRaftCluster:
         for prefix in (SPLIT_RECORD_PREFIX, MIGRATION_RECORD_PREFIX):
             forget_note(storages, shard_id, prefix)
 
-    def _remember_split(self, pending: Dict[str, Any]) -> None:
-        """Write a split down, on every replica of the shard being split.
-
-        The window between the copy and the proposal is the one place this cluster
-        holds state that exists nowhere else: rows in the new shard's group, and a
-        freeze that nothing has recorded.  A process that dies there comes back with no
-        idea it was doing anything, so the intent goes into the source shard's own
-        storage - the thing that does survive a restart - before the first row moves.
-
-        Every replica writes its own copy.  The note says which shard is being split,
-        and any replica holding that shard can be the one that finds it.
-        """
-        note = PendingNote.split(pending["shard_id"], bytes(pending["split_key"]),
-                                 int(pending["new_shard_id"]))
-        write_note(self._storages_of(pending["shard_id"]), note)
-
-    def _forget_split(self, pending: Dict[str, Any]) -> None:
-        """Drop the note: the table has the range, so there is nothing to pick up."""
-        shard_id = pending["shard_id"]
-        forget_note(self._storages_of(shard_id), shard_id, SPLIT_RECORD_PREFIX)
-
-    def _load_split_record(self, shard_id: int) -> Optional[Dict[str, Any]]:
-        """The split this shard was in the middle of, as one of its replicas wrote it."""
-        note = read_note(self._storages_of(shard_id), shard_id, SPLIT_RECORD_PREFIX)
-        if note is None:
-            return None
-        return {"shard_id": shard_id,
-                "split_key": note.split_key,
-                "new_shard_id": note.new_shard_id,
-                "rows": []}
-
     def _remember_migration(self, state: MigrationState) -> None:
         """Write a move down, on every replica of the shard being moved.
 
@@ -1850,47 +1629,9 @@ class ShardedRaftCluster:
             return None
         return self._shard_servers[leader[0]].get_shard_node(shard_id)
 
-    def _wait_for_shard_leader(self, shard_id: int,
-                               timeout: float = SPLIT_LEADER_TIMEOUT) -> Optional[MemoryRaftNode]:
-        """The node leading ``shard_id``, waiting a bounded while for an election.
-
-        A shard that has just been created has no leader yet - the group has to elect
-        one before anything can be copied into it - and a copy sent to a shard with no
-        leader is a copy that never happened.
-        """
-        deadline = time.time() + timeout
-        while True:
-            leader = self._shard_leader_node(shard_id)
-            if leader is not None:
-                return leader
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.05)
-
-    def _wait_for_shard_to_catch_up(self, shard_id: int,
-                                    timeout: float = SPLIT_LEADER_TIMEOUT
-                                    ) -> Optional[MemoryRaftNode]:
-        """The node leading ``shard_id``, once it knows its own commit index.
-
-        Stronger than :meth:`_wait_for_shard_leader`, and needed only by a caller that
-        reads the leader's state machine.  A node that has just been elected cannot yet
-        answer for the rows in its log: whether they committed is a question a majority
-        acknowledging an entry of its own term answers, and until they have, the state
-        machine is behind the group.  A split that read the shard there would take a row
-        that is already copied for one that is not, and copy it a second time.
-        """
-        deadline = time.time() + timeout
-        while True:
-            leader = self._shard_leader_node(shard_id)
-            if leader is not None and leader.has_committed_in_its_own_term():
-                return leader
-            if time.time() >= deadline:
-                return None
-            time.sleep(0.05)
-
     def split_error(self) -> Optional[str]:
-        """Why the last split could not be published, if it could not be."""
-        return self._last_split_error
+        """Why the last split could not finish, if it could not."""
+        return self._recovery_runner.split_error()
 
     def migration_error(self) -> Optional[str]:
         """Why the last move could not be started or copied, if it could not be."""
@@ -1898,7 +1639,7 @@ class ShardedRaftCluster:
 
     def pending_splits(self) -> Dict[int, Dict[str, Any]]:
         """The splits that are waiting for the routing table, for callers that look."""
-        return dict(self._pending_splits)
+        return self._recovery_runner.pending_splits()
 
     def migration_state(self, shard_id: int) -> Optional[MigrationState]:
         """The move of ``shard_id`` this cluster is in the middle of, if there is one."""
@@ -1986,7 +1727,7 @@ class ShardedRaftCluster:
         return None
 
     def _wait_for_leader_on(self, node_ids: List[int], shard_id: int,
-                            timeout: float = SPLIT_LEADER_TIMEOUT) -> Optional[MemoryRaftNode]:
+                            timeout: float = LEADER_TIMEOUT) -> Optional[MemoryRaftNode]:
         """The leader among ``node_ids``, once it knows its own commit index.
 
         The same wait the split makes for the shard it creates, for the same reason: a
@@ -2051,34 +1792,15 @@ class ShardedRaftCluster:
 
     def _move_row(self, source: NodeClient, target: NodeClient, key: bytes,
                   value: bytes, version: int) -> ApplyResult:
-        """Copy one row into the new shard *as the version it already is*.
+        """Write one row into the new shard.  See :meth:`RecoveryRunner._move_row`.
 
-        The row keeps the timestamp it was committed at, and the write record of
-        the transaction that committed it.  A copy stamped with the moment of the
-        move - which is what a wall clock gives you, and what this used to do - is
-        the newest thing that has ever happened to that key: a snapshot read at
-        any timestamp a client can hold does not see it, and every prewrite
-        against it is refused as a write conflict, because the copy is newer than
-        the start timestamp the TSO has just handed out.  Moving a row is not a
-        write to the key, and a shard that answers for the row differently from
-        the shard it came from is a shard the row cannot be moved to.
-
-        The version is handed in rather than read here: the caller has just read it, and
-        a second read would be a second answer to a question that already has one.  A
-        record whose commit is some other moment is a row written after that transaction,
-        and it travels without a ``start_ts``.
+        The split's copy is the recovery's now and the move's copy still runs here, so
+        this is the one place the two meet: the body is written once, where both
+        branches are going, and this is the cluster's way of reaching it until the
+        move's copy moves as well.
         """
-        record = source.get_write_record(key)
-        command = serialize_command(
-            CommandType.SET,
-            key=key,
-            value=value,
-            timestamp=version,
-            start_ts=(record["start_ts"] if record is not None
-                      and record["commit_ts"] == version else None),
-        )
-        return target.propose(command)
-    
+        return self._recovery_runner._move_row(source, target, key, value, version)
+
     def shutdown(self):
         # Before the servers: the cleaner proposes entries onto shard leaders, so
         # stopping it first keeps it from racing the shutdown.  The publisher needs

@@ -27,6 +27,7 @@ from _ports import free_addresses
 from _wait import wait_for_metadata_client, wait_until
 from oxidedb.metadata.service import MetadataCluster
 from oxidedb.raft.recovery_notes import PendingNote, write_note
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, MVCCStateMachine
 from oxidedb.raft.storage import EngineRaftStorage
@@ -133,7 +134,7 @@ def test_a_split_that_died_before_the_proposal_is_finished_on_the_next_start(
             raise RuntimeError("the process died with the rows copied and nowhere told")
 
         with monkeypatch.context() as patch:
-            patch.setattr(ShardedRaftCluster, "_publish_split", died_before_the_table_was_told)
+            patch.setattr(RecoveryRunner, "_publish_split", died_before_the_table_was_told)
             with pytest.raises(RuntimeError):
                 cluster.split_shard(0, b"n")
 
@@ -169,7 +170,7 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
     metadata = _start_metadata(tmp_path)
     cluster = _start_cluster(tmp_path, addresses, metadata)
     copied = []
-    original = ShardedRaftCluster._move_row
+    original = RecoveryRunner._move_row
 
     def died_after_one_row(self, source, target, key, value, version):
         original(self, source, target, key, value, version)
@@ -181,7 +182,7 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
         _write_rows(cluster)
         client = wait_for_metadata_client(metadata)
         with monkeypatch.context() as patch:
-            patch.setattr(ShardedRaftCluster, "_move_row", died_after_one_row)
+            patch.setattr(RecoveryRunner, "_move_row", died_after_one_row)
             with pytest.raises(RuntimeError):
                 cluster.split_shard(0, b"n")
         assert copied == [MOVED_KEYS[0]], "one row was copied before the process died"
@@ -191,7 +192,7 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
 
     metadata = _start_metadata(tmp_path)
     again = []
-    original = ShardedRaftCluster._move_row
+    original = RecoveryRunner._move_row
 
     def counting_move_row(self, source, target, key, value, version):
         again.append(key)
@@ -207,7 +208,7 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
     # has just come back finds the note - so the count has to be in place before the
     # cluster is built, not after it has already finished the split.
     with monkeypatch.context() as patch:
-        patch.setattr(ShardedRaftCluster, "_move_row", counting_move_row)
+        patch.setattr(RecoveryRunner, "_move_row", counting_move_row)
         revived = _start_cluster(tmp_path, addresses, metadata)
         try:
             client = wait_for_metadata_client(metadata)
@@ -293,7 +294,7 @@ def test_a_split_that_finds_a_lock_keeps_its_note_and_waits(tmp_path):
         assert list(revived.pending_splits()) == [0], "and the note is kept for the next call"
         assert "lock" in (revived.split_error() or ""), (
             "refused over the lock, and not for some other reason")
-        assert revived._load_split_record(0) is not None, "the note is still on disk"
+        assert revived.pending_notes(0), "the note is still on disk"
         assert revived.get_shard_server(1).get_shard_node(0).writes_frozen, (
             "and the shard stays frozen while that is true")
         new_shard = revived.get_shard_server(1).get_shard_node(NEW_SHARD)

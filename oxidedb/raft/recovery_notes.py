@@ -14,7 +14,7 @@ writer would be a second format.
 Nothing here reaches into a node.  A note goes to the storages the caller holds, which is
 the only thing either side has to hand: for a restart that is the replicas this process
 holds, and the invariant that makes it enough is that *every* replica writes a copy (see
-``ShardedRaftCluster._remember_split``).
+``RecoveryRunner.remember_split``).
 """
 
 import msgpack

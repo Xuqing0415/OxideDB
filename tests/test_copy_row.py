@@ -38,6 +38,7 @@ import msgpack
 
 from _wait import wait_until
 from oxidedb.client.node_client import LocalNodeClient
+from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import MigrationState, ShardedRaftCluster
 from oxidedb.raft.state_machine import CommandType, MVCCStateMachine, serialize_command
 
@@ -255,7 +256,7 @@ def test_the_copy_a_split_makes_reads_the_source_by_range(monkeypatch):
     reads = []
     written = []
     real_scan_versions = LocalNodeClient.scan_versions
-    real_move_row = ShardedRaftCluster._move_row
+    real_move_row = RecoveryRunner._move_row
 
     def recording_scan_versions(self, start_key, end_key, timestamp=None):
         reads.append((start_key, end_key))
@@ -266,7 +267,7 @@ def test_the_copy_a_split_makes_reads_the_source_by_range(monkeypatch):
         return real_move_row(self, source, target, key, value, version)
 
     monkeypatch.setattr(LocalNodeClient, "scan_versions", recording_scan_versions)
-    monkeypatch.setattr(ShardedRaftCluster, "_move_row", recording_move_row)
+    monkeypatch.setattr(RecoveryRunner, "_move_row", recording_move_row)
     try:
         source = wait_until(lambda: cluster._shard_leader_node(0),
                             message="shard 0 never elected a leader")
