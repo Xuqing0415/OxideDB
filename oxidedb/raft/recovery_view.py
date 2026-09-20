@@ -171,17 +171,35 @@ class RecoveryView(Protocol):
 
     # -- changing this side ---------------------------------------------------
 
-    def freeze(self, shard_id: int, reason: str) -> None:
-        """Refuse commands that add rows on the replicas this side holds for the shard.
+    def freeze(self, shard_id: int, reason: str, nodes: List[int]) -> None:
+        """Refuse commands that add rows, on this side's groups in ``nodes``.
 
         ``reason`` is what the refusal quotes, so a caller can tell a split from a move.
         Commits and rollbacks still go through: they are the end of a transaction that
         prewrote before this, and dropping one would leave a lock on a shard whose rows
-        are about to be copied with that lock in them.  Idempotent.
+        are about to be copied with that lock in them.
+
+        ``nodes`` is the caller's, and naming it is the point of the call: a shard being
+        moved has two groups at once, on two disjoint sets of nodes, and a copy about to
+        read the source's rows has to stop *that* group.  Freeze the one the rows are
+        going into instead and the copy's own commands are refused, while the group whose
+        rows are being read goes on taking rows it is about to lose.  Which group is
+        which is written in the note a recovery holds, so it is known where the note is;
+        asking the side that keeps a placement answers a different question - which group
+        clients are being sent to - and on a shard being moved those are not these nodes.
+
+        A node of ``nodes`` this side holds no group on is not a failure: it is a node
+        with nothing to freeze.  Idempotent.
         """
 
-    def unfreeze(self, shard_id: int) -> None:
-        """The reverse, for the source of a split that is done and a move that was refused.
+    def unfreeze(self, shard_id: int, nodes: List[int]) -> None:
+        """Let this side's groups in ``nodes`` take rows again: the reverse, same set.
+
+        One call with :meth:`freeze` rather than one that names a wider set: what has to
+        take rows again is the group a copy stopped working over, and the caller that
+        froze it is the caller that thaws it - the source of a split that is done, and
+        the group a refused move ends with.  A node with nothing frozen is a no-op rather
+        than a mistake, which is what makes a second call safe.
 
         It waits for nothing: the writes admitted before the freeze are the caller's to
         drain, and a recovery that comes back and finds a note freezes the shard again

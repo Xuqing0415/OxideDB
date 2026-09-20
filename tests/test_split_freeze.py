@@ -11,8 +11,10 @@ once the shard that will own the range has the rows.
 What these tests pin: a frozen shard refuses the commands that add rows and still lands
 the commit of a transaction that prewrote before the freeze; a split freezes the source
 while the rows are being copied, and the write it refuses there is nowhere at all
-afterwards; and a split that refuses for a reason of its own thaws the shard it froze, so
-the caller can come back.
+afterwards; a split that refuses for a reason of its own thaws the shard it froze, so
+the caller can come back; and a freeze stops the nodes it was given and no others, which
+is the half of a move it would be silent about - a shard being moved has two groups, and
+freezing the wrong one leaves the group whose rows are being read still taking them.
 """
 
 import threading
@@ -223,7 +225,38 @@ def test_a_split_that_refuses_thaws_the_shard_it_froze():
         cluster.shutdown()
 
 
+def test_a_freeze_lands_on_the_nodes_it_is_given_and_no_others():
+    """The set is the caller's, which is the reason the call names one at all.
+
+    A shard being moved has two groups at once, on two disjoint sets of nodes, and which of
+    them a copy is about to read is written in the note the copy came from - not in what a
+    side that keeps a placement answers, which is where clients are being sent.  So the set
+    is handed in, and what gets stopped is exactly that: this cluster serves the shard on
+    every node, one of them is named, and the other two go on taking rows.
+    """
+    cluster = _started_cluster()
+    try:
+        nodes = cluster.shard_replica_ids(0)
+        assert nodes == [1, 2, 3], "every node serves the shard to begin with"
+
+        cluster.freeze(0, "migration", [2])
+
+        frozen = {node_id: cluster.get_shard_server(node_id).get_shard_node(0).writes_frozen
+                  for node_id in nodes}
+        assert frozen == {1: False, 2: True, 3: False}, \
+            "the nodes that were not named are not stopping anything"
+        assert cluster.get_shard_server(2).get_shard_node(0).freeze_reason == "migration"
+
+        cluster.unfreeze(0, [2])
+        assert not cluster.get_shard_server(2).get_shard_node(0).writes_frozen
+        cluster.unfreeze(0, [1])
+        assert not cluster.get_shard_server(1).get_shard_node(0).writes_frozen, \
+            "thawing a shard that was never frozen is a no-op"
+    finally:
+        cluster.shutdown()
+
 if __name__ == "__main__":
     test_a_frozen_shard_refuses_new_rows_until_it_is_thawed()
     test_a_transaction_that_prewrote_before_the_freeze_still_commits()
     test_a_split_that_refuses_thaws_the_shard_it_froze()
+    test_a_freeze_lands_on_the_nodes_it_is_given_and_no_others()

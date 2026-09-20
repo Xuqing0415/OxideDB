@@ -1782,29 +1782,27 @@ class ShardedRaftCluster:
                 return None
             time.sleep(0.05)
 
-    def freeze(self, shard_id: int, reason: str) -> None:
-        """Stop the shard taking new rows, on the group the routing table names.
+    def freeze(self, shard_id: int, reason: str, nodes: List[int]) -> None:
+        """Stop the shard taking new rows, on this cluster's groups in ``nodes``.
 
-        Which nodes that is comes from :meth:`_serving_nodes` rather than from every node
-        holding the shard id, and the difference is a shard being moved: it has two groups
-        for a moment, and freezing the one the rows are being copied *into* would refuse
-        the copy itself.  Commits and rollbacks still go through, because they end a
-        transaction that prewrote before this.
+        The set is the caller's and is not worked out here: a shard being moved has two
+        groups at once, and which of them a copy is about to read is written in the note
+        that copy came from.  :meth:`_serving_nodes` answers where clients are being sent,
+        and it also answers with the source set while a move is in flight - a second route
+        to the same answer, which agrees only while the note has been loaded and nothing
+        has moved on.  Naming the set leaves one route to it.
 
         See :class:`RecoveryView.freeze`.
         """
-        self._freeze_shard(shard_id, reason=reason,
-                           node_ids=self._serving_nodes(shard_id))
+        self._freeze_shard(shard_id, reason=reason, node_ids=nodes)
 
-    def unfreeze(self, shard_id: int) -> None:
-        """Let the shard take rows again, over every replica this cluster holds for it.
+    def unfreeze(self, shard_id: int, nodes: List[int]) -> None:
+        """Let the shard take rows again, on this cluster's groups in ``nodes``.
 
-        A thaw takes the whole shard rather than the group the table names, and that is
-        the safe direction: a group that was not frozen is a no-op rather than a mistake.
-
-        See :class:`RecoveryView.unfreeze`.
+        See :class:`RecoveryView.unfreeze`.  A node of ``nodes`` holding no group, or one
+        that was never frozen, is a no-op rather than a mistake.
         """
-        self._unfreeze_shard(shard_id)
+        self._unfreeze_shard(shard_id, node_ids=nodes)
 
     def _freeze_shard(self, shard_id: int, reason: str = "split",
                       node_ids: Optional[List[int]] = None) -> None:

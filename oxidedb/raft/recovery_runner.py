@@ -195,7 +195,8 @@ class RecoveryRunner:
         # move's: a shard cannot be splitting and moving at once, and the interface
         # drops what a shard has rather than what a caller names.
         self._view.forget_note(pending["shard_id"])
-        self._view.unfreeze(pending["shard_id"])
+        self._view.unfreeze(pending["shard_id"],
+                           self._view.shard_replica_ids(pending["shard_id"]))
         return True
 
     # -- the split's body -------------------------------------------------------
@@ -209,7 +210,10 @@ class RecoveryRunner:
         # It was copied, or it was about to be.  Either way the shard may not take new
         # rows until the table says where they go, and a restarted node has to be told
         # again: a freeze is a local fact, and it died with the process that held it.
-        self._view.freeze(shard_id, "split")
+        # The group this side holds for the shard, and the one its rows are about to be
+        # read out of: a split has one, so this names the whole of it.
+        self._view.freeze(shard_id, "split",
+                          self._view.shard_replica_ids(shard_id))
         self._view.ensure_serving(pending["new_shard_id"], self._view.node_ids())
 
         source = self._wait_for_leader(shard_id)

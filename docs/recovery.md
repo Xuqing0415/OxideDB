@@ -105,8 +105,8 @@ class RecoveryView(Protocol):
     def leader_client(self, shard_id: int) -> Optional[NodeClient]: ...
     def leader_client_for_nodes(self, shard_id: int,
                                 nodes: List[int]) -> Optional[NodeClient]: ...
-    def freeze(self, shard_id: int, reason: str) -> None: ...
-    def unfreeze(self, shard_id: int) -> None: ...
+    def freeze(self, shard_id: int, reason: str, nodes: List[int]) -> None: ...
+    def unfreeze(self, shard_id: int, nodes: List[int]) -> None: ...
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]: ...
     def ensure_group_on(self, shard_id: int, nodes: List[int]) -> None: ...
     def close_group_on(self, shard_id: int, nodes: List[int]) -> List[int]: ...
@@ -162,11 +162,19 @@ class RecoveryView(Protocol):
   rather than a default argument on the other one: a caller that forgot the set would be
   handed the wrong group's leader, and the wrong group's leader here is the shard the
   rows are being copied out of.  A read.
-* **`freeze(shard_id, reason)`** - refuse commands that add rows on the replicas this
-  process holds, with the reason the refusal quotes.  Commits and rollbacks still go
-  through: they are the end of a transaction that prewrote before this.  Idempotent.
-* **`unfreeze(shard_id)`** - the reverse, for the source of a split that is done and for a
-  move the table refused.  Idempotent.
+* **`freeze(shard_id, reason, nodes)`** - refuse commands that add rows, on this side's
+  groups in `nodes`, with the reason the refusal quotes.  The set is the caller's and
+  not the side's to work out: a shard being moved has two groups at once, on two
+  disjoint sets, and a copy about to read the source's rows has to stop *that* group -
+  freeze the one the rows are going into and the copy's own commands are refused while
+  the group whose rows are being read goes on taking rows it is about to lose.  Which
+  group is which is written in the note a recovery holds; asking a side that keeps a
+  placement answers where clients are being sent, which is a different question and,
+  on a shard being moved, different nodes.  Commits and rollbacks still go through:
+  they are the end of a transaction that prewrote before this.  Idempotent.
+* **`unfreeze(shard_id, nodes)`** - the reverse, on the same set: the source of a split
+  that is done, and the group a refused move ends with.  A node with nothing frozen is
+  a no-op rather than a mistake, which is what makes a second call safe.  Idempotent.
 * **`ensure_serving(shard_id, nodes)`** - make what this process holds match that set:
   build its member of the group if it is in the set and holds nothing, close its member if
   it holds one and is not.  What the publisher follows is the group this side holds: the
@@ -273,7 +281,8 @@ thirteen and the three land like this:
 
 * `_shard_nodes`, `_nodes_on` - internal: "the nodes this process holds for the shard" is
   what a view answers, and it is a helper here rather than a call.
-* `_freeze_shard`, `_unfreeze_shard` - `freeze` and `unfreeze`.
+* `_freeze_shard`, `_unfreeze_shard` - `freeze` and `unfreeze`, both taking the set
+  the caller names, which is the one the note it read is about.
 * `_drain_shard` - the beginning's, and internal: it waits out the writes the freeze
   admitted, and it runs before anything is written down, so it sits on the far side of the
   seam drawn above rather than in the recovery.
