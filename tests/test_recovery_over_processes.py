@@ -15,14 +15,22 @@ the range, the restart is what finishes the split, and that is the case a proces
 once, published a table and was killed comes back as - the one the two phases of
 ``ClusterNode.start`` are there for, and the one nothing else in this file can reach,
 because the note has to outlive the process that reads it.
+
+A move is the same idea one size up: its note names the set the shard is leaving and the one
+it is going to, and which of the two the routing table names says how far the move got.  Over
+processes there is no move to *make* - the launcher serves every shard on every node, and a
+move onto a node that already serves the shard is refused where a move begins - so a note is
+the only way one gets into a process, and the half a process can be asked to finish is the one
+a landing proposal leaves behind: the note goes, and so does the group the shard left.
 """
 
 import os
 
+import pytest
 from _cluster import read_when_ready, start_cluster, write_when_ready
-from _notes import SPLIT, PendingNote, pending_note, write_pending_note
+from _notes import MOVE, SPLIT, PendingNote, pending_note, write_pending_note
 from _wait import wait_until
-from oxidedb.client import RemoteMetadataClient, RemoteNodeClient
+from oxidedb.client import NodeUnreachable, RemoteMetadataClient, RemoteNodeClient
 from oxidedb.raft.state_machine import CommandType, serialize_command
 
 #: Where the split says it was made, and keys on both sides of it.
@@ -78,6 +86,22 @@ def split_landed(client):
     """The routes once the table names more than one shard, or None while it names one."""
     named = routes(client)
     return named if len(named) > 1 else None
+
+
+def leading_node(client, shard_id):
+    """The node the table names as leading ``shard_id``, once the publisher has said so.
+
+    A write goes to the node that leads a shard and to no other: a three-node group has one
+    leader and two nodes that refuse and name it, and following that name is the caller's
+    step.  So a test that wants a row written reads the leader out of the table, which is
+    what a publisher is for, rather than talking to whichever node it happens to know.
+    """
+    def named():
+        table = table_now(client)
+        placement = None if table is None else table.shard(shard_id)
+        return None if placement is None else placement.leader_id
+
+    return wait_until(named, message=f"the table never named a leader for shard {shard_id}")
 
 
 def test_a_process_that_comes_back_with_a_split_note_does_not_take_rows(tmp_path):
@@ -174,3 +198,79 @@ def test_a_process_that_comes_back_with_a_split_note_finishes_the_split(tmp_path
         assert again.success, (
             f"the source refused a row below the split point with {again.error_code} "
             f"({again.error_msg!r}): the shard is still frozen under a split that is done")
+
+
+#: The move the test below writes down: shard 0 leaving three nodes for two of them.  A move
+#: onto a node that already serves the shard is one the launcher cannot make - every node
+#: serves every shard - so this is a note written by hand, and the second set is here
+#: because a note is what names it, not because a process could ever propose it.
+MOVE_FROM = (1, 2, 3)
+MOVE_TO = (2, 3)
+
+
+def test_a_process_that_comes_back_after_its_move_landed_lets_the_shard_go(tmp_path):
+    """A node killed after the table was told finishes the move on the way back up.
+
+    What a move leaves behind when it stops between its proposal and its cleanup is the
+    table the proposal wrote, naming the set the shard went to, and the note in the storage
+    of the group it left.  Both are written here while the node is down - the table by a
+    client of the table's group, the note by the call the node itself makes - because
+    nothing outside ``ShardedRaftCluster`` can begin a move: the launcher serves every shard
+    on every node, so there is no set to move a shard to that the table would not refuse,
+    and the half of a move a process can be asked to finish is the one after the proposal,
+    which asks the table for a read and nothing else.
+
+    That half is ``_commit_move``: the note goes and the group the shard left is closed.  So
+    a node that comes back is asked for two things - the note is gone from its own storage,
+    and its port for the shard stops answering - and the second is what tells this half of
+    the recovery from the half before it: finding the same note and the same table, the
+    other half would copy into the set the table names and leave the shard served by both
+    groups, which is the one thing a move that has already landed must not come back to.
+    """
+    base = str(tmp_path / "cluster")
+    with start_cluster(num_nodes=3, num_shards=1, base_dir=base) as cluster:
+        table = RemoteMetadataClient(cluster.metadata_seeds)
+        wait_until(lambda: published(table),
+                   message="a one-shard cluster never published its shard")
+
+        client = RemoteNodeClient(cluster.shard_address(0, node_id=leading_node(table, 0)))
+        try:
+            written = write_when_ready(
+                client, serialize_command(CommandType.SET, key=KEY, value=VALUE))
+        finally:
+            client.close()
+        assert written.success, written.error_msg
+
+        data_dir = cluster.data_dirs[1]
+        cluster.stop_node(1, crash=True)
+
+        # What the move left: the table its proposal wrote, and the note.  The addresses are
+        # the ones the nodes themselves listen on, worked out the way every address here is
+        # rather than guessed at - a placement the table cannot name an address for is one a
+        # client cannot be sent to.
+        told = table.set_shard_nodes(
+            0, list(MOVE_TO), {node_id: cluster.shard_address(0, node_id)
+                               for node_id in MOVE_TO})
+        assert told.success, told.error_msg
+        note = PendingNote.move(shard_id=0, source_nodes=MOVE_FROM, target_nodes=MOVE_TO)
+        write_pending_note(data_dir, 0, note)
+
+        cluster.start_node(1)
+
+        assert pending_note(data_dir, 0, MOVE) is None, (
+            "the node came back with a move note for a shard the table already says it "
+            "left, and the note is still on disk: a recovery that read it would have dropped "
+            "it, and nothing else drops a move's note")
+
+        left = RemoteNodeClient(cluster.shard_address(0, node_id=1))
+        try:
+            with pytest.raises(NodeUnreachable):
+                left.get(KEY)
+        finally:
+            left.close()
+
+        placed = table.table(refresh=True).shard(0)
+        assert placed.nodes == list(MOVE_TO), (
+            f"the table names {placed.nodes} for shard 0, and the move whose note the node "
+            f"dropped was going to {list(MOVE_TO)}: a recovery that rewrote the table would "
+            f"be undoing the proposal it came back to finish")
