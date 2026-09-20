@@ -16,6 +16,7 @@ from ..transaction.lock_cleaner import LockCleaner
 from ..transaction.lock_resolver import DEFAULT_LOCK_TTL
 from .recovery_notes import (MIGRATION_RECORD_PREFIX, SPLIT_RECORD_PREFIX, PendingNote,
                              forget_note, read_note, write_note)
+from .recovery_view import RecoveryInvariantError
 
 #: How often the cluster's own lock cleaner looks for abandoned locks, in seconds.
 DEFAULT_LOCK_CLEANER_INTERVAL = 30.0
@@ -903,12 +904,16 @@ class ShardedRaftCluster:
         # is what ``leader_client_for_nodes`` is for - and not by shard id: asking by id
         # would reach the every-node fallback ``_serving_nodes`` keeps for a shard it has
         # no entry for, which happens to include the group just built, and a process keeps
-        # no such fallback and would be answered None.  Asserted rather than assumed, so
-        # that the day these two clients come from the view the target comes from the set.
-        assert pending["new_shard_id"] not in self._placed_shards, (
-            f"shard {pending['new_shard_id']} is a split's new shard and the routing "
-            f"table does not name it yet; leader_client would answer for it only "
-            f"through the every-node fallback")
+        # no such fallback and would be answered None.  A caller that broke this would be
+        # making a mistake rather than meeting a failure of the shard, so it raises: the
+        # four outcomes of a split are about the work, and a bug filed as one more
+        # attempt is a bug that gets retried instead of fixed.
+        if pending["new_shard_id"] in self._placed_shards:
+            raise RecoveryInvariantError(
+                f"shard {pending['new_shard_id']} is a split's new shard, which the "
+                f"routing table does not name until the split's own proposal lands; "
+                f"asking about its group by shard id would go through the every-node "
+                f"fallback instead of the group the split built")
         source_client = self._client_for_node(pending["shard_id"], source)
         target_client = self._client_for_node(pending["new_shard_id"], target)
 
