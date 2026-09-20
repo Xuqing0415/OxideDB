@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Eight habits, each of them learned by getting something wrong first, and between them the
+Nine habits, each of them learned by getting something wrong first, and between them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -85,6 +85,18 @@ import is shared by every definition in the file, and a field by every branch th
 touches it: after a move like that the suite is the test, or at least the tests of the
 branch on the other side.
 
+**A control experiment injects one failure per duty, not one per method.**  A test that
+runs a call and then asserts several things about it stops at the first assertion that
+fails, so breaking the whole call shows that one duty is covered and hides the rest behind
+it - and what that looks like is "the test is shallow", which is the wrong reading: the
+test covers all of them and the experiment never reached the others.  `_abort_move` has
+four duties and one test, and breaking the body wholesale and then breaking only the note
+it writes both landed on the same assertion; it took one injection per duty - drop the
+in-memory state, drop the note, close no group, delete the copy - to see that each duty has
+an assertion of its own.  The unit of injection is the thing that can fail on its own, and
+the first red assertion is what tells you how far the experiment got, not how far the test
+goes.
+
 One thing is decided and deliberately not done yet, written down so that it is not
 decided twice.  The lists of what is owed are going to be two lists with one rule between
 them: an entry that has a finished state is a *gap*, and an entry only a change to the
@@ -92,6 +104,45 @@ shape of the system could cross is a *boundary*.  The re-sort waits for the reco
 interface to exist, because that interface brings boundaries of its own - so until then an
 entry may be in the list it does not belong to, and this paragraph is the promise that it
 was thought about rather than missed.
+
+## Pitfalls we have hit
+
+Four things that cost time here and are not design decisions: tools that do one thing and
+look like they did another, and a rule that reads as stricter than the code.  Each one is
+reproducible in a minute and invisible while it is happening, so they are written down
+here rather than left to be recognised.  The habits above say how to work; these say what
+to check before believing a result.
+
+**A rule written stricter than the code makes the code look wrong.**  Section 6 of the
+recovery's notes said an in-process test "must pass unchanged", which reads as a promise
+that no test file was ever allowed to change - and the move of the copy onto the client
+seam had changed the shape of three spies while leaving every assertion alone.  A rule
+stricter than what was done fails nothing; it leaves the next reader thinking someone
+before them broke it.  The sentence now says what was true: the assertions may not change,
+a spy's shape may.
+
+**Two files naming one thing differently look right in both.**  `metadata()` in the notes
+and `metadata_client()` in the protocol were one call under two names, and neither file
+looks wrong on its own, so grepping the old name in the file that defines the new one finds
+nothing to fix.  Nothing catches this one: the prose reads as a name, the code reads as a
+name, and only the interface says which name the recovery can call.  A rename is swept
+from the definition outwards, and a name that appears in one file and not the other is the
+shape of it.
+
+**`Path.read_text` normalises line endings, and `newline=""` writes them back that way.**
+Reading a CRLF file with it and writing the result with `newline=""` - the argument that
+means "do not translate" - turns every `\r\n` into `\n`, so an edit to two lines shows
+up as a whole-file change that `git diff` will not report, because this repository has
+`core.autocrlf=true` and git compares the normalised forms.  Read and write such a file as
+bytes, or pass `newline=""` on the way in as well, and then count: a file that kept its
+endings has as many `\r\n` as `\n`.
+
+**An experiment is not undone until the file matches HEAD byte for byte.**  With
+`autocrlf` on, `git diff` and `git status` normalise both sides, so an injection that also
+rewrote the endings leaves an empty diff over a file that is not the one you started from -
+and the next commit then carries whatever the experiment did to it.  Comparing bytes
+against `git show HEAD:<path>` is what says "restored", and it is the habit above applied
+to a file rather than to a claim: check the state, not the report of the state.
 
 ## Invariants
 
