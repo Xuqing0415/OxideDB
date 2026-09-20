@@ -44,6 +44,17 @@ FREEZE_REFUSALS = {
 APPLY_RESULTS_WINDOW = 1024
 
 
+#: How long a read waits for this replica to apply what it has committed, in seconds.
+#: A read is answered at a read index rather than at whatever this node happens to hold,
+#: so an entry that is committed and not applied is a row the read may not see yet - and
+#: the wait for the apply loop to reach it has no end when that loop has stopped or is
+#: stuck on a command.  What is bounded is the *caller*: a read that hangs cannot be told
+#: from a slow one, and the caller's next move - ask somewhere else, ask again - needs an
+#: answer rather than a wait.  Past this the read is refused with ``ERR_TIMEOUT``, whose
+#: message says how far behind it was.
+APPLY_TIMEOUT = 5.0
+
+
 class _ApplyResults(OrderedDict):
     """Apply results for the most recent indices, oldest evicted first."""
 
@@ -139,6 +150,7 @@ class MemoryRaftNode:
         grpc_server: Optional = None,
         snapshot_interval: int = 100,
         apply_results_window: int = APPLY_RESULTS_WINDOW,
+        apply_timeout: float = APPLY_TIMEOUT,
     ):
         self._node_id = node_id
         self._peers = peers
@@ -205,6 +217,7 @@ class MemoryRaftNode:
         self._shutdown_flag = False
         
         self._apply_results = _ApplyResults(apply_results_window)
+        self._apply_timeout = apply_timeout
 
         # One bounded pool per node instead of a thread per RPC.  Heartbeats
         # fire every 50 ms and the old code started a thread per peer for each
@@ -828,10 +841,31 @@ class MemoryRaftNode:
         self._last_included_index = index
         self._last_included_term = term
 
-    def _wait_for_apply(self, index: int) -> None:
+    def _wait_for_apply(self, index: int) -> bool:
+        """Wait until this replica has applied ``index``, and say whether it did.
+
+        A read is served at a read index and not at the newest thing this node holds, so
+        a state machine behind that index cannot answer it: an entry that is committed is
+        a row in the log that the machine has not been given yet.  What the wait is for is
+        the ordinary lag of an apply loop that is a few entries behind.
+
+        Nothing is held while it waits, which is worth saying because the counter it waits
+        on is moved under the node's own lock: the condition is built on that lock, so
+        waiting releases it and the apply loop can take it.  What the wait did not have is
+        an end - one that is stuck, or stopped, leaves a reader in it for as long as the
+        node lives - and a read that hangs cannot be told from a read that is slow.  So it
+        is bounded by this node's ``apply_timeout`` (see :data:`APPLY_TIMEOUT`), and the
+        answer says whether the index was reached: the callers below turn a ``False`` into
+        their own refusal, because only they know what kind of read was refused.
+        """
+        deadline = time.time() + self._apply_timeout
         with self._lock:
             while self._last_applied < index:
-                self._apply_cond.wait()
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._apply_cond.wait(timeout=remaining)
+            return True
 
     def request_vote(self, request: RequestVoteRequest) -> RequestVoteResponse:
         with self._lock:
@@ -1247,13 +1281,21 @@ class MemoryRaftNode:
         replica at least as far as everything committed before the read began -
         which is at or past ``start_ts``, since the TSO issued that timestamp
         before this call.
+
+        The apply the handshake implies is waited for with an end on it: a replica
+        that cannot catch up says so (``ERR_TIMEOUT``) rather than holding the
+        caller, which is a refusal a client can act on and a wait it cannot.
         """
         read_index, failure = self._read_index()
         if read_index is None:
             return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, failure)
 
         with self._lock:
-            self._wait_for_apply(read_index)
+            if not self._wait_for_apply(read_index):
+                return ReadResult.failure(
+                    ErrorCode.ERR_TIMEOUT,
+                    f"this replica has applied {self._last_applied} and the read is at "
+                    f"{read_index}: the entries between them are committed and not applied")
 
             if self._state != NodeState.LEADER:
                 return ReadResult.failure(ErrorCode.ERR_NOT_LEADER, "Not leader")
@@ -1268,7 +1310,9 @@ class MemoryRaftNode:
         versions, and a transaction passes its own ``start_ts``.  The ReadIndex
         handshake is done first for the same reason - an older timestamp is only
         safe on a replica that is at or past everything committed before the read
-        began.
+        began - and the wait for that replica to have applied it has an end on it
+        for the reason :meth:`get` gives: ``ERR_TIMEOUT`` rather than a caller held
+        for good on a replica that cannot catch up.
 
         What this does not do is answer when it cannot.  A key the snapshot may be
         owed but that is behind a lock, and a read on a replica that is not the
@@ -1299,7 +1343,11 @@ class MemoryRaftNode:
             raise ScanRefused(ErrorCode.ERR_NOT_LEADER, failure)
 
         with self._lock:
-            self._wait_for_apply(read_index)
+            if not self._wait_for_apply(read_index):
+                raise ScanRefused(
+                    ErrorCode.ERR_TIMEOUT,
+                    f"this replica has applied {self._last_applied} and the read is at "
+                    f"{read_index}: the entries between them are committed and not applied")
 
             if self._state != NodeState.LEADER:
                 raise ScanRefused(ErrorCode.ERR_NOT_LEADER, "Not leader")

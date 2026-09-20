@@ -430,7 +430,13 @@ uncommitted.  Linearity was assumed, not established.
 6. `_update_commit_index()`.  Those acknowledgements may have advanced
    `match_index`, and therefore the commit point, so the second read of
    `commit_index` is the one the answer uses.
-7. `_wait_for_apply(read_index)`, then read the local state machine.
+7. `_wait_for_apply(read_index)`, then read the local state machine.  That wait
+   is bounded (`APPLY_TIMEOUT`): a replica whose apply loop has stopped would
+   otherwise hold the reader for as long as the node lives, and a read that
+   hangs cannot be told from a read that is slow.  Past the bound the read is
+   refused with `ERR_TIMEOUT` - which the wire classifies as a refusal and not
+   as an answer about leadership, because the reader's next move is to ask
+   again or ask elsewhere, not to follow a leader.
 
 Steps 1-6 are one method, `_read_index`, because `scan` needs exactly the same
 handshake: a range read at a timestamp is only as safe as the replica serving it, so

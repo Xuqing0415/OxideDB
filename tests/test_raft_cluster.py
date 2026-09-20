@@ -1,6 +1,7 @@
 import pytest
 import threading
 import tempfile
+import time
 import shutil
 from _wait import (wait_for_leader, wait_for_replication, wait_for_single_leader,
                    wait_until)
@@ -8,6 +9,7 @@ from oxidedb.raft import (
     RaftCluster, MVCCStateMachine, CommandType, NodeState, MemoryRaftNode,
     JSONFileStorage, LogEntry, NOOP_COMMAND,
 )
+from oxidedb.raft.state_machine import ErrorCode, ScanRefused
 
 
 def _write_entries(node):
@@ -67,6 +69,49 @@ class TestRaftCluster:
                 assert not node.has_committed_in_its_own_term()
         finally:
             cluster.shutdown()
+
+    def test_a_read_that_cannot_catch_up_is_refused_rather_than_held(self):
+        """A replica whose apply is stuck answers, and the answer is a refusal.
+
+        A read waits for the state machine to reach the commit point it is answered
+        at, and nothing bounded that wait: an apply loop that has stopped - a machine
+        stuck on a command - left the reader in it for as long as the node lived.
+        That is worse than a refusal, because a caller cannot tell a read that will
+        never be answered from one that is merely slow.
+
+        The node here leads itself with its apply loop taken away, so entries commit
+        and are never applied: that shape and not a slow one.  The wait it is given is
+        short, so that what is asserted is the bound rather than five seconds passing.
+        """
+        node = MemoryRaftNode(node_id=1, peers=[], state_machine=MVCCStateMachine(),
+                              election_timeout_min=20, election_timeout_max=40,
+                              apply_timeout=0.2)
+        try:
+            def never_applies():
+                return None
+
+            node._apply_committed_entries = never_applies
+            wait_until(lambda: node.state == NodeState.LEADER, timeout=10,
+                       message="the single node never became the leader")
+            wait_until(lambda: node.commit_index > node.last_applied, timeout=10,
+                       message="nothing committed, so nothing is waiting to be applied")
+
+            started = time.time()
+            result = node.get(b"key")
+            elapsed = time.time() - started
+
+            assert not result.success, "a read was answered from a machine behind its log"
+            assert result.error_code == ErrorCode.ERR_TIMEOUT, result.error_msg
+            assert "applied" in result.error_msg, result.error_msg
+            assert elapsed < 4, (
+                f"the read took {elapsed:.1f}s to be refused: the wait is bounded by "
+                f"this node's own apply_timeout and not by a constant of its own")
+
+            with pytest.raises(ScanRefused) as refused:
+                node.scan(b"a", b"z")
+            assert refused.value.error_code == ErrorCode.ERR_TIMEOUT, refused.value.error_msg
+        finally:
+            node.shutdown()
 
     def test_leader_failure(self):
         cluster = RaftCluster(num_nodes=3)
