@@ -7,7 +7,7 @@ references point at the code that implements the decision.
 
 ## How this repository is worked on
 
-Six habits, each of them learned by getting something wrong first, and between them the
+Eight habits, each of them learned by getting something wrong first, and between them the
 reason the rest of this file can be believed rather than interesting on their own.
 
 **Measure before building, and fix the estimate rather than the plan.**  More than one
@@ -65,6 +65,25 @@ mechanical.  The sweep this repository's recovery interface was drawn from came 
 `ast` rather than out of reading - parse the module, walk the class for `self.<name>` - and
 it found more of the cluster's own state inside the recovery's bodies than reading them
 had.  The walk is a script and a minute, and it cannot be too tired to check a branch.
+
+**The code is the truth; a document that disagrees with it is what gets fixed.**  A
+design file is a reading of the code, taken at one moment and checked by nothing
+afterwards, so where the two part it is the prose that is stale and the source that is
+right - and the danger is not the stale sentence, it is the next change made to match
+it.  Two statements in the recovery's own notes were settled against the files while its
+seam was drawn, rather than by reading the notes again: a rule filed under one section
+that belonged in another, and a migration's error string described there as the
+finishing side's when a refusal before the note is where it is most often set.
+
+**A branch's own tests passing says nothing about the code it shares.**  Moving one
+branch can reach past it without meaning to - an import, a helper, a field - and the
+tests that cover the branch will not notice, because what breaks is not under them.
+Moving the split's recovery out of the cluster took a name out of that module's imports
+that the move's half still used, and the nine files covering the split's paths went
+green while the full run came back red in eight tests that never mention a split.  An
+import is shared by every definition in the file, and a field by every branch that
+touches it: after a move like that the suite is the test, or at least the tests of the
+branch on the other side.
 
 One thing is decided and deliberately not done yet, written down so that it is not
 decided twice.  The lists of what is owed are going to be two lists with one rule between
