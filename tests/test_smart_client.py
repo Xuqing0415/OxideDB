@@ -157,17 +157,18 @@ def test_a_consistency_that_is_not_one_of_the_three_is_refused():
 
 
 def test_a_level_this_client_does_not_implement_is_refused_rather_than_answered():
-    """A replica read is not quietly a leader read.
+    """A read the client cannot make at the level asked is not quietly made at another.
 
     Answering it strongly would be the one failure a caller cannot detect: it would get an
-    answer, and nothing in it would say that the level it asked for was ignored.  So the two
-    levels that are not implemented raise, and each says which one it was.
+    answer, and nothing in it would say that the level it asked for was ignored.  So the
+    level that is not implemented raises, and says which one it was.  It used to be two:
+    a follower read is made now, and a level that is made is pinned where it is served -
+    over a real cluster, in ``test_client_routing.py`` - rather than by a raise here.
     """
     client = _a_client_that_covers_no_keys()
 
-    for level in (Consistency.FOLLOWER, Consistency.CACHED):
-        with pytest.raises(NotImplementedError, match=level):
-            client.get(b"user:1", consistency=level)
+    with pytest.raises(NotImplementedError, match=Consistency.CACHED):
+        client.get(b"user:1", consistency=Consistency.CACHED)
 
 
 def test_an_index_the_client_has_is_kept_for_the_reads_that_come_next():

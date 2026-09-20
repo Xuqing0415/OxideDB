@@ -37,8 +37,8 @@ import pytest
 from _ports import free_addresses
 from _wait import (wait_for_keys_leader, wait_for_metadata_client,
                    wait_for_tso_client, wait_until)
-from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, RemoteNodeClientFactory,
-                            ShardLeaders, ask_shard)
+from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, NodeUnreachable,
+                            RemoteNodeClientFactory, ShardLeaders, ask_shard)
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import MetadataCluster, RoutingTable, ShardPlacement
 from oxidedb.raft.node import NodeState
@@ -46,7 +46,7 @@ from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (ErrorCode, MVCCStateMachine, ReadResult,
                                         ScanRefused)
 from oxidedb.transaction.coordinator import TransactionCoordinator
-from oxidedb.transaction.smart_client import SmartClient
+from oxidedb.transaction.smart_client import Consistency, SmartClient
 from oxidedb.tso.tso import TSOCluster
 
 KEY_A = b"key0"      # first byte 0x6b -> shard 0
@@ -485,6 +485,144 @@ def test_a_machine_this_client_has_no_handle_for_is_not_where_it_reads():
     assert cache.any_replica_for(0).address == "a:2"
 
 
+class _SilentNode:
+    """A member that does not answer at all: a channel that has gone, not a refusal.
+
+    Nothing here refuses, because there is no answer to refuse in - the situation ``ask_shard``
+    treats as a refusal's equal with nothing in it.  A list, when one is given, is where this
+    node records that it was asked: a walk over a set of these is told apart from a walk that
+    happened to start elsewhere by the order the list is in.
+    """
+
+    def __init__(self, reached=None):
+        self.asked = 0
+        self._reached = reached
+
+    def get(self, key, timestamp=None, read_index=None):
+        self.asked += 1
+        if self._reached is not None:
+            self._reached.append(self)
+        raise NodeUnreachable("nothing answered")
+
+
+def test_a_member_that_does_not_answer_sends_the_read_to_another_member():
+    """The level picks a member, and a pick that has gone quiet is one to walk past.
+
+    A node that does not answer is the same situation as a refusal with no answer in it: the
+    member this read was sent to is not serving it, so the next member of the set is asked.
+    The member it picked is the one this client is on, and the one the table calls the leader
+    is elsewhere - so an answer that came from the leader, with the member this read was sent
+    to never asked, is exactly the read this level exists not to make.
+
+    The silent member is asked once: asking each member of the set once is what a round of
+    addresses is, and the client's retry of the whole read is not a second round.
+    """
+    addresses = {1: "node1:8001", 2: "node2:8001"}
+    silent = _SilentNode()
+    factory = _AddressBookFactory({addresses[1]: _FakeNode(value=b"v1"),
+                                   addresses[2]: silent})
+    router = RoutingCache(_FakeCluster({}),
+                          _FakeTableSource(_table_with_addresses(1, addresses)),
+                          factory=factory, local_node_id=2)
+    client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
+
+    assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+    assert silent.asked == 1, "the member this read was sent to, once, before the leader"
+
+
+def test_a_follower_read_that_no_member_answers_says_so():
+    """Every member silent is the one outcome a caller has to be told about.
+
+    Coming back with nothing would read as a shard with no leader, which is a different
+    thing: the members are there and none of them is answering.  So the walk ends by raising
+    what it heard, and only after it has spent the set: every member the table names asked,
+    which is what tells a walk that ran out of places from one that stopped at the first.
+    """
+    addresses = {1: "node1:8001", 2: "node2:8001", 3: "node3:8001"}
+    reached = []
+    silent = {address: _SilentNode(reached) for address in addresses.values()}
+    factory = _AddressBookFactory(silent)
+    router = RoutingCache(_FakeCluster({}),
+                          _FakeTableSource(_table_with_addresses(1, addresses)),
+                          factory=factory, local_node_id=2)
+    client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
+
+    with pytest.raises(NodeUnreachable):
+        client.get(KEY_A, consistency=Consistency.FOLLOWER)
+
+    assert reached[0] is silent[addresses[2]], (
+        "the member this client is on was asked first, and not the leader the table names")
+    assert all(node.asked > 0 for node in silent.values()), (
+        "every member of the set was asked before the client gave up")
+
+
+class _NodeThatNamesItsBasis:
+    """A node that answers at an index of its own, the way a node that served a read does.
+
+    A refusal is not an answer as of anything, so this is the shape every read that reached a
+    state machine comes back in - and the basis is the node\'s to fill in, because the machine
+    it read from is handed entries to apply and not the positions they were written at.
+    """
+
+    def __init__(self, value, read_index):
+        self._value = value
+        self._read_index = read_index
+
+    def get(self, key, timestamp=None, read_index=None):
+        assert read_index is None, "a level the node obtains the index for names none"
+        return ReadResult.success(self._value, read_index=self._read_index)
+
+
+def test_a_read_keeps_the_index_the_node_answered_it_at():
+    """The basis a client has just been told is the basis of the reads that will not ask.
+
+    A cached read is answered at an index this client was given earlier, and the only place
+    such an index can come from is a read that was answered at one.  So every read that
+    reached a state machine keeps what came back, and not only the level that will read at
+    it: a first follower read is what makes a cached one possible at all.
+    """
+    addresses = {1: "node1:9001", 2: "node2:9001"}
+    factory = _AddressBookFactory({addresses[2]: _NodeThatNamesItsBasis(b"v1", 7)})
+    router = RoutingCache(_FakeCluster({}),
+                          _FakeTableSource(_table_with_addresses(1, addresses)),
+                          factory=factory, local_node_id=2)
+    client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
+
+    assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+    # The cache has no other handle: what a level will read at is not something a caller of a
+    # read is meant to reach for, so the test reaches in rather than opening one.
+    assert client._read_index_cache.cached_index(0) == 7, (
+        "the index the answer came back with, kept by the shard it is an index of")
+
+
+class _NodeThatAnswersARange:
+    """A node that answers a range with rows, wherever it is asked from."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def scan(self, start_key, end_key, timestamp=None, read_index=None):
+        return list(self._rows)
+
+
+def test_a_range_read_at_a_level_that_need_not_lead_goes_to_a_member():
+    """A range is a piece per shard it crosses, and a piece is one read of that shard.
+
+    So the level is the piece\'s and not the range\'s: each piece goes to a member of its own
+    shard\'s set, and the caller asked for the level once.  What makes this worth its own test
+    is that the pick is per piece - a range read is a loop over shards, and a loop is where a
+    lookup gets made once and used for all of them.
+    """
+    addresses = {1: "node1:9001", 2: "node2:9001"}
+    factory = _AddressBookFactory({addresses[2]: _NodeThatAnswersARange([(b"k", b"v")])})
+    router = RoutingCache(_FakeCluster({}),
+                          _FakeTableSource(_table_with_addresses(1, addresses)),
+                          factory=factory, local_node_id=2)
+    client = SmartClient(None, _FakeCluster({}), router=router, factory=factory)
+
+    assert client.scan(b"a", b"z", consistency=Consistency.FOLLOWER) == [(b"k", b"v")]
+
+
 # -- the two sources a placement can come from ---------------------------------
 
 class _ClusterThatSaysWhoLeads:
@@ -741,6 +879,70 @@ def test_a_killed_shard_leader_is_answered_by_the_other_replicas_of_its_set():
 
         assert client.put(KEY_A, b"v2"), "the write never got past the node that was killed"
         assert router.refreshes == 0, "the table was not read to find the new leader"
+    finally:
+        factory.close()
+        shard_cluster.shutdown()
+        tso_cluster.shutdown()
+        metadata.shutdown()
+
+
+# -- the level that picks a member, over a real cluster ------------------------
+
+class _RecordingRemoteFactory(RemoteNodeClientFactory):
+    """A factory over a wire that remembers which node each handle was drawn for.
+
+    How many members a follower read went through is not something the answer says, so it is
+    said here: a read the member it asked went on to serve draws one handle, and a read that
+    had to walk past a member that refused or went quiet draws more than one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.drawn = []
+
+    def get_client(self, shard_id, node_id, address=None):
+        client = super().get_client(shard_id, node_id, address)
+        if client is not None:
+            self.drawn.append(node_id)
+        return client
+
+
+def test_a_follower_read_is_served_by_a_member_of_the_shard_s_set():
+    """The level where the hop happens on the replica, and the reads spread over the set.
+
+    A follower read is answered at the leader's index, and it is the node that answers that
+    obtains it - so any member of the set can serve the read, and which member is the
+    caller's draw.  Pinning that takes a client over a wire: a handle in this process has no
+    channel to carry the index question over, so that member of the set is a member the
+    client reaches the leader through, which is ``test_client_servicer.py``\'s subject.
+
+    One handle per read is how a member is told from a walk: a member that had refused would
+    have sent the client to another node, which is a second draw.  The value is asserted too,
+    and it is the floor rather than the point - a spread over replicas that answered
+    differently would be a client reading from several places at once.
+    """
+    metadata, tso_cluster, shard_cluster = _cluster_with_metadata(num_shards=1)
+    factory = _RecordingRemoteFactory()
+    try:
+        wait_for_keys_leader(shard_cluster, [KEY_A])
+        tso_client = wait_for_tso_client(tso_cluster)
+        table_client = wait_for_metadata_client(metadata)
+        table = _published_table(table_client, (0,))
+
+        router = RoutingCache(shard_cluster, _FakeTableSource(table), factory=factory)
+        client = SmartClient(tso_client, shard_cluster, router=router)
+        assert client.put(KEY_A, b"v1")
+
+        members = set(table.shard(0).nodes)
+        assert len(members) == 3, "a set to spread over"
+
+        factory.drawn.clear()
+        for _ in range(60):
+            assert client.get(KEY_A, consistency=Consistency.FOLLOWER) == b"v1"
+
+        assert len(factory.drawn) == 60, (
+            "one member served each read: a member that refused would have been walked past")
+        assert set(factory.drawn) == members, "every member of the set, and nothing else"
     finally:
         factory.close()
         shard_cluster.shutdown()

@@ -3,7 +3,7 @@ import time
 import random
 from typing import Callable, List, Optional, Tuple, Dict, Any
 
-from ..client.node_client import NodeClientFactory
+from ..client.node_client import NodeClient, NodeClientFactory
 from ..client.routing import ShardLeaders, ask_shard
 from ..raft.state_machine import (CommandType, ErrorCode, ReadResult,
                                   serialize_command)
@@ -94,18 +94,18 @@ def _check_consistency(consistency: str) -> None:
     """Refuse a read this client cannot make as asked, rather than answering it another way.
 
     Two refusals, and they are different mistakes: a word that is not a consistency at all,
-    and one of the three that this client does not implement yet.  Neither is answered
-    strongly, because a caller that asked for a replica read and was given a linearizable
-    one would have no way to tell - which is the one thing a caller chooses this parameter
-    to be able to say.
+    and the one level this client does not implement yet.  Neither is answered strongly,
+    because a caller that asked for a replica read and was given a linearizable one would
+    have no way to tell - which is the one thing a caller chooses this parameter to be able
+    to say.
     """
     if consistency not in Consistency.ALL:
         raise ValueError(f"{consistency!r} is not a consistency: "
                          f"{' or '.join(Consistency.ALL)}")
-    if consistency != Consistency.STRONG:
+    if consistency == Consistency.CACHED:
         raise NotImplementedError(
-            f"a {consistency} read is not implemented yet: every read this client makes "
-            f"goes to the shard's leader")
+            f"a {consistency} read is not implemented yet: this client asks the node it "
+            f"reaches for the index, and cannot yet read at one of its own remembering")
 
 
 class SmartClient:
@@ -190,16 +190,43 @@ class SmartClient:
                     answer = client.get(key)
                 return answer
 
-            result = ask_shard(self._leaders, shard_id, _read)
+            result = ask_shard(self._leaders, shard_id, _read,
+                               first=self._member_to_ask(shard_id, consistency))
             if result is None:
                 raise RuntimeError("No leader found")
             if result.error_code == ErrorCode.ERR_NOT_LEADER:
                 raise RuntimeError("Not leader")
 
+            # The basis this answer was given at, kept for the reads that will not ask for
+            # one (see ``Consistency.CACHED``): a reader that has just been told an index is
+            # the reader that can pass it on.  Only a read that reached the state machine has
+            # one - a refusal is not an answer as of anything - so that is the whole test.
+            if result.read_index is not None:
+                self._read_index_cache.remember(shard_id, result.read_index)
+
             return result.value
         
         return self._retry_with_backoff(_do_get)
-    
+
+    def _member_to_ask(self, shard_id: int, consistency: str) -> Optional[NodeClient]:
+        """Where a read at ``consistency`` starts: a member of the set, or the leader.
+
+        ``STRONG`` is the shard's leader confirming an index, so the walk starts where it
+        always has.  ``FOLLOWER`` asks a member that need not lead, because the index such
+        a read needs is obtained by the node that answers it - the leader's, fetched over
+        the wire - and the point of the level is that the hop happens on a node the caller
+        picked rather than on the caller.
+
+        None when no member can be named, which the walk reads as the leader.  It is the
+        same answer the strong path would have given, and no weaker: a member of the set
+        the caller can reach is where a follower read is served, and the leader is one of
+        them - so a client with no table, or one whose table names a set nothing can reach,
+        loses the spread and not the read.
+        """
+        if consistency == Consistency.STRONG:
+            return None
+        return self._leaders.replica_for_shard(shard_id)
+
     def read(self, txn_id: int, key: bytes) -> Optional[bytes]:
         """Read ``key`` at the transaction's start timestamp, not at the newest one.
 
@@ -361,7 +388,9 @@ class SmartClient:
 
         ``consistency`` is :meth:`get`'s, and every piece of the range is read the way
         the caller asked for: a range is a piece per shard it crosses, and each piece is
-        one read of that shard rather than a second kind of read.
+        one read of that shard rather than a second kind of read.  A piece read at a level
+        that need not lead is served by a member of that shard's set, which is what the
+        level means one shard at a time.
         """
         _check_consistency(consistency)
 
@@ -376,7 +405,8 @@ class SmartClient:
 
             answer = ask_shard(
                 self._leaders, shard_id,
-                lambda client: client.scan(piece_start, piece_end, timestamp))
+                lambda client: client.scan(piece_start, piece_end, timestamp),
+                first=self._member_to_ask(shard_id, consistency))
             if answer is None:
                 raise RuntimeError(f"No leader for shard {shard_id}")
             rows.extend(answer)

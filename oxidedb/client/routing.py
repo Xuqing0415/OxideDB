@@ -132,6 +132,29 @@ class ShardLeaders:
             return None
         return self.leader_for_shard(shard_id)
 
+    def replica_for_shard(self, shard_id: int) -> Optional[NodeClient]:
+        """A member of ``shard_id``'s set to read from, or None when there is none to name.
+
+        The other answer a read can have, for the level that does not need the leader: the
+        table publishes a whole replica set, and a read whose index the answering node
+        obtains is answered by any member of it.  Which member is then a question about
+        spreading the reads of many clients over the set, and not about the shard - so the
+        choosing is the table's own answer (``any_replica_for``) and nothing here prefers
+        one over another.
+
+        None without a table, and that is not a failure: a cluster that publishes nowhere
+        has one thing to say about a shard - who leads it - and a handle in this process
+        has no wire to carry an index question over, so there is no second member to name.
+        The walk that starts with a None here starts where it always has.
+
+        The handle is noted as asked, the way ``leader_for_shard`` notes the one the table
+        names: a walk that began by asking this member must not come round to it again.
+        """
+        if self._router is None:
+            return None
+        client = self._router.any_replica_for(shard_id)
+        return None if client is None else self._hand_out(shard_id, client)
+
     def ranges(self) -> Dict[int, Tuple[bytes, bytes]]:
         """The ranges of the one placement this client holds, by shard id.
 
@@ -346,7 +369,7 @@ class ShardLeaders:
 
 def ask_shard(leaders: ShardLeaders, shard_id: int,
               question: Callable[[NodeClient], object],
-              table_reads: int = 2):
+              table_reads: int = 2, first: Optional[NodeClient] = None):
     """Ask ``shard_id``'s leader ``question``, following a refusal to the next place.
 
     A refusal here is ``ERR_NOT_LEADER``, and the node that gave it is evidence: it is not
@@ -354,6 +377,12 @@ def ask_shard(leaders: ShardLeaders, shard_id: int,
     the address the shard named, or the next replica of its set - and this asks there until
     there is nowhere left to ask.  That is a walk and not a loop: a replica set has as many
     addresses as it has, each is asked at most once, and the table is what bounds the rest.
+
+    ``first`` is where the walk starts when the caller is not asking the leader: a read
+    that need not lead picks the member it is to be served by, and that pick is the node
+    asked first.  Every turn after it is the walk this function has always been - the
+    address a refusal named, the set's other replicas, then the table - so a member that
+    refuses or goes quiet costs the caller that member and nothing else.
 
     ``table_reads`` is what a fresh table is worth, counted in reads of the table rather
     than in questions asked, because that is what the alternative costs: the first read is
@@ -395,7 +424,10 @@ def ask_shard(leaders: ShardLeaders, shard_id: int,
         last_refusal = None
         last_silence = None
 
-        client = leaders.leader_for_shard(shard_id)
+        # The caller's own pick, once: after that this is the walk it has always been, and
+        # a member that refused or went quiet is left behind with the rest of them.
+        client = leaders.leader_for_shard(shard_id) if first is None else first
+        first = None
         if client is None:
             break
 
