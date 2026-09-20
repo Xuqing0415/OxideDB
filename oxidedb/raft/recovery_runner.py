@@ -528,7 +528,17 @@ class RecoveryRunner:
                           self._view.shard_replica_ids(shard_id))
         self._view.ensure_serving(pending["new_shard_id"], self._view.node_ids())
 
-        source = self._wait_for_leader(shard_id)
+        # The lookup below is the first thing this recovery asks the routing table, and
+        # on the process side the group holding that table is electing at the same
+        # moment - the two are the same restart.  A read that lands in that window
+        # reports that nothing was read, and a split that stops for it stops the way one
+        # with no leader does: the note stays, the shard stays frozen, and the next call
+        # picks it up rather than the node failing to start at all.
+        try:
+            source = self._wait_for_leader(shard_id)
+        except RuntimeError as nothing_read:
+            self._last_split_error = str(nothing_read)
+            return False
         if source is None:
             self._last_split_error = f"shard {shard_id} has no leader"
             return False
@@ -949,14 +959,30 @@ class RecoveryRunner:
         before anything can be read out of it - and the view answers None until it has,
         which is an answer and not a failure.  How long to wait for one is the caller's
         business, which is why the deadline is here and not behind the interface.
+
+        A lookup that cannot be made at all is waited for on the same terms and behind the
+        same deadline, because on the process side the two are the same restart.  Who
+        serves a shard is read out of the routing table, the group holding the table is
+        electing while the recovery that needs it runs, and a read that lands in that
+        window says nothing was read rather than answering - which is what
+        :meth:`RecoveryView.serving_nodes` promises.  A recovery that took it as final
+        would stop there for good, since nothing calls it a second time.  What is left
+        after the deadline is the read failing, handed on as the failure it is: the
+        thread above tells a table that will not answer from a shard that has no leader,
+        and that is a distinction this call cannot make for it.
         """
         deadline = time.time() + timeout
         while True:
-            client = self._view.leader_client(shard_id)
-            if client is not None:
-                return client
-            if time.time() >= deadline:
-                return None
+            try:
+                client = self._view.leader_client(shard_id)
+            except RuntimeError:
+                if time.time() >= deadline:
+                    raise
+            else:
+                if client is not None:
+                    return client
+                if time.time() >= deadline:
+                    return None
             time.sleep(LEADER_POLL_SECONDS)
 
     def _wait_for_group(self, shard_id: int, nodes: List[int],

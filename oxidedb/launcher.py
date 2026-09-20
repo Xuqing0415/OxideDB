@@ -31,6 +31,12 @@ the first writer wins and every other node is refused, which is why all of them 
 and it sweeps the locks of the shards it leads (``LockCleaner``).  Both are background
 threads, and both are stopped before the groups they talk to are.
 
+A node that stopped in the middle of a split or a move comes back with a note in the
+shard's own storage, and what it does about that note is a recovery - ``RecoveryRunner``,
+run against this node's view, read at the start and finished around the publisher.  A
+node object never restarts; a process does, and this is the half of the story that says
+so.
+
 The report goes over the group's own port - the same walk a client makes, following the
 name a refusal gives - because the node that leads a shard is usually not the node that
 leads the table's group.  A publisher holding a node object could only speak while its own
@@ -64,6 +70,7 @@ from .metadata.service import MetadataStateMachine, add_metadata_services_to_ser
 from .raft.node import MemoryRaftNode, NodeState
 from .raft.recovery_notes import (MIGRATION_RECORD_PREFIX, SPLIT_RECORD_PREFIX,
                                   PendingNote, forget_note, read_note, write_note)
+from .raft.recovery_runner import MigrationState, RecoveryRunner
 from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_SEGMENT,
                                 ShardServer)
 from .raft.state_machine import MVCCStateMachine, StateMachine
@@ -359,6 +366,10 @@ class NodeClusterView:
     * it can ask no peer anything a client cannot ask.  A peer's address comes from the one
       port arithmetic both sides share, and what leads a shard is worked out by asking the
       group's members themselves - where a cluster has every node of the group in hand.
+
+    It holds what a cluster holds, too: the recovery of this side, driven by this
+    node's own start in the cluster's order, and read by the publisher for the shards a
+    move is in flight for.  See :meth:`recovery_runner`.
     """
 
     def __init__(self, config: ClusterConfig, range_map: RangeMap):
@@ -369,10 +380,30 @@ class NodeClusterView:
         #: How this node reaches the rest of the cluster, built when something first asks
         #: for it: until a recovery runs, a node answers only about itself.
         self._node_clients: Optional[RemoteNodeClientFactory] = None
+        #: The recovery's body, run against this view: the splits and the moves this
+        #: node was in the middle of, and why the last attempt at either could not
+        #: finish.  It belongs to the recovery rather than to a side - see section 3
+        #: of ``docs/recovery.md`` - so this node reaches it through
+        #: :meth:`recovery_runner`, the way a cluster object reaches its own.
+        self._recovery_runner = RecoveryRunner(self)
 
     def serve(self, server: ShardServer) -> None:
         """Record the server this node runs, which is the one it can answer for."""
         self._shard_servers[self._config.node_id] = server
+
+    def recovery_runner(self) -> RecoveryRunner:
+        """The recovery of this node, which its own start drives in the cluster's order.
+
+        A cluster object holds one of these as well, and for the same reason: what is
+        in flight is the recovery's state and not the side's, and a side that comes
+        back rebuilds it out of the notes in its own storage.  What differs is who
+        starts it - a node is told to start rather than starting a cluster, so its own
+        start is the caller, and it keeps the cluster's order: the notes of both kinds
+        are read before the publisher's thread exists and finished after it.
+
+        See :class:`RecoveryRunner`.
+        """
+        return self._recovery_runner
 
     # -- what the client-side lookups ask a cluster -------------------------
 
@@ -459,6 +490,37 @@ class NodeClusterView:
         if node is None or node.state != NodeState.LEADER:
             return None
         return (self._config.node_id, node.current_term)
+
+    def possible_ranges(self) -> List[Dict[int, tuple]]:
+        """The range maps this node's keyspace could be in, right now.
+
+        A node that is splitting has two answers for a moment: the map its servers
+        route by, and the map the table gets once the split lands.  Both are this
+        node's own placement, which is what a publisher needs to tell apart from
+        somebody else's - and the one a restarted node finds in the table is often the
+        second, because the split landed before the process stopped.  A node that
+        could not say which maps are its own would take its own split for a stranger's
+        keyspace and refuse to publish at all, which is what the note it read at start
+        is there to prevent.
+
+        See :meth:`RecoveryRunner.possible_ranges`.
+        """
+        return self._recovery_runner.possible_ranges()
+
+    def migrations(self) -> Dict[int, MigrationState]:
+        """Every move this node has not finished, for callers that look.
+
+        The publisher is the caller, and what it does with this is leave the shards in
+        it alone: a shard with a move in flight has two groups, and which of them the
+        table names is the move's to decide and to write.  What this node would say
+        about such a shard is the group it holds, which is one of the two and not
+        always the same one - the set a move is leaving on the node it is leaving, the
+        set it is going to on a node it is going to - and either of those written to
+        the table is a routing answer the move has not given yet or has replaced.
+
+        See :meth:`RecoveryRunner.migrations`.
+        """
+        return self._recovery_runner.migrations()
 
     # -- what a recovery asks a cluster -------------------------------------
 
@@ -884,7 +946,14 @@ class ClusterNode:
     # -- start --------------------------------------------------------------
 
     def start(self) -> None:
-        """Build this node, bind its ports, and say it is ready."""
+        """Build this node, bind its ports, finish what it was in the middle of, and
+        say it is ready.
+
+        A node that stopped in the middle of a split or a move comes back with a note
+        in its own storage, and the work that note stands for is picked up here rather
+        than left for a second call: nothing else calls a recovery on this path, so a
+        recovery nobody runs is a shard frozen for good.
+        """
         if self._started:
             raise RuntimeError("this node is already started")
 
@@ -897,7 +966,19 @@ class ClusterNode:
         self._start_metadata_group()
         self._start_tso_group()
         self._start_shards()
+        # What this node was in the middle of when it stopped, read before anything
+        # publishes and finished after - the order ``ShardedRaftCluster.start`` keeps,
+        # and for the reason it keeps it, which is the publisher's second pass rather
+        # than its first: a note that is read but not yet acted on has this node
+        # answering about a shard with the ranges the table has already moved past.
+        # Both phases are the recovery's, and a node with no notes pays nothing here:
+        # the maps and the entries they build over are empty.
+        runner = self._view.recovery_runner()
+        runner.load_pending_splits()
+        runner.load_pending_migrations()
         self._start_background()
+        runner.finish_pending_splits()
+        runner.finish_pending_migrations()
 
         if self._config.watch_stdin:
             threading.Thread(target=self._watch_stdin, name="stdin-watch",

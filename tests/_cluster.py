@@ -358,7 +358,7 @@ class Cluster:
 
 def start_cluster(num_nodes: int = 1, num_shards: int = DEFAULT_NUM_SHARDS,
                   base_dir: Optional[str] = None,
-                  host: str = DEFAULT_HOST) -> Cluster:
+                  host: str = DEFAULT_HOST, bootstrap: bool = True) -> Cluster:
     """Start ``num_nodes`` node processes and return them once each has said ``READY``.
 
     ``base_dir`` is where the nodes keep their logs and rows.  Given none, a directory is
@@ -370,9 +370,11 @@ def start_cluster(num_nodes: int = 1, num_shards: int = DEFAULT_NUM_SHARDS,
     a leader and come back NOT_LEADER.  A test that writes should retry that answer, which is
     what a real client does with it as well.
 
-    Bootstrap is left on for every node.  The first node to reach the metadata group
-    installs the starting ranges and the others are refused, which is the ordinary case
-    rather than an error - so no node has to know whether it started first.
+    Bootstrap is on for every node unless it is turned off here.  The first node to reach
+    the metadata group installs the starting ranges and the others are refused, which is
+    the ordinary case rather than an error - so no node has to know whether it started
+    first.  ``bootstrap=False`` starts nodes that publish nothing, for a test about a
+    node whose table somebody else is keeping.
     """
     if num_nodes < 1:
         raise ValueError(f"a cluster has at least one node, not {num_nodes}")
@@ -386,7 +388,7 @@ def start_cluster(num_nodes: int = 1, num_shards: int = DEFAULT_NUM_SHARDS,
     # their other ports from, so they have to be a whole block apart - and a block is the
     # same width whatever the nodes were told to serve.
     bases = [allocate_port(span=block_width()) for _ in range(num_nodes)]
-    configs = [_config(node_id, bases, num_shards, host, root)
+    configs = [_config(node_id, bases, num_shards, host, root, bootstrap)
                for node_id in range(1, num_nodes + 1)]
 
     nodes: List[NodeProcess] = []
@@ -407,13 +409,13 @@ def start_cluster(num_nodes: int = 1, num_shards: int = DEFAULT_NUM_SHARDS,
 
 
 def _config(node_id: int, bases: Sequence[int], num_shards: int, host: str,
-            root: str) -> ClusterConfig:
+            root: str, bootstrap: bool = True) -> ClusterConfig:
     """One node's configuration: what it would have been handed on a command line."""
     peers = tuple(Peer(other_id, host, bases[other_id - 1])
                   for other_id in range(1, len(bases) + 1) if other_id != node_id)
     return ClusterConfig(node_id=node_id, port=bases[node_id - 1], host=host, peers=peers,
                          data_dir=os.path.join(root, f"node{node_id}"),
-                         num_shards=num_shards)
+                         num_shards=num_shards, bootstrap=bootstrap)
 
 
 def _command(config: ClusterConfig) -> List[str]:
@@ -424,6 +426,8 @@ def _command(config: ClusterConfig) -> List[str]:
                "--port", str(config.port),
                "--num-shards", str(config.num_shards),
                "--data-dir", str(config.data_dir)]
+    if not config.bootstrap:
+        command.append("--no-bootstrap")
     if config.peers:
         command += ["--peers", ",".join(peer.text for peer in config.peers)]
     return command
