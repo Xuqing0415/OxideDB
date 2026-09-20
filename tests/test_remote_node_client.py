@@ -24,6 +24,7 @@ from oxidedb.client import (LocalNodeClient, NodeUnreachable, RemoteNodeClient,
 from oxidedb.client.routing import ShardLeaders, ask_shard
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import RoutingTable, ShardPlacement
+from oxidedb.proto import client_pb2
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
                                         ScanRefused, serialize_command)
@@ -89,9 +90,15 @@ def _leader_client(cluster, factory, shard_id: int = 0):
 
 
 def _read_shape(result):
-    """Every field a read answers with, so equality is field by field."""
+    """Every field a read answers with, so equality is field by field.
+
+    ``read_index`` is here because it is the one field whose two carriers can
+    disagree without either node being wrong: a node fills it in as the read is
+    answered, and a client that did not carry it back would answer a read that
+    named an index with a result that says it named none.
+    """
     return (result.success, result.value, result.commit_ts, result.error_code,
-            result.error_msg)
+            result.error_msg, result.read_index)
 
 
 def _table_over(cluster, leader_of, version: int = 1) -> RoutingTable:
@@ -182,6 +189,15 @@ def test_a_client_across_a_wire_answers_the_same_as_one_in_this_process():
     # The version crosses too, and it is the one the commit published rather than a number
     # the two sides happened to agree on: this is what a copy cannot do without.
     assert remote.get(KEY_A).commit_ts == 200
+    # And the index the answer is as of, which is what a caller with more reads to
+    # make at one snapshot has to name.  Equality and not is-not-None: an answer that
+    # crossed saying it was as of nothing would pass the second assertion alone.
+    across, here = remote.get(KEY_A), local.get(KEY_A)
+    assert across.read_index is not None, (
+        "the index the answer is as of crosses the wire with it")
+    assert across.read_index == here.read_index, (
+        "and it is the index this node would answer at itself")
+    assert across.read_index >= 1, "which is an index this log has reached"
     assert remote.scan_versions(b"a", b"z") == [(KEY_A, b"v1", 200)]
     assert remote.follower_read_index()[0] == local.follower_read_index()[0]
 
@@ -352,3 +368,30 @@ def test_a_retry_follows_the_hint_and_never_reads_the_table():
     assert written.success, written.error_msg
     assert cache.refreshes == 0, (
         "the client read the table again instead of following the address it was given")
+# -- what a response's index means to the client -------------------------------
+
+
+def test_the_basis_a_response_carries_is_read_the_way_the_node_meant_it():
+    """What the wire's index means, in the three shapes a response puts it in.
+
+    A field with no presence says "none" with 0, since no log has an index 0, and a
+    refusal that never reached a state machine is the case that uses it.  A refusal the
+    machine did make carries the index the answer was seen at, which is a basis like any
+    other: a key behind a lock was observed at one.  And a read named at an index that
+    was not applied in time comes back with that index, so that the same read can be
+    asked again at it elsewhere - which is the request rather than an answer, and the
+    in-process carrier leaves the field unset for it.  A client that read the third as a
+    basis would be a client whose result depends on which side of a wire it is on, which
+    is the one thing this layer is for.
+    """
+    never_reached_a_machine = client_pb2.GetResponse(error_code=client_pb2.NOT_LEADER)
+    assert RemoteNodeClient._read_index_of(never_reached_a_machine) is None, (
+        "the refusal was answered as of nothing, and 0 is how the wire says so")
+
+    locked = client_pb2.GetResponse(error_code=client_pb2.LOCKED, read_index=7)
+    assert RemoteNodeClient._read_index_of(locked) == 7, (
+        "the machine answered, and the lock was observed at an index")
+
+    timed_out = client_pb2.GetResponse(error_code=client_pb2.TIMEOUT, read_index=10 ** 6)
+    assert RemoteNodeClient._read_index_of(timed_out) is None, (
+        "what the request named and what the node answered at are not the same fact")

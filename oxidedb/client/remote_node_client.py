@@ -61,10 +61,20 @@ class RemoteNodeClient:
 
         response = self._call(self._stub.Get, request)
         if response.error_code == client_pb2.OK:
+            # The basis crosses with the answer, as it does in process: it is the index a
+            # caller names on the reads that follow, and an answer that arrived without
+            # it would leave the caller with nothing to name.
             return ReadResult.success(
                 response.value if response.HasField("value") else None,
-                commit_ts=response.commit_ts)
-        return ReadResult.failure(*self._failure(response))
+                commit_ts=response.commit_ts,
+                read_index=self._read_index_of(response))
+        # A refusal can be an answer as of an index all the same - a key behind a lock was
+        # seen at one, and the read that found it is consistent to it - so the basis goes
+        # on this result too, and the local carrier leaves it unset for exactly the
+        # refusals that never reached a machine.
+        refused = ReadResult.failure(*self._failure(response))
+        refused.read_index = self._read_index_of(response)
+        return refused
 
     def scan(self, start_key: bytes, end_key: bytes,
              timestamp: Optional[int] = None, read_index: Optional[int] = None) -> list:
@@ -164,6 +174,26 @@ class RemoteNodeClient:
             return method(request, timeout=self._timeout)
         except grpc.RpcError as error:
             raise NodeUnreachable(f"{self._address}: {error}") from error
+
+    @staticmethod
+    def _read_index_of(response):
+        """The index an answer is as of, or None when the wire carried none.
+
+        The response field has no presence, so 0 is how a wire says "none" - no log
+        has an index 0 - and a refusal that never reached a state machine is the case
+        that uses it.  A refusal the machine did make carries the index the answer was
+        seen at, which is a basis like any other: a key behind a lock was observed at
+        one.
+
+        A read named at an index that was not applied in time is the exception, and it
+        is not a basis: the index comes back so that the same read can be asked again
+        at it somewhere else, which is the request rather than an answer.  The local
+        carrier leaves the field unset for that read, and reading the field back here
+        is what keeps a result from depending on which side of a wire it came from.
+        """
+        if response.error_code == client_pb2.TIMEOUT:
+            return None
+        return response.read_index or None
 
     @staticmethod
     def _failure(response):

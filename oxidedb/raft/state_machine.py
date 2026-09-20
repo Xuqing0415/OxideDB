@@ -140,8 +140,9 @@ class ReadResult:
         self.read_index = read_index
     
     @staticmethod
-    def success(value: Optional[bytes], commit_ts: int = 0):
-        return ReadResult(True, value, commit_ts=commit_ts)
+    def success(value: Optional[bytes], commit_ts: int = 0,
+                read_index: Optional[int] = None):
+        return ReadResult(True, value, commit_ts=commit_ts, read_index=read_index)
     
     @staticmethod
     def failure(error_code: int, error_msg: str, leader_address: Optional[str] = None):
