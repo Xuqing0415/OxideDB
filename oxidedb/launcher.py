@@ -57,11 +57,13 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .client import RemoteMetadataClient
+from .client import (NodeClient, NodeUnreachable, RemoteMetadataClient,
+                     RemoteNodeClientFactory)
 from .metadata.publisher import MetadataPublisher
-from .metadata.service import (MetadataClient, MetadataStateMachine,
-                                add_metadata_services_to_server)
+from .metadata.service import MetadataStateMachine, add_metadata_services_to_server
 from .raft.node import MemoryRaftNode, NodeState
+from .raft.recovery_notes import (MIGRATION_RECORD_PREFIX, SPLIT_RECORD_PREFIX,
+                                  PendingNote, forget_note, read_note, write_note)
 from .raft.shard_server import (DEFAULT_LOCK_CLEANER_INTERVAL, SHARD_SEGMENT,
                                 ShardServer)
 from .raft.state_machine import MVCCStateMachine, StateMachine
@@ -345,6 +347,18 @@ class NodeClusterView:
     name ``LockCleaner`` reaches for, so the cleaner sweeps the locks of the shards this
     node leads and no others - which is the only thing a process could do about another
     process's locks in any case.
+
+    It is also the :class:`RecoveryView` of this side of a wire, and the two answers it
+    does not have are worth naming, because they are the difference between the two sides
+    rather than gaps in this one:
+
+    * it keeps no placement.  Who serves a shard is read off the group this node holds, so
+      ``apply_move_locally`` - a write a side that keeps one has to make - has nothing to
+      write here, while ``serving_nodes`` goes to the routing table for the answer a
+      cluster object keeps in a field;
+    * it can ask no peer anything a client cannot ask.  A peer's address comes from the one
+      port arithmetic both sides share, and what leads a shard is worked out by asking the
+      group's members themselves - where a cluster has every node of the group in hand.
     """
 
     def __init__(self, config: ClusterConfig, range_map: RangeMap):
@@ -352,19 +366,29 @@ class NodeClusterView:
         self._range_map: RangeMap = dict(range_map)
         #: Named as the cleaner expects to find it: a mapping of node id to server.
         self._shard_servers: Dict[int, ShardServer] = {}
-        self._metadata_client: Optional[MetadataClient] = None
+        #: How this node reaches the rest of the cluster, built when something first asks
+        #: for it: until a recovery runs, a node answers only about itself.
+        self._node_clients: Optional[RemoteNodeClientFactory] = None
 
     def serve(self, server: ShardServer) -> None:
         """Record the server this node runs, which is the one it can answer for."""
         self._shard_servers[self._config.node_id] = server
 
-    def set_metadata_client(self, client: MetadataClient) -> None:
-        self._metadata_client = client
-
     # -- what the client-side lookups ask a cluster -------------------------
 
-    def metadata_client(self) -> Optional[MetadataClient]:
-        return self._metadata_client
+    def metadata_client(self):
+        """The routing table's group as a client, over the group's own port.
+
+        The answer a cluster object gives has to be reachable the other way here: an
+        in-process cluster *is* the table's group when it leads it, while a process is a
+        client of the group whoever leads - which is what lets a node that does not lead it
+        go on keeping its shards' entries current.
+
+        One client for the whole node rather than one per caller, so that a publisher and a
+        recovery read one answer: it caches the table and drops that cache on the writes it
+        makes, and two of them would be two caches to keep in step.  See :meth:`_clients`.
+        """
+        return self._clients().metadata_client()
 
     def get_shard_server(self, node_id: int) -> Optional[ShardServer]:
         return self._shard_servers.get(node_id)
@@ -438,6 +462,175 @@ class NodeClusterView:
 
     # -- what a recovery asks a cluster -------------------------------------
 
+    def node_ids(self) -> List[int]:
+        """Every node of the cluster this side is part of, in a fixed order.
+
+        The whole membership and not the nodes holding anything: a split's new shard is
+        served by every node, so a side that answered with itself would build a group of
+        one and then publish itself as the shard's replica set.  Both sides answer the same
+        list, so the members they each build are the members of one group.
+
+        See :class:`RecoveryView.node_ids`.
+        """
+        return self._config.node_ids()
+
+    def pending_notes(self, shard_id: int) -> List[PendingNote]:
+        """The notes this node holds for ``shard_id``: what the shard was in the middle of.
+
+        Read out of this node's own storage for the shard, which is where a split or a move
+        put them before the first row moved - and the reason a process can pick the work up
+        at all: between the copy and the proposal the note is the only record anywhere, and
+        the storage is the only thing that survives the restart.
+
+        A shard this node holds no group for has no note here rather than an error: a
+        process that never served the shard has nothing written down about it.
+
+        See :class:`RecoveryView.pending_notes`.
+        """
+        notes = []
+        for prefix in (SPLIT_RECORD_PREFIX, MIGRATION_RECORD_PREFIX):
+            note = read_note(self._storages_of(shard_id), shard_id, prefix)
+            if note is not None:
+                notes.append(note)
+        return notes
+
+    def remember_note(self, note: PendingNote) -> None:
+        """Write ``note`` into this node's storage for the shard it is about.
+
+        Which shard that is is the note's own answer rather than a second argument, and the
+        replicas to write it on are the group this node holds for it: one storage here,
+        against a cluster's one per node that holds a replica.
+
+        See :class:`RecoveryView.remember_note`.
+        """
+        write_note(self._storages_of(note.shard_id), note)
+
+    def forget_note(self, shard_id: int) -> None:
+        """Drop every note this node holds for ``shard_id``, of either kind.
+
+        ``forget_note`` below is the module's function and not this method: a method body
+        looks its globals up rather than its own class, so the two do not shadow each other
+        and the call means what it says.
+
+        See :class:`RecoveryView.forget_note`.
+        """
+        storages = self._storages_of(shard_id)
+        for prefix in (SPLIT_RECORD_PREFIX, MIGRATION_RECORD_PREFIX):
+            forget_note(storages, shard_id, prefix)
+
+    def serving_nodes(self, shard_id: int) -> Optional[List[int]]:
+        """The set the routing table names for ``shard_id``, or None if it names none.
+
+        Asked of the table rather than answered from a field, because on this side there is
+        no field: who serves a shard is what the table says, and the group this node holds
+        is the other half of the same fact.  It is this read that a side which comes back
+        learns how far a move got from - the set the move was going to means the proposal
+        landed, the set it was leaving means nothing was proposed - so it is a fresh read
+        and not a cached one: a copy of the table taken before the last write answers with
+        the step before it.
+
+        None is the third answer, and the one a process can give that a cluster object
+        cannot: the table names no such shard, and nothing here may guess which group a
+        range belongs to - a guess between two live groups is how a range ends up served by
+        one of them while its rows are in the other.
+
+        A table that cannot be read raises, which is how the recovery's own reads report
+        the same thing: nothing was read, so nothing is known.
+
+        See :class:`RecoveryView.serving_nodes`.
+        """
+        table = self._clients().metadata_client().table(refresh=True)
+        placement = table.shard(shard_id)
+        return None if placement is None else sorted(placement.nodes)
+
+    def addresses_on(self, shard_id: int, nodes: List[int]) -> Dict[int, str]:
+        """Where each of ``nodes`` serves ``shard_id``, by the arithmetic both sides share.
+
+        Worked out rather than asked for, which is the one thing this side cannot do the way
+        a cluster does: there is no server object here for a peer, so an address comes from
+        :func:`ports_for` - the same arithmetic that peer binds its own shard port with -
+        and from the base address the configuration gave it.  A node the configuration does
+        not place is left out rather than guessed at, which is what the protocol asks of
+        both sides.
+
+        See :class:`RecoveryView.addresses_on`.
+        """
+        addresses = {}
+        for node_id in nodes:
+            address = self._address_of(shard_id, node_id)
+            if address is not None:
+                addresses[node_id] = address
+        return addresses
+
+    def leader_client(self, shard_id: int) -> Optional[NodeClient]:
+        """A handle on whatever leads ``shard_id``, or None while nobody does.
+
+        The group the routing table names, which for a shard being moved is the one its rows
+        are coming from.  A shard the table names nowhere is asked of the whole cluster,
+        which is the fallback a cluster object answers with too: a shard nothing has an
+        entry for is one the model places on every node.
+
+        See :class:`RecoveryView.leader_client`.
+        """
+        nodes = self.serving_nodes(shard_id)
+        return self.leader_client_for_nodes(
+            shard_id, self._config.node_ids() if nodes is None else nodes)
+
+    def leader_client_for_nodes(self, shard_id: int,
+                               nodes: List[int]) -> Optional[NodeClient]:
+        """A handle on whichever of ``nodes`` leads ``shard_id``, or None.
+
+        Each node is asked the one question a client service answers only on a leader - a
+        follower read index, which is a node that has confirmed an entry of its own term
+        with a quorum - so the first node that answers with one is the node to talk to, and
+        no leader hint is followed: every member of the group is in ``nodes``, so the walk
+        over the set is the whole answer.
+
+        A node that does not answer at all is skipped rather than failing the walk, which is
+        the difference between the two sides of this seam: a cluster's handles are objects
+        in one process and always answer, while these are processes - and the node being
+        asked about is often the one that has just been restarted.
+
+        See :class:`RecoveryView.leader_client_for_nodes`.
+        """
+        factory = self._clients()
+        for node_id in nodes:
+            address = self._address_of(shard_id, node_id)
+            if address is None:
+                continue
+            client = factory.get_client(shard_id, node_id, address)
+            if client is None:
+                continue
+            try:
+                read_index, _ = client.follower_read_index()
+            except NodeUnreachable:
+                continue
+            if read_index is not None:
+                return client
+        return None
+
+    def freeze(self, shard_id: int, reason: str, nodes: List[int]) -> None:
+        """Refuse commands that add rows, on this node's group in ``nodes``.
+
+        The set is the caller's and is not worked out here, the same as on the cluster side:
+        a shard being moved has two groups at once, and which of them a copy is about to
+        read is written in the note that copy came from.  A node of ``nodes`` this side
+        holds no group on is not a failure - it is a node with nothing to freeze - and the
+        one group a process can freeze is its own.
+
+        See :class:`RecoveryView.freeze`.
+        """
+        for node in self._nodes_on(nodes, shard_id):
+            node.freeze_writes(reason)
+
+    def unfreeze(self, shard_id: int, nodes: List[int]) -> None:
+        """Let this node's group in ``nodes`` take rows again: the reverse, same set.
+
+        See :class:`RecoveryView.unfreeze`.
+        """
+        for node in self._nodes_on(nodes, shard_id):
+            node.resume_writes()
+
     def ensure_serving(self, shard_id: int, nodes: List[int]) -> List[int]:
         """Make this node's group for ``shard_id`` the one that serves ``nodes``.
 
@@ -494,6 +687,175 @@ class NodeClusterView:
         server.add_shard(shard_id, members=members)
         return closed
 
+    def ensure_group_on(self, shard_id: int, nodes: List[int]) -> None:
+        """Build this node's member of the group for ``shard_id``, and close nothing.
+
+        The build half of :meth:`ensure_serving` on its own, which is the whole of what a
+        move asks of a node it is going to: a move builds the group its rows are going into
+        while the source is still the group the table names, so what is built here is built
+        beside that group rather than instead of it.  A set this node is not in asks nothing
+        of it, and a group already here is left alone.
+
+        See :class:`RecoveryView.ensure_group_on`.
+        """
+        members = sorted(set(nodes))
+        if self._config.node_id not in members:
+            return
+        server = self._shard_server()
+        if server.get_shard_node(shard_id) is None:
+            server.add_shard(shard_id, members=members)
+
+    def close_group_on(self, shard_id: int, nodes: List[int]) -> List[int]:
+        """Close this node's group for ``shard_id``, and only if ``nodes`` names this node.
+
+        The set is the caller's and the routing table is not, the same as on the cluster
+        side: what is closed is the group a refused move built, which is the one group a
+        refusal is entitled to name.  What this side does not do is put the storage aside
+        under an orphan name - a process keeps no placement to read back, so the directory
+        stays where it is and a later build of the same shard finds it, which is the half of
+        this that is not written yet.
+
+        What it returns is this node when it had a group to close, so an empty list is work
+        already done.
+
+        See :class:`RecoveryView.close_group_on`.
+        """
+        if self._config.node_id not in set(nodes):
+            return []
+        server = self._shard_server()
+        if server.get_shard_node(shard_id) is None:
+            return []
+        return [self._config.node_id] if server.shutdown_shard(shard_id) else []
+
+    def apply_split_locally(self, shard_id: int, split_key: bytes,
+                            new_shard_id: int) -> None:
+        """Re-range this node, now that the routing table says so.
+
+        The two edits a cluster makes, made the same way and for the same reason: this node
+        routes by its own range map - its server was given it, and ``range_map`` and
+        ``shard_ids`` are answered out of it - so until the map moves, this node goes on
+        routing for a range the table has given away and goes on answering the publisher
+        with a map the table no longer holds.  The map and the server are given the new
+        answer in one step, which is what keeps them from being two answers to where a key
+        goes.
+
+        See :class:`RecoveryView.apply_split_locally`.
+        """
+        new_range_map = dict(self._range_map)
+        start, end = new_range_map[shard_id]
+        new_range_map[shard_id] = (start, split_key)
+        new_range_map[new_shard_id] = (split_key, end)
+        self._range_map = new_range_map
+        server = self._shard_servers.get(self._config.node_id)
+        if server is not None:
+            server.set_range_map(new_range_map)
+
+    def apply_move_locally(self, shard_id: int, nodes: List[int]) -> None:
+        """Where the table now says ``shard_id`` is served: nothing to write down here.
+
+        A process keeps no placement, so who serves a shard on this side is read off the
+        group it holds - before this call and after it alike.  The step that changes what it
+        holds is :meth:`ensure_serving`, the step after this one; writing a placement here
+        would be a second answer to a question the group already answers, and the first of
+        the two to go stale.
+
+        See :class:`RecoveryView.apply_move_locally`, which says the same about a side that
+        keeps no placement.
+        """
+
+    # -- how this node reaches the rest of the cluster ----------------------
+
+    def close_clients(self) -> None:
+        """Close the channels this node opened to the rest of the cluster, on the way down.
+
+        A pool nobody closes holds sockets and a thread pool for the life of the process,
+        and the table's client and every shard handle are let go with it.  A node that
+        opened none - because nothing ever asked it about another node - closes nothing.
+        """
+        if self._node_clients is not None:
+            self._node_clients.close()
+            self._node_clients = None
+
+    def _shard_server(self) -> ShardServer:
+        """The server this node runs, which is the one thing here it can change."""
+        server = self._shard_servers.get(self._config.node_id)
+        if server is None:
+            raise RuntimeError(
+                "this node has no shard server to build a group on: a recovery runs "
+                "after the node's own shards are up")
+        return server
+
+    def _storages_of(self, shard_id: int) -> List[RaftStorage]:
+        """The storages this node holds for ``shard_id``: one per group it has here.
+
+        The note layer takes storages rather than nodes, for the reason it does on the
+        cluster side: a note is written into a replica's storage and read back out of it.
+        This side's replicas of a shard are the group it holds for it, so that is one
+        storage - and none at all for a shard it holds nothing for.
+        """
+        server = self._shard_servers.get(self._config.node_id)
+        node = None if server is None else server.get_shard_node(shard_id)
+        if node is None or node._storage is None:
+            return []
+        return [node._storage]
+
+    def _nodes_on(self, node_ids: List[int], shard_id: int) -> List[MemoryRaftNode]:
+        """The nodes of ``node_ids`` that are holding a group for ``shard_id``, here.
+
+        At most this node, and only while it holds one: a process has one replica of a
+        shard, so a caller naming a whole replica set is naming one node it can act on and a
+        set of peers it cannot.
+        """
+        if self._config.node_id not in set(node_ids):
+            return []
+        server = self._shard_servers.get(self._config.node_id)
+        node = None if server is None else server.get_shard_node(shard_id)
+        return [] if node is None else [node]
+
+    def _address_of(self, shard_id: int, node_id: int) -> Optional[str]:
+        """Where ``node_id`` serves ``shard_id``, or None for a node this config has not.
+
+        The arithmetic is :func:`ports_for`, the one both sides derive a shard port with, so
+        an address worked out here is the one that node bound - which is the only way this
+        side learns a peer's address, having no object to ask.
+        """
+        if node_id not in self._config.base_addresses():
+            return None
+        return self._config.shard_address(shard_id, node_id)
+
+    def _clients(self) -> RemoteNodeClientFactory:
+        """The one factory this node reaches everything through, built on first use.
+
+        One and not one per caller: it holds one channel pool, and the table client it hands
+        out caches the table and drops that cache on the writes it makes - so a publisher
+        and a recovery that did not share it would be two answers to what the table says,
+        one of them a step behind.
+
+        The table's seeds are the group's members with this node first, so a command costs
+        one hop when this node leads and two when it does not.  The clock is not seeded: a
+        recovery reads rows and proposes changes, and never asks for a timestamp.
+        """
+        if self._node_clients is None:
+            self._node_clients = RemoteNodeClientFactory(
+                metadata_seeds=self._metadata_seeds())
+        return self._node_clients
+
+    def _metadata_seeds(self) -> List[str]:
+        """Where the table's group listens, this node's own address first.
+
+        Every member is in the list because any of them may lead it, and the order is the
+        only optimisation: the client remembers the address that answered, so a node that
+        leads the group pays one hop and a node that does not pays two - which is what the
+        name in a refusal is for.
+        """
+        voters = self._config.voters(self._config.metadata_group_size)
+        seeds = [self._config.metadata_address(node_id) for node_id in voters]
+        own = self._config.metadata_address()
+        if own in seeds:
+            seeds.remove(own)
+            seeds.insert(0, own)
+        return seeds
+
 
 class ClusterNode:
     """One node: its groups, its servers, its background threads, and its stop."""
@@ -506,7 +868,6 @@ class ClusterNode:
         self._shard_server: Optional[ShardServer] = None
         self._metadata_node: Optional[MemoryRaftNode] = None
         self._tso_node: Optional[MemoryRaftNode] = None
-        self._metadata_client: Optional[MetadataClient] = None
         self._metadata_writer: Optional[RemoteMetadataClient] = None
         self._publisher: Optional[MetadataPublisher] = None
         self._lock_cleaner: Optional[LockCleaner] = None
@@ -558,8 +919,6 @@ class ClusterNode:
             self._group_storage("metadata"),
             register=self._serve_metadata_clients,
         )
-        self._metadata_client = MetadataClient(self._metadata_leader)
-        self._view.set_metadata_client(self._metadata_client)
 
     def _start_tso_group(self) -> None:
         """Serve this node's member of the timestamp group, if it has one."""
@@ -695,29 +1054,6 @@ class ClusterNode:
         print(f"{name}: {address} (peers {sorted(peers)})", flush=True)
         return node
 
-    def _metadata_group_seeds(self) -> List[str]:
-        """Where the table's group listens, this node's own address first.
-
-        Every member is in the list because any of them may lead it, and the order is the
-        only optimisation: the client that walks these addresses remembers the one that
-        answered, so a node that leads the group pays one hop and a node that does not pays
-        two - which is what the name in a refusal is for.
-        """
-        voters = self._config.voters(self._config.metadata_group_size)
-        seeds = [self._config.metadata_address(node_id) for node_id in voters]
-        own = self._config.metadata_address()
-        if own in seeds:
-            seeds.remove(own)
-            seeds.insert(0, own)
-        return seeds
-
-    def _metadata_leader(self) -> Optional[MemoryRaftNode]:
-        """The metadata member to ask, or None while this node is not the leader."""
-        node = self._metadata_node
-        if node is None or node.state != NodeState.LEADER:
-            return None
-        return node
-
     def _start_background(self) -> None:
         """Start the threads that keep the table current and the locks cleaned up.
 
@@ -729,11 +1065,13 @@ class ClusterNode:
         The client it writes through is the socket's rather than this node's: the group's
         leader is whichever node won that election, and a publisher holding a node object
         could only get a command in on the passes that coincided with its own node leading.
-        The seeds are the group's members with this node first, so a command costs one hop
-        when this node does lead and two when it does not.
+        It is the view's own client and not one built here, so the recovery that runs before
+        this thread and the publisher go on reading one table rather than two.
+
+        See :meth:`NodeClusterView.metadata_client`.
         """
         if self._config.bootstrap and self._metadata_node is not None:
-            self._metadata_writer = RemoteMetadataClient(self._metadata_group_seeds())
+            self._metadata_writer = self._view.metadata_client()
             self._publisher = MetadataPublisher(self._metadata_writer, self._view)
             self._publisher.start()
 
@@ -761,8 +1099,9 @@ class ClusterNode:
         that ran on after its group had stopped would spend the time reporting failures,
         and the point of the order is that nothing writes once nothing is listening.
 
-        The publisher's client is closed here too: its channels are its own, and a socket
-        left open by a stopped thread is a socket nobody is going to close.
+        The channels this node opened to the rest of the cluster go with it, in one call:
+        the publisher's client and every handle a recovery built share one pool, and a
+        socket left open by a stopped thread is a socket nobody is going to close.
 
         The shards go next, and each of them stops its gRPC server and its node together -
         ``ShardServer.shutdown`` is one call for both, so "stop accepting" and "stop the
@@ -777,9 +1116,8 @@ class ClusterNode:
             if stopper is not None:
                 stopper.stop()
 
-        if self._metadata_writer is not None:
-            self._metadata_writer.close()
-            self._metadata_writer = None
+        self._metadata_writer = None
+        self._view.close_clients()
 
         if self._shard_server is not None:
             self._shard_server.shutdown()
