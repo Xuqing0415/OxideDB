@@ -169,10 +169,24 @@ class TestRaftCluster:
                             if node_id != leader.node_id)
             wait_for_replication(leader, [follower])
 
+            # A second write, replicated, so that the follower has applied past the index
+            # below.  It is what tells the two candidate answers apart: the index the
+            # caller named, or wherever this replica has got to by itself.
+            second = leader._state_machine.serialize_command(
+                CommandType.SET, key=b"named", value=b"later")
+            later = leader.propose(second)
+            assert later.success, later.error_msg
+            wait_for_replication(leader, [follower])
+            assert follower.last_applied > written.index
+
             read = follower.get(b"named", read_index=written.index)
             assert read.success, read.error_msg
-            assert read.value == b"value"
-            assert read.read_index == written.index, "the index the caller named is the one"
+            assert read.value == b"later", (
+                "the newest version is the answer: the index is a floor under the read "
+                "and not the snapshot it is taken at")
+            assert read.read_index == written.index, (
+                "the index the caller named is the one it gets back, and not the newest "
+                "thing this replica has applied")
 
             without = follower.get(b"named")
             assert not without.success, "a follower answered a read with no index"
