@@ -311,6 +311,27 @@ Design boundaries.
   range that is frozen, beside the one for a lock and the one for a lost leadership.  The two
   shapes it could take, and why the choice waits for that widening rather than being made
   here, are written out as an open decision in `docs/design.md`, section 7.
+* **An in-process TSO client is pinned to the node that led when it was built, and the
+  remote one is not.**  `TSOCluster.get_client()` answers with a `TSOClient` over whichever
+  node leads at that moment, that client holds the node, and its next fetch - the first one
+  that needs a new batch of numbers, which is not necessarily the call in flight when the
+  election happened - raises `RuntimeError("TSO node is not leader")`
+  (`oxidedb/tso/tso.py`).  There is no hint to follow and no way for the client to re-point
+  itself.  The wire answers the same question the other way: `RemoteTSOClient`, over
+  `client/remote_group_client.py`, walks the address that last answered, then the leader a
+  refusal named, then its seeds, so an election costs it one hop.  `SmartClient` and
+  `TransactionCoordinator` each hold one client for as long as they live
+  (`oxidedb/transaction/smart_client.py`, `oxidedb/transaction/coordinator.py`), so no
+  caller gets to ask for a new one between two transactions.  Nothing shipped reaches this:
+  `oxidedb/cli.py` hands `SmartClient` the remote client, which is the one that follows.
+  What is exposed is a library caller composing a `SmartClient` over an in-process cluster,
+  which is the shape every test here builds.  Measured on a three-node TSO group: a client
+  built and not yet read from, with the node it names stopped, raises; the group has a new
+  leader 0.201s later, and a client built after that reads.  Tests are protected only where
+  they were made so - `_timestamp_from_whichever_leads` in
+  `tests/test_local_node_client.py` takes a client per timestamp, which is a test's answer
+  to a gap that is the caller's.  The completion state is two implementations with the same
+  shape: an in-process read that follows the leader the way the remote one does.
 * **A shard's state machine is built without being told which shard it is.**  The factory
   `ShardServer` calls takes no argument (`launcher.py`'s `_state_machine` is handed nothing),
   so a state machine that opened storage of its own - one file per shard - cannot be written
