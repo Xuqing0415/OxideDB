@@ -1036,6 +1036,11 @@ Honest list of what is *not* done, roughly in priority order.
   this log's absolute positions in a test that is about two carriers agreeing.  The
   completion state is one way of writing a result's shape that both files use, so that a
   field added to a read cannot be compared on one side of a wire and not the other.
+* **The README's copy of the read-index window is a copy.**  Consistency levels writes the
+  window out as `0.1s`, which is what `READ_INDEX_TTL` holds today, and prose cannot
+  import a constant: a line here that quotes a number from the code goes stale the moment
+  the number changes, and nothing fails.  The completion state is a test that reads the
+  window out of the README and compares it with the constant.
 
 ## Layout
 
