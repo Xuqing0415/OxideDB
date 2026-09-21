@@ -358,6 +358,17 @@ def test_a_move_ends_with_the_table_told_and_the_group_it_left_gone(tmp_path):
 
 
 def test_a_move_the_table_refuses_puts_the_shard_back_and_keeps_what_was_copied(tmp_path):
+    """The abort half of a refused move: what it undoes, and not the note it writes.
+
+    The four things `_abort_move` undoes each have an assertion here - the source
+    takes rows again, the record goes, the note goes, the group built to receive the
+    rows is closed and put aside - and each was shown to have one of its own by
+    injecting that single failure: dropping the whole body and skipping only the thaw
+    land on the same assertion, so the first red line says how far the experiment got
+    and not how far this test goes.  What is not covered here is the note's forward
+    write: skipping it leaves this test green and reddens six others that need a note
+    on disk - four in `tests/test_migration_recovery.py` and two more in this file.
+    """
     metadata, cluster = _cluster_with_metadata(tmp_path, shard_nodes={0: SERVING})
     try:
         client = wait_for_metadata_client(metadata)
