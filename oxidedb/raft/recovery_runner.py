@@ -687,26 +687,35 @@ class RecoveryRunner:
         other.  A split has no such choice in front of it - the shard being split is the
         shard, and the table naming it is a question of when.
 
+        A table this side cannot read at all answers True at once and the proposal says
+        why: what is waited for is a table that answers and has not been told about the
+        shard yet - a publisher's first pass that is behind - and a group nothing can be
+        read from is not a state this side can wait its way out of.  That is also what
+        keeps the wait from costing anything on a node that has no table to read.
+
         Sets ``_last_split_error`` and answers False when the deadline passes with the
-        table still not naming the shard, or still unreadable.  ``timeout`` defaults to
-        ``TABLE_TIMEOUT``, read when the wait starts rather than bound to this call, so a
-        test can shorten the recovery's patience by patching the constant.
+        table still not naming the shard.  ``timeout`` defaults to ``TABLE_TIMEOUT``, read
+        when the wait starts rather than bound to this call, so a test can shorten the
+        recovery's patience by patching the constant.
         """
         if timeout is None:
             timeout = TABLE_TIMEOUT
 
         deadline = time.time() + timeout
-        reason = f"the routing table names no shard {shard_id}"
         while True:
             try:
-                if self._view.serving_nodes(shard_id) is not None:
-                    return True
-            except RuntimeError as nothing_read:
-                reason = str(nothing_read)
+                named = self._view.serving_nodes(shard_id)
+            except RuntimeError:
+                # Nothing was read, so nothing is known - and there is no answer to
+                # wait for: a table this side cannot reach at all is reported by the
+                # proposal below, which is what happened before this wait existed.
+                return True
+            if named is not None:
+                return True
             if time.time() >= deadline:
                 self._last_split_error = (
                     f"the routing table never named shard {shard_id}, so the split "
-                    f"cannot be proposed: {reason}")
+                    f"cannot be proposed")
                 return False
             time.sleep(LEADER_POLL_SECONDS)
 
