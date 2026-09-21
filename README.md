@@ -661,7 +661,10 @@ Three environment notes:
 
 ## Known gaps
 
-Honest list of what is *not* done, roughly in priority order.
+Honest list of what is *not* done, roughly in priority order.  Every entry here has a
+completion state - a shape the finished thing would have, written into the entry itself.
+What could not be written that way, because only a different design reaches it, is in
+Design boundaries.
 
 * **A split cannot be asked for the shard beyond a node's port segment.**  A node's ports
   are its shard segment with the two groups above it, so a cluster can serve
@@ -715,16 +718,6 @@ Honest list of what is *not* done, roughly in priority order.
   it.  A range read refuses rather than guesses (`ScanRefused`): a key it cannot decide
   about, or a replica that is not the leader, is an error, because an empty range and a
   range nobody could answer must not look the same.
-* **Serializable isolation is validated, not SSI.**  A transaction is refused when any
-  key it read was committed over after its snapshot.  That prevents write skew, but it
-  also refuses read-write overlaps that a conflict graph would allow, so it aborts more
-  than SSI would.  The validation and the primary commit are ordered by one lock on the
-  coordinator, which is what makes the check atomic with the commit - and bounds the
-  guarantee to the transactions that commit through one coordinator; two committing at
-  the same time would need the graph.  The read set covers keys, not ranges: `scan` is
-  not part of the transaction path - it can be read at a timestamp, but it records
-  nothing - so a phantom is not detected, and a transaction with a large read set pays
-  one lookup per key with no batching or Bloom filter.
 * **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
   every row in a single msgpack payload, so the cost of a snapshot grows with the
   data set, and it is taken and restored while holding the node lock - the node
@@ -733,20 +726,6 @@ Honest list of what is *not* done, roughly in priority order.
   Over gRPC the payload also has to fit in one message: the 4 MiB default limit
   means a snapshot past that size is dropped by the peer until the channel is
   configured for more.
-* **No membership change.**  Cluster size is fixed at construction; there is no
-  joint-consensus configuration change.
-* **Timing is a thread per node, not an event loop.**  Elections and heartbeats
-  are driven by one long-lived ticker thread per node (`MemoryRaftNode._tick`)
-  and RPCs run on a small bounded pool.  That replaced a `threading.Timer`
-  schedule that created 50-80 threads per second on an idle three-node cluster.
-  An `asyncio` event loop per node is the intended end state.
-* **`synchronous=NORMAL` trades power-loss durability for throughput.**  A
-  process crash loses nothing, because every write is its own committed SQLite
-  transaction, but a machine crash can drop the tail of the WAL because commits
-  are not fsynced.  Use `SQLiteEngine(path, synchronous="FULL")` when that
-  matters.
-* **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
-  rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 * **A node can be a process, but a client outside one cannot do everything yet.**
   The contract is six node-level primitives in
   `proto/client.proto`, with a five-value `error_code` and a leader hint.  Two of its
@@ -1020,7 +999,6 @@ Honest list of what is *not* done, roughly in priority order.
   locks and no primary key: it writes every key of a transaction with one shared
   `commit_ts`, so a crash between two of those writes, or a reader arriving
   mid-commit, can observe part of a transaction.  See `docs/design.md`.
-
 * **A range read has no index to read at again, so a cached read cannot cover one.**
   `ScanResponse.read_index` is filled by the servicer and read by nobody: `scan` and
   `scan_versions` answer with rows rather than with a result, on both carriers, so a client
@@ -1041,6 +1019,37 @@ Honest list of what is *not* done, roughly in priority order.
   import a constant: a line here that quotes a number from the code goes stale the moment
   the number changes, and nothing fails.  The completion state is a test that reads the
   window out of the README and compares it with the constant.
+
+## Design boundaries
+
+Where the design stops.  Nothing here is waiting to be done: each is a choice this
+project makes, and what would move it is a different design rather than the next piece
+of work.
+
+* **No membership change.**  Cluster size is fixed at construction; there is no
+  joint-consensus configuration change.
+* **Serializable isolation is validated, not SSI.**  A transaction is refused when any
+  key it read was committed over after its snapshot.  That prevents write skew, but it
+  also refuses read-write overlaps that a conflict graph would allow, so it aborts more
+  than SSI would.  The validation and the primary commit are ordered by one lock on the
+  coordinator, which is what makes the check atomic with the commit - and bounds the
+  guarantee to the transactions that commit through one coordinator; two committing at
+  the same time would need the graph.  The read set covers keys, not ranges: `scan` is
+  not part of the transaction path - it can be read at a timestamp, but it records
+  nothing - so a phantom is not detected, and a transaction with a large read set pays
+  one lookup per key with no batching or Bloom filter.
+* **Timing is a thread per node, not an event loop.**  Elections and heartbeats
+  are driven by one long-lived ticker thread per node (`MemoryRaftNode._tick`)
+  and RPCs run on a small bounded pool.  That replaced a `threading.Timer`
+  schedule that created 50-80 threads per second on an idle three-node cluster.
+  An `asyncio` event loop per node is the intended end state.
+* **`synchronous=NORMAL` trades power-loss durability for throughput.**  A
+  process crash loses nothing, because every write is its own committed SQLite
+  transaction, but a machine crash can drop the tail of the WAL because commits
+  are not fsynced.  Use `SQLiteEngine(path, synchronous="FULL")` when that
+  matters.
+* **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
+  rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 
 ## Layout
 
