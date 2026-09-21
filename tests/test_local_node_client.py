@@ -471,7 +471,12 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
             lock = client.get_lock(key)
             assert lock is not None and lock["start_ts"] == start_ts
 
-        assert _commit(client_a, KEY_A, start_ts, commit_ts).success
+        committed = _commit(client_a, KEY_A, start_ts, commit_ts)
+        if not committed.success:
+            print('DIAG commit code=%r msg=%r leader=%r tso=%r'
+                  % (committed.error_code, committed.error_msg,
+                     shard_cluster.get_leader_for_key(KEY_A), (start_ts, commit_ts)))
+        assert committed.success, committed.error_msg
         assert _commit(client_b, KEY_B, start_ts, commit_ts).success
 
         for client, key, value in ((client_a, KEY_A, b"value_a"),
