@@ -21,10 +21,13 @@ split that finds a lock in the range it would copy refuses, keeping its note and
 shard frozen until the lock clears.
 """
 
+import threading
+
 import pytest
 
 from _ports import free_addresses
 from _wait import wait_for_metadata_client, wait_until
+from oxidedb.metadata.publisher import MetadataPublisher
 from oxidedb.metadata.service import MetadataCluster
 from oxidedb.raft.recovery_notes import PendingNote, write_note
 from oxidedb.raft.recovery_runner import RecoveryRunner
@@ -98,6 +101,23 @@ def _wait_for_the_table_to_know_the_shard(client):
     """
     return wait_until(lambda: client.table(refresh=True).shard(0),
                       message="the table never got the first range")
+
+
+def _wait_for_two_ranges_or_say_why(client, cluster):
+    """The table's two ranges, or a failure carrying the recovery's own words.
+
+    A table that never got the second range is a proposal that was refused or a copy
+    that never finished, and the recovery is the only one that knows which - so the
+    reason goes into the failure rather than staying behind with the side that gave up.
+    """
+    try:
+        return _wait_for_two_ranges(client)
+    except AssertionError as gave_up:
+        publisher = getattr(cluster, "_metadata_publisher", None)
+        raise AssertionError(
+            f"{gave_up} - the recovery's last word was {cluster.split_error()!r} "
+            f"with {cluster.pending_splits()!r} still pending, and the publisher's "
+            f"{getattr(publisher, 'last_error', None)!r}") from None
 
 
 def _assert_the_rows_are_where_the_table_says(cluster, client):
@@ -217,19 +237,9 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
             # happened, which is not what this test is about - see the same wait in the test
             # above, where the assertion after it needs the table to be behind.
             _wait_for_the_table_to_know_the_shard(client)
-            # A table that never got the second range is a proposal that was refused or
-            # a copy that never finished, and the recovery is the only one that knows
-            # which - so the reason goes into the failure rather than staying behind with
-            # the side that gave up.
-            try:
-                _wait_for_two_ranges(client)
-            except AssertionError as gave_up:
-                publisher = getattr(revived, "_metadata_publisher", None)
-                raise AssertionError(
-                    f"{gave_up} - the recovery's last word was "
-                    f"{revived.split_error()!r} with {revived.pending_splits()!r} "
-                    f"still pending, and the publisher's "
-                    f"{getattr(publisher, 'last_error', None)!r}") from None
+            # The reason a split that came back did not finish is the recovery's to
+            # say, and the failure carries it.
+            _wait_for_two_ranges_or_say_why(client, revived)
 
             assert again == MOVED_KEYS[1:], (
                 "the row that was already copied was copied again")
@@ -237,6 +247,64 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
         finally:
             revived.shutdown()
             metadata.shutdown()
+
+
+def test_a_split_that_comes_back_before_the_table_names_the_shard_waits_for_it(
+        tmp_path, monkeypatch):
+    """A recovery is nobody's second call, so the wait for the table is its own.
+
+    The proposal is checked by the group against the routing table, and a table that
+    has not been told this shard exists refuses it - which on a side that has just come
+    back is a race with this side's own publisher, whose first pass is a thread of its
+    own.  The publisher is held here until the recovery asks the table, and that ask is
+    the wait under test: a recovery that took the refusal as final would leave the note
+    pending with the table never told, and nothing would call it a second time.
+
+    The table starts empty rather than restarted, which is the same thing from where the
+    recovery stands - a metadata service its publisher has not reached yet.
+    """
+    addresses = free_addresses()
+    metadata = _start_metadata(tmp_path)
+    cluster = _start_cluster(tmp_path, addresses, metadata)
+    try:
+        _write_rows(cluster)
+        # The note a split leaves when it dies before the table is told, written the way
+        # the split writes it - the state the lock test picks up from as well.
+        write_note(cluster._storages_of(0),
+                   PendingNote.split(shard_id=0, split_key=b"n", new_shard_id=NEW_SHARD))
+    finally:
+        cluster.shutdown()
+        metadata.shutdown()
+
+    metadata = _start_metadata(tmp_path / "empty")
+    asked = threading.Event()
+    original_publish_once = MetadataPublisher.publish_once
+
+    def held_until_the_recovery_asks(self):
+        assert asked.wait(30), "the recovery never asked the table"
+        return original_publish_once(self)
+
+    monkeypatch.setattr(MetadataPublisher, "publish_once", held_until_the_recovery_asks)
+
+    original_table_look = ShardedRaftCluster.serving_nodes
+
+    def release_when_asked(self, shard_id):
+        nodes = original_table_look(self, shard_id)
+        if shard_id == 0 and nodes is None:
+            asked.set()
+        return nodes
+
+    monkeypatch.setattr(ShardedRaftCluster, "serving_nodes", release_when_asked)
+
+    revived = _start_cluster(tmp_path, addresses, metadata)
+    try:
+        client = wait_for_metadata_client(metadata)
+        _wait_for_two_ranges_or_say_why(client, revived)
+        assert not revived.pending_splits(), "the split is done, so nothing is pending"
+        _assert_the_rows_are_where_the_table_says(revived, client)
+    finally:
+        revived.shutdown()
+        metadata.shutdown()
 
 
 def test_a_split_that_finished_leaves_nothing_to_pick_up(tmp_path):

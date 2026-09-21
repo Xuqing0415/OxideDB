@@ -565,6 +565,14 @@ class RecoveryRunner:
                 f"copied while one is in flight")
             return False
 
+        # The proposal below is checked by the group against the table it holds, and a
+        # table that has not been told this shard exists refuses it.  On a side that has
+        # just come back that is this side's own publisher, which starts with this
+        # recovery and publishes from a thread of its own - so the wait is here rather
+        # than left for a caller, because nothing calls a recovery a second time.
+        if not self._wait_for_the_table_to_name(shard_id):
+            return False
+
         pending["rows"] = self._rows_above(source, shard_id, pending["split_key"])
         return self.finish_split(pending, source)
 
@@ -659,6 +667,48 @@ class RecoveryRunner:
 
         self._last_split_error = result.error_msg
         return False
+
+    def _wait_for_the_table_to_name(self, shard_id: int,
+                                    timeout: Optional[float] = None) -> bool:
+        """Whether the routing table names ``shard_id``, asked until it does.
+
+        The look a split takes before it copies anything, and the one place this flow
+        waits on a table rather than reading it once: a split is proposed against the
+        table, and the group refuses one for a shard it has not heard of - which on a
+        side that has just come back is not a fact about the split but about this side's
+        own publisher, whose first pass is a thread that starts with the recovery.  The
+        two are a race, and one the recovery loses whenever the shard's own group elects
+        first.
+
+        None is waited through here, which is the opposite of what
+        :meth:`_wait_for_serving` does with the same answer, and worth keeping apart: a
+        move stops when the table names neither of the sets it is between, because
+        guessing is how a range ends up served by one group while its rows are in the
+        other.  A split has no such choice in front of it - the shard being split is the
+        shard, and the table naming it is a question of when.
+
+        Sets ``_last_split_error`` and answers False when the deadline passes with the
+        table still not naming the shard, or still unreadable.  ``timeout`` defaults to
+        ``TABLE_TIMEOUT``, read when the wait starts rather than bound to this call, so a
+        test can shorten the recovery's patience by patching the constant.
+        """
+        if timeout is None:
+            timeout = TABLE_TIMEOUT
+
+        deadline = time.time() + timeout
+        reason = f"the routing table names no shard {shard_id}"
+        while True:
+            try:
+                if self._view.serving_nodes(shard_id) is not None:
+                    return True
+            except RuntimeError as nothing_read:
+                reason = str(nothing_read)
+            if time.time() >= deadline:
+                self._last_split_error = (
+                    f"the routing table never named shard {shard_id}, so the split "
+                    f"cannot be proposed: {reason}")
+                return False
+            time.sleep(LEADER_POLL_SECONDS)
 
     # -- the move's body --------------------------------------------------------
 
