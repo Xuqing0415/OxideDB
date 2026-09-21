@@ -735,7 +735,9 @@ Design boundaries.
   stopped only by a lock that outlives its TTL, which means the shard could not settle
   it.  A range read refuses rather than guesses (`ScanRefused`): a key it cannot decide
   about, or a replica that is not the leader, is an error, because an empty range and a
-  range nobody could answer must not look the same.
+  range nobody could answer must not look the same.  The completion state is a read a person
+  can ask for at a timestamp of their own: a flag on the CLI's `get` and `scan`, carried the
+  way `--consistency` is.
 * **A snapshot is the whole keyspace in one blob.**  `MVCCStorage.dump` returns
   every row in a single msgpack payload, so the cost of a snapshot grows with the
   data set, and it is taken and restored while holding the node lock - the node
@@ -862,9 +864,13 @@ Design boundaries.
   What is still missing around it: it does not coordinate with a write that resolved to the
   old shard just before the range moved, so the copy can end up behind such a write; the
   copies left in the old shard are never reclaimed; and nothing chooses split points or
-  where a shard should live, which is a decision the caller makes.  A read that need not
-  lead is a level a client asks for rather than something the cluster decides: the flag
-  that names it is in Consistency levels.
+  where a shard should live, which is a decision the caller makes.  The completion state
+  for the first two is a copy that cannot end up behind a write the source had admitted,
+  and a source shard whose copied rows are released once the move has landed; the third
+  is not owed work, because choosing a split point or a placement is a different piece of
+  software rather than the next step of this one.  A read that need not lead is a level a
+  client asks for rather than something the cluster decides: the flag that names it is in
+  Consistency levels.
   A move is wired end to end.  `move_shard(shard_id, target_nodes)` freezes the source -
   refusing its writes with `ERR_MIGRATING`, which is deliberately not the split's answer,
   because a caller told a shard is moving has to look the range up again - reads its rows at
@@ -990,7 +996,14 @@ Design boundaries.
   and to every caller that builds one.
 * **The SQL layer is minimal.**  `SELECT` and `INSERT` only; no schema, types,
   multi-row insert, `AND`/`OR`, `UPDATE`, `DELETE`, joins, or secondary indexes.
+  The completion state is a layer that can refuse as well as answer: `SQLExecutor.execute`
+  answers a statement it cannot parse with `[]` (`oxidedb/sql/executor.py`), and a `SELECT` whose
+  shard has no leader with `[]` as well, so what the layer cannot answer and what it has
+  nothing to say about look the same - the distinction `ScanRefused` keeps everywhere else.
 * **No multi-version garbage collection.**  Old versions are never reclaimed.
+  The completion state is a watermark below which a version may be dropped: the oldest
+  timestamp a reader may still ask for, published to the store rather than guessed, because
+  nothing in `MVCCStorage` is told today what a reader is still holding.
 * **The generated protobuf bindings are checked in and pinned by nothing.**  The
   `*_pb2.py` files carry the toolchain that produced them in their header - protobuf
   7.35.0 and grpcio 1.82.1 - and the `*_pb2_grpc.py` files need one hand edit the
@@ -1016,7 +1029,9 @@ Design boundaries.
   `oxidedb/transaction/local.py` - the embedded `Database` and the CLI - has no
   locks and no primary key: it writes every key of a transaction with one shared
   `commit_ts`, so a crash between two of those writes, or a reader arriving
-  mid-commit, can observe part of a transaction.  See `docs/design.md`.
+  mid-commit, can observe part of a transaction.  See `docs/design.md`.  The completion state
+  is a local transaction ordered the way the distributed one is - through the coordinator, or
+  with a primary key and locks of its own - so that a reader never sees half of a commit.
 * **A range read has no index to read at again, so a cached read cannot cover one.**
   `ScanResponse.read_index` is filled by the servicer and read by nobody: `scan` and
   `scan_versions` answer with rows rather than with a result, on both carriers, so a client
@@ -1037,6 +1052,13 @@ Design boundaries.
   import a constant: a line here that quotes a number from the code goes stale the moment
   the number changes, and nothing fails.  The completion state is a test that reads the
   window out of the README and compares it with the constant.
+* **`JSONFileStorage` is legacy.**  Kept because existing tests construct it - three files
+  under `tests/` - and because `raft/__init__.py` exports it; it rewrites the whole log per
+  append, and `EngineRaftStorage` is the one for new code, which `raft/storage.py` says in
+  its own docstring.  The completion state is those callers moved onto the engine storage or
+  onto the factory and the class deleted, which is cleanup waiting to happen rather than a
+  design this project chose: `raft/shard_server.py` already imports it without using it, so
+  the callers are fewer than the imports suggest.
 
 ## Design boundaries
 
@@ -1066,8 +1088,6 @@ of work.
   transaction, but a machine crash can drop the tail of the WAL because commits
   are not fsynced.  Use `SQLiteEngine(path, synchronous="FULL")` when that
   matters.
-* **`JSONFileStorage` is legacy.**  Kept because existing tests construct it; it
-  rewrites the whole log per append.  Prefer `EngineRaftStorage`.
 
 ## Layout
 
