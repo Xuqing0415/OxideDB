@@ -39,7 +39,8 @@ pip install oxidedb      # the library, the client CLI and the cluster launcher
 ```
 
 `oxidedb` reads and writes a database inside its own process, or a cluster over the wire;
-[Quickstart and operations][quickstart] has all three modes and how to start a node.
+[Quickstart and operations][quickstart] has all three modes, how to start a node, and a
+session against a cluster end to end.
 
 ```
 # Durable: the data goes to ./demo/data.sqlite3, so the next command finds it
@@ -65,7 +66,7 @@ python examples/basic_usage.py     # set/get, a scan, a transaction and a rollba
 
 | Note | What it covers |
 |---|---|
-| [Quickstart and operations][quickstart] | the three modes, running a node, ports and `READY`, and a session against a cluster |
+| [Quickstart and operations][quickstart] | the three modes, running a node, ports and `READY` |
 | [The four goals][goals] | what each goal set out to be, how to reach it, and its limits |
 | [Consistency levels][levels] | `strong`, `follower` and `cached`, and what `cached` costs |
 | [Architecture][architecture] | the five-layer write path, and what is in each directory |
