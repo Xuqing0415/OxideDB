@@ -26,6 +26,14 @@ A node is READY before it can be written to, so a ``--server`` command asks befo
 sends: a timestamp from the clock's group, and a table naming every shard and its
 leader.  Nothing else here waits, and that wait is this file's rather than the
 client's for a reason ``wait_until_routable`` gives.
+
+``get`` and ``scan`` also take a ``--consistency``, which chooses which copy of a
+shard may answer and therefore what the read costs beyond the node that serves it:
+``strong`` asks the leader, ``follower`` any member of the set, and ``cached`` any
+member at an index this client was given a moment earlier.  ``set`` and ``delete``
+take none of it, because a write has one place to go.  What the three words mean is
+said by ``--help`` on the two read commands rather than here, since that is where a
+caller meets them first.
 """
 
 import argparse
@@ -36,7 +44,7 @@ from oxidedb.client import RemoteNodeClientFactory
 from oxidedb.database import Database
 from oxidedb.launcher import ports_for
 from oxidedb.metadata.cache import RoutingCache
-from oxidedb.transaction.smart_client import SmartClient
+from oxidedb.transaction.smart_client import READ_INDEX_TTL, Consistency, SmartClient
 
 
 #: How long a ``--server`` command waits for a cluster that is still starting, and how
@@ -53,6 +61,27 @@ CLUSTER_WAIT_SECONDS = 5.0
 CLUSTER_WAIT_INTERVAL = 0.1
 
 
+#: What ``--consistency`` offers, in the words ``get --help`` and ``scan --help``
+#: show.  It is said here, and at this length, because a shell shows it before it
+#: shows anything else: the first documentation a caller meets is the flag's own,
+#: earlier than the README and closer to the command, so it says what each level
+#: costs rather than only what the three are called.  The window comes from the
+#: module that keeps the index rather than being written out again here - help that
+#: said "100ms" while the cache had moved on would be wrong in the one place a
+#: caller cannot check it.
+CONSISTENCY_HELP = (
+    "which copy of a shard may answer the read, and what that costs (default: "
+    "%(default)s).  strong: the shard's leader confirms a basis with a quorum and "
+    "answers at it - the slowest, and the level every read had before there was a "
+    "choice.  follower: any member of the shard's set answers at a basis the node "
+    "obtains from the leader, so the hop is the node's rather than yours; as fresh "
+    "as strong, and spread over the set.  cached: any member answers at a basis "
+    "this client was given earlier and keeps for "
+    f"{READ_INDEX_TTL:g}s - no hop at all, and the only level that may return "
+    f"data up to {READ_INDEX_TTL:g}s old"
+)
+
+
 class ClusterStore:
     """The four commands against a cluster, over the transports that reach it.
 
@@ -61,9 +90,16 @@ class ClusterStore:
     else is delegation - the client underneath is the same ``SmartClient`` a test
     drives, so a key set from a shell travels the path a key set from a test does,
     through the same routing table and the same transaction coordinator.
+
+    The ``consistency`` is the level every read this store makes is answered at.  It
+    is handed in rather than asked for at each call because a command makes one read
+    and the level belongs where the backend is chosen: a local database has one copy
+    of a key and nowhere to put a level, so ``_run`` would otherwise have to know
+    which backend it was talking to in order to pass a word one of the two does not
+    take.
     """
 
-    def __init__(self, servers):
+    def __init__(self, servers, consistency=Consistency.STRONG):
         metadata_seeds, tso_seeds = _group_seeds(servers)
         self._factory = RemoteNodeClientFactory(metadata_seeds=metadata_seeds,
                                                 tso_seeds=tso_seeds)
@@ -78,6 +114,10 @@ class ClusterStore:
         self._table = RoutingCache(None, self._metadata, factory=self._factory)
         self._client = SmartClient(self._factory.tso_client(), None,
                                    router=self._table, factory=self._factory)
+        #: The level this store's reads are answered at.  Kept with the client rather
+        #: than passed to the two calls that have one, because a command makes one
+        #: read: see this class's docstring for why the level arrives here at all.
+        self._consistency = consistency
 
     def wait_until_routable(self, timeout=CLUSTER_WAIT_SECONDS):
         """Wait for a cluster that has only just started, and say why if it never is.
@@ -163,7 +203,8 @@ class ClusterStore:
         return None
 
     def get(self, key):
-        return self._client.get(key)
+        """The key's value, at the level this store was built with."""
+        return self._client.get(key, consistency=self._consistency)
 
     def set(self, key, value):
         return self._client.put(key, value)
@@ -172,7 +213,9 @@ class ClusterStore:
         return self._client.delete(key)
 
     def scan(self, start, end):
-        return self._client.scan(start, end)
+        """Every key in the range, each piece of it at the level this store was
+        built with."""
+        return self._client.scan(start, end, consistency=self._consistency)
 
     def close(self):
         self._factory.close()
@@ -232,6 +275,8 @@ def _parser():
 
     get_parser = subparsers.add_parser("get", help="Get a value by key")
     get_parser.add_argument("key", help="The key to retrieve")
+    get_parser.add_argument("--consistency", choices=Consistency.ALL,
+                            default=Consistency.STRONG, help=CONSISTENCY_HELP)
 
     set_parser = subparsers.add_parser("set", help="Set a key-value pair")
     set_parser.add_argument("key", help="The key")
@@ -243,6 +288,8 @@ def _parser():
     scan_parser = subparsers.add_parser("scan", help="Scan keys in range")
     scan_parser.add_argument("start_key", help="Start key (inclusive)")
     scan_parser.add_argument("end_key", help="End key (exclusive)")
+    scan_parser.add_argument("--consistency", choices=Consistency.ALL,
+                             default=Consistency.STRONG, help=CONSISTENCY_HELP)
 
     return parser
 
@@ -260,6 +307,10 @@ def _open(parser, args):
         parser.error("--data-dir and --server are two different places to keep data")
 
     if not servers:
+        # No level reaches the embedded database: it has one copy of a key, so there
+        # is no set to spread a read over and no index to answer at.  The flag is on
+        # the two read commands and does nothing here, the way ``--wait`` already does
+        # without a --server.
         return Database(data_dir=args.data_dir)
 
     for address in servers:
@@ -267,7 +318,10 @@ def _open(parser, args):
         if not host or not port.isdigit():
             parser.error(f"--server wants host:port, and {address!r} is not that")
 
-    store = ClusterStore(servers)
+    # ``--consistency`` is declared on the two read commands, so a write has no such
+    # attribute at all; the default is what a command that cannot choose already
+    # reads at.
+    store = ClusterStore(servers, getattr(args, "consistency", Consistency.STRONG))
     try:
         store.wait_until_routable(args.wait)
     except RuntimeError:

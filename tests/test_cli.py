@@ -4,11 +4,18 @@ Run as a subprocess rather than by calling ``main()`` in process, because the
 thing being tested is what a user gets from a shell - including the exit code
 ``get`` uses to report a missing key.
 
-The last class is the newest mode and the reason the file grew: ``--server``, which
-points the same four commands at a cluster running in other processes.  That mode
-cannot be tested any other way - in process there is no wire to be wrong on, no
-routing table to read and no second process to be a shard - so those tests start a
-real node and run the CLI against it the way a person would.
+``--server`` is the newest mode and the reason the file grew: it points the same four
+commands at a cluster running in other processes.  That mode cannot be tested any
+other way - in process there is no wire to be wrong on, no routing table to read and
+no second process to be a shard - so those tests start a real node and run the CLI
+against it the way a person would.
+
+The last two classes are the level a read is answered at: ``--consistency``, the one
+thing about a cluster read a caller chooses besides where it is routed.  They need a
+cluster of three nodes, since one node per set makes every level the same read; and
+the claim a shell cannot make at all - that a ``cached`` read answers at an index this
+client was given earlier - is tested in process, where a store can be held across two
+reads.
 """
 
 import os
@@ -19,6 +26,9 @@ import time
 import pytest
 
 from _cluster import start_cluster
+from oxidedb.cli import ClusterStore
+from oxidedb.client import RemoteNodeClient
+from oxidedb.transaction.smart_client import Consistency
 
 
 def _cli(*args):
@@ -77,6 +87,15 @@ class TestCli:
 
         assert result.returncode == 2
         assert "host:port" in result.stderr
+
+    def test_a_write_takes_no_consistency_because_it_has_one_place_to_go(self):
+        """A level says which copy of a shard may answer a read, and a write is
+        not a read: it has one shard to go to, so the argument is refused rather
+        than quietly ignored."""
+        result = _cli("set", "user:1", "alice", "--consistency", "cached")
+
+        assert result.returncode == 2
+        assert "--consistency" in result.stderr
 
 
 def _address_that_answers_nothing(cluster) -> str:
@@ -239,3 +258,118 @@ class TestCliAgainstACluster:
         assert "no address answered" in result.stdout, result.stdout
         assert "Key not written" not in result.stdout
         assert waited >= 1.0, f"the wait was over after {waited:.1f}s"
+
+
+@pytest.fixture(scope="module")
+def replicated_cluster(tmp_path_factory):
+    """Three nodes on two shards: every shard has three members, in three processes.
+
+    A set of one cannot show what a read level is for.  "Any member of the set" and
+    "the leader" are then the same address, and a read that need not lead is served
+    by the node the leader would have been, so the levels are tested against a cluster
+    whose sets are larger than one.  Everything else is the fixture above: nothing
+    waits for an election here either, because a command that arrives in that gap is
+    what the CLI's own wait is for.
+    """
+    with start_cluster(
+            num_nodes=3, num_shards=2,
+            base_dir=str(tmp_path_factory.mktemp("oxidedb-cli-levels"))) as running:
+        yield running
+
+
+class TestCliReadLevels:
+    """``--consistency``: the one thing about a cluster read a caller chooses.
+
+    Three words for three ways of being answered, and the same value from all of them
+    - which is what makes the choice a price rather than a promise about the answer.
+    """
+
+    def test_every_level_reads_a_key_a_shell_wrote(self, replicated_cluster):
+        """The flag has to reach the client, not merely the parser.
+
+        Three reads of one key, each at a different level, and the value comes back
+        three times: what differs is the route and what the caller pays for it, not
+        the answer.
+        """
+        cluster = replicated_cluster
+        written = _cluster_cli(cluster, "set", "level:key", "answered")
+        assert written.stdout.strip() == "OK", written.stdout + written.stderr
+
+        for level in Consistency.ALL:
+            read = _cluster_cli(cluster, "get", "level:key", "--consistency", level)
+
+            assert read.returncode == 0, f"{level}: {read.stdout}{read.stderr}"
+            assert read.stdout.strip() == "answered", f"{level}: {read.stdout}"
+
+    def test_a_range_read_takes_the_level_too(self, replicated_cluster):
+        """A range is a piece per shard, and every piece is read at the level asked
+        for."""
+        cluster = replicated_cluster
+        below = "level:0"     # utf-8 first byte 0x6c -> the shard the range starts in
+        above = "\u952e:level"    # utf-8 first byte 0xe9 -> the shard after it
+
+        assert _cluster_cli(cluster, "set", below, "first").stdout.strip() == "OK"
+        assert _cluster_cli(cluster, "set", above, "second").stdout.strip() == "OK"
+
+        scan = _cluster_cli(cluster, "scan", below, "\uffff", "--consistency", "cached")
+
+        assert scan.returncode == 0, scan.stdout + scan.stderr
+        rows = scan.stdout.strip().splitlines()
+        assert f"{below}: first" in rows, rows
+        assert f"{above}: second" in rows, rows
+
+
+def _what_each_read_named(monkeypatch):
+    """Every basis a shard read named, and the basis the node answered it at.
+
+    What one read looks like from the caller's side of the wire: the index it names is
+    the cache being used, and the index it is answered at is what there is to remember
+    for the next read.  Both are on the handle the read goes through, and nowhere else
+    a caller without the node's own logs can see them.
+    """
+    asked = []
+    wire_get = RemoteNodeClient.get
+
+    def recording_get(self, key, timestamp=None, read_index=None):
+        answer = wire_get(self, key, timestamp, read_index)
+        asked.append((read_index, answer.read_index))
+        return answer
+
+    monkeypatch.setattr(RemoteNodeClient, "get", recording_get)
+    return asked
+
+
+class TestCliCachedReadsRememberAnIndex:
+    """The one claim a shell cannot make: the index is the client's, not the set's.
+
+    ``cached`` is a read answered at an index this client was given earlier, and
+    "earlier" is inside one process: two invocations of the CLI are two clients with
+    two caches, so the second can prove nothing about the first.  So the level is
+    tested where the CLI's own backend can be held across two reads - the
+    ``ClusterStore`` the ``--server`` mode is built out of, built the way ``_open``
+    builds it - and what is asserted is what that client told the node, which is where
+    a cache shows from outside the client.
+    """
+
+    def test_the_second_read_names_the_basis_the_first_was_answered_at(
+            self, replicated_cluster, monkeypatch):
+        store = ClusterStore([replicated_cluster.bootstrap_address], Consistency.CACHED)
+        try:
+            store.wait_until_routable()
+            assert store.set(b"level:cached", b"answered") is True
+
+            asked = _what_each_read_named(monkeypatch)
+
+            assert store.get(b"level:cached") == b"answered"
+            assert store.get(b"level:cached") == b"answered"
+        finally:
+            store.close()
+
+        assert len(asked) == 2, f"two reads asked the nodes {len(asked)} times: {asked}"
+        first, second = asked
+        assert first[0] is None, "the first cached read named an index it had not been given"
+        assert first[1] is not None, "the node answered the first read at no basis at all"
+        assert second[0] == first[1], (
+            f"the second read named {second[0]} where the first was answered at "
+            f"{first[1]}, so it did not read at what this client had been given")
+
