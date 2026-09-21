@@ -116,9 +116,9 @@ Which to use:
 * `follower` to spread reads over a shard's replica set.  It costs the same quorum
   confirmation, and what moves is where the hop happens: on the node the caller chose, so
   many clients reading together are served by the set rather than by one node.
-* `cached` for reads that repeat.  An index this client was already given is worth
-  `READ_INDEX_TTL` (0.1s), and inside that window a read costs nothing beyond the read
-  itself.
+* `cached` for reads that repeat, where an answer as old as the window can be lived with:
+  an index this client was already given is worth `READ_INDEX_TTL` (0.1s), and inside
+  that window a read costs nothing beyond the read itself.
 
 In code the level is an argument rather than a mode: `SmartClient.get(key, consistency=...)`
 and the same on `scan`, or `read_index=` on the node primitives for a caller that already
