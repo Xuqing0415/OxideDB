@@ -333,13 +333,22 @@ Design boundaries.
   `*_pb2.py` files carry the toolchain that produced them in their header - protobuf
   7.35.0 and grpcio 1.82.1 - and the `*_pb2_grpc.py` files need one hand edit the
   generator does not make: `from . import x_pb2`, so that the module is importable as
-  part of the package rather than as a top-level module.  Nothing fails if someone
-  regenerates them with another toolchain until the version stamp is *newer* than the
-  installed runtime, and a diff of a regenerated file is unreadable - though
-  regenerating all three protos with the toolchain this checkout has (libprotoc 35.0
-  against the installed `grpcio`) reproduces them byte for byte up to that hand edit,
-  so the accident is narrower than the paragraph makes it sound.  A test that pins the
-  six files' sha256 is owed.
+  part of the package rather than as a top-level module.  Regenerating them is one
+  command, and then that hand edit:
+
+  `python -m grpc_tools.protoc -I proto --python_out=oxidedb/proto --grpc_python_out=oxidedb/proto proto/raft.proto proto/client.proto proto/groups.proto`
+
+  Nothing fails if someone regenerates them with another toolchain until the version
+  stamp is *newer* than the installed runtime, and a diff of a regenerated file is
+  unreadable.  Which version that is comes from the toolchain the command is run with
+  rather than from the checkout, so it belongs in the sentence: with grpcio-tools
+  1.82.1, which is what produced the checked-in files, regenerating all three protos
+  into a scratch directory gives back the code and both stamps unchanged, up to that
+  hand edit.  With 1.83.1 two lines per file move instead - `*_pb2.py` says 7.35.1
+  where the checked-in file says 7.35.0, and `GRPC_GENERATED_VERSION` says 1.83.1
+  where the checked-in file says 1.82.1.  Both are installed on the machine this was
+  measured on, in different interpreters, which is why "the toolchain this checkout
+  has" was the wrong way to say it.  A test that pins the six files' sha256 is owed.
 * **A delete is a tombstone written outside the transaction path.**  What the CLI's
   `delete` sends is the shard's own `DELETE` command - one command to the leader, stamped
   from the same clock the transactions take their timestamps from, which is what puts the

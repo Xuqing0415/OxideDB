@@ -244,3 +244,22 @@ Three environment notes:
   instead of sleeping a fixed number of seconds.  A fixed sleep is a race: the
   suite starts dozens of local gRPC servers, and a loaded machine can spend
   longer than the sleep just electing a leader.
+
+## Running part of it
+
+The suite is one pytest run, so selecting part of it is pytest's own selection.  The
+two forms below that need a name - the keyword and the node id - were run against
+this suite to check that they select what they say:
+
+```
+python -m pytest tests -q                       # the whole suite, quiet
+python -m pytest tests/test_mvcc.py -q          # one file
+python -m pytest tests -k mvcc                  # a keyword, across every file
+python -m pytest tests/test_mvcc.py::TestMVCCStorage::test_set_and_get
+python -m pytest tests -x                       # stop at the first failure
+python -m pytest tests --lf                     # only what failed last time
+python -m pytest tests --collect-only -q        # count them, and run none
+```
+
+The node id in the fourth line is `file.py::Class::test`, and `--collect-only -q`
+is how to get one: it prints exactly that, one per test, without running any.
