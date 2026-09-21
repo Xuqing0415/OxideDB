@@ -217,7 +217,19 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
             # happened, which is not what this test is about - see the same wait in the test
             # above, where the assertion after it needs the table to be behind.
             _wait_for_the_table_to_know_the_shard(client)
-            _wait_for_two_ranges(client)
+            # A table that never got the second range is a proposal that was refused or
+            # a copy that never finished, and the recovery is the only one that knows
+            # which - so the reason goes into the failure rather than staying behind with
+            # the side that gave up.
+            try:
+                _wait_for_two_ranges(client)
+            except AssertionError as gave_up:
+                publisher = getattr(revived, "_metadata_publisher", None)
+                raise AssertionError(
+                    f"{gave_up} - the recovery's last word was "
+                    f"{revived.split_error()!r} with {revived.pending_splits()!r} "
+                    f"still pending, and the publisher's "
+                    f"{getattr(publisher, 'last_error', None)!r}") from None
 
             assert again == MOVED_KEYS[1:], (
                 "the row that was already copied was copied again")
