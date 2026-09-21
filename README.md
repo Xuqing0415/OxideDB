@@ -436,7 +436,7 @@ thing in the suite - five seconds for every stop of a sharded cluster, almost ha
 whole run - which is the reason to measure a slow suite rather than to assume it is the
 tests: the slowest thing in it can be the product.
 
-298 tests.  `tests/test_durability.py` covers the correctness properties that
+414 tests.  `tests/test_durability.py` covers the correctness properties that
 used to be missing: committed-only replay after restart, durable log truncation,
 SQLite-backed MVCC and lock round trips, durable locks across a node restart,
 committing entries inherited from a previous term, single-node commit, and
