@@ -38,8 +38,19 @@ jobs:
         run: |
           python -m venv /tmp/wheelcheck
           /tmp/wheelcheck/bin/pip install dist/*.whl
+          # From outside the checkout: `python -c` puts the working directory on
+          # sys.path, so run from somewhere else and say where the package came
+          # from - otherwise this imports the tree in front of it, and a wheel
+          # missing half its subpackages passes.
+          cd /tmp
           /tmp/wheelcheck/bin/python -c "import importlib, pkgutil, oxidedb; \
+            assert 'wheelcheck' in oxidedb.__file__, oxidedb.__file__; \
             mods = [m.name for m in pkgutil.walk_packages(oxidedb.__path__, 'oxidedb.')]; \
-            [importlib.import_module(m) for m in mods]; print(len(mods), 'submodules')"
+            [importlib.import_module(m) for m in mods]; \
+            print(len(mods), 'submodules from', oxidedb.__file__)"
+          /tmp/wheelcheck/bin/python -c "from importlib.metadata import version, metadata; \
+            print('version', version('oxidedb'), \
+                  '| license', metadata('oxidedb').get('License-Expression'), \
+                  '| requires-python', metadata('oxidedb').get('Requires-Python'))"
           /tmp/wheelcheck/bin/oxidedb --help
           /tmp/wheelcheck/bin/oxidedb-launcher --help
