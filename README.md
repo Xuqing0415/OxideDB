@@ -5,6 +5,10 @@
 
 [rel]: https://github.com/Xuqing0415/OxideDB/releases/tag/v0.1.0
 
+First time here?  `OVERVIEW.md` is the short version: what it is, one session against a
+three-node cluster, what each of the four goals does and does not do, and where to read
+next.  This file is the reference.
+
 A distributed transactional key/value store written in Python: Raft for
 replication, a Percolator-style two-phase commit for distributed transactions,
 MVCC for snapshot reads, and a range-sharded keyspace.
