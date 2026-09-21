@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oxidedb"
+dynamic = ["version"]
+description = "A distributed transactional key/value store: Raft replication, MVCC snapshot reads, Percolator-style two-phase commit, range sharding and follower reads"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Xuqing0415" }]
+keywords = ["raft", "distributed-database", "key-value", "mvcc", "two-phase-commit", "grpc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "grpcio>=1.50.0",
+    "protobuf>=4.21.0",
+    "msgpack>=1.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.20.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Xuqing0415/OxideDB"
+Repository = "https://github.com/Xuqing0415/OxideDB"
+Issues = "https://github.com/Xuqing0415/OxideDB/issues"
+
+[project.scripts]
+oxidedb = "oxidedb.cli:main"
+oxidedb-launcher = "oxidedb.launcher:main"
+
+# One version, read from the package itself rather than typed twice.
+[tool.hatch.version]
+path = "oxidedb/__init__.py"
+
+# The wheel carries the package tree.  Five of its subdirectories are namespace
+# packages with no __init__.py, which `find_packages()` would have dropped.
+[tool.hatch.build.targets.wheel]
+packages = ["oxidedb"]
