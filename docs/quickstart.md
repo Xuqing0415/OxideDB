@@ -120,3 +120,69 @@ needs no cluster object at all, which is what `oxidedb/cli.py --server` is - tha
 client with a shell in front of it.  A read need not go to the leader either:
 `--consistency` on `get` and `scan` names one of three levels, and `consistency.md`
 says which copy of a shard may answer each one and what it costs.
+
+## A session
+
+Three nodes, in three terminals.  A node takes a block of ports from the one it is given,
+and each of them names the other two by the address their first shard listens at.
+
+```
+$ python -m oxidedb.launcher --node-id 1 --host 127.0.0.1 --port 8001 \
+      --data-dir ./node1 --peers "2@127.0.0.1:10001,3@127.0.0.1:12001"
+metadata: 127.0.0.1:9001 (peers [2, 3])
+tso: 127.0.0.1:9002 (peers [2, 3])
+ShardServer 1 started with 2 of 2 shards (network mode)
+node 1: shards at 127.0.0.1:8001, 127.0.0.1:8002, metadata at 127.0.0.1:9001, tso at 127.0.0.1:9002
+READY 127.0.0.1 8001
+```
+
+`READY` is a promise about ports rather than about elections, so a command sent in the
+first moment of a cluster's life is slow to answer rather than refused: the CLI asks for
+a timestamp and for a table naming every shard and its leader before it sends anything.
+
+The other two are the same command with the ports moved up a block - node 2 takes `10001`,
+node 3 takes `12001`, and each names the other two in `--peers`.
+
+```
+$ python -m oxidedb.launcher --node-id 2 --host 127.0.0.1 --port 10001 \
+      --data-dir ./node2 --peers "1@127.0.0.1:8001,3@127.0.0.1:12001"
+$ python -m oxidedb.launcher --node-id 3 --host 127.0.0.1 --port 12001 \
+      --data-dir ./node3 --peers "1@127.0.0.1:8001,2@127.0.0.1:10001"
+```
+
+A fourth terminal is a client of that cluster, holding no cluster object at all.
+
+```
+$ oxidedb --server 127.0.0.1:8001 set user:1 alice
+OK
+$ oxidedb --server 127.0.0.1:8001 get user:1
+alice
+$ oxidedb --server 127.0.0.1:8001 get user:1 --consistency follower
+alice
+```
+
+The write is a transaction with one key in it.  The first read is answered at an index the
+shard's leader confirmed with a quorum; the second asks for a level that does not need the
+leader, and `--consistency` is something only the reads take.
+
+Now one node goes away - node 3's terminal, stopped the way `Ctrl-C` stops it (`stop` on
+its stdin).
+
+```
+SHUTDOWN
+STOPPED
+```
+
+Two nodes of three are left - still a quorum for the table's group and for every shard - so
+both reads are answered and a new key still commits.
+
+```
+$ oxidedb --server 127.0.0.1:8001 get user:1
+alice
+$ oxidedb --server 127.0.0.1:8001 get user:1 --consistency follower
+alice
+$ oxidedb --server 127.0.0.1:8001 set user:2 bob
+OK
+$ oxidedb --server 127.0.0.1:8001 get user:2
+bob
+```

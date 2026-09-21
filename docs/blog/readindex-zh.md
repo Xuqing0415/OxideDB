@@ -248,4 +248,6 @@ OxideDB 是个教学向的原型，不是生产数据库。README 里有一份�
 
 > **后记（2026-09）：** 本文写作时，「没有成员变更」是 README 的 Known gaps 之一；它现在在 Design boundaries——它需要的是 joint consensus，是 Raft 核心的变更，不是待补的工作量。
 
+> **后记（2026-09-21）：** 本文写作时，那份清单在 README。README 已重构，它现在单独成篇：`docs/known-gaps.md`。
+
 同系列的另一篇：[从原型到产品](https://github.com/Xuqing0415/OxideDB/blob/main/docs/blog/prototype-to-product-zh.md)——写的是同一件事在另外两个方向上的样子。

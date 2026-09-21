@@ -35,6 +35,12 @@ test = [
     "pytest>=7.0.0",
 ]
 
+release = [
+    "build",
+    "twine",
+    "readme_renderer[md]",
+]
+
 [project.urls]
 Homepage = "https://github.com/Xuqing0415/OxideDB"
 Repository = "https://github.com/Xuqing0415/OxideDB"

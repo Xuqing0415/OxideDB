@@ -65,10 +65,9 @@ python examples/basic_usage.py     # set/get, a scan, a transaction and a rollba
 
 | Note | What it covers |
 |---|---|
-| [What it is, in one page][overview] | a session against a three-node cluster, and the four goals |
+| [Quickstart and operations][quickstart] | the three modes, running a node, ports and `READY`, and a session against a cluster |
 | [The four goals][goals] | what each goal set out to be, how to reach it, and its limits |
 | [Consistency levels][levels] | `strong`, `follower` and `cached`, and what `cached` costs |
-| [Quickstart and operations][quickstart] | the three modes, running a node, ports and `READY` |
 | [Architecture][architecture] | the five-layer write path, and what is in each directory |
 | [Storage engines][storage] | the engine interface, the keyspace layout, durable mode |
 | [Tests][tests] | what the suite covers, file by file |
@@ -83,7 +82,6 @@ MIT.  See [LICENSE][license].
 [rel]: https://github.com/Xuqing0415/OxideDB/releases/tag/v0.1.0
 [pypi]: https://pypi.org/project/oxidedb/
 [license]: https://github.com/Xuqing0415/OxideDB/blob/main/LICENSE
-[overview]: https://github.com/Xuqing0415/OxideDB/blob/main/OVERVIEW.md
 [goals]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/goals.md
 [levels]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/consistency.md
 [quickstart]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/quickstart.md
