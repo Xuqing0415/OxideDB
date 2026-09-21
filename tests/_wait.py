@@ -76,6 +76,20 @@ def wait_for_keys_leader(cluster, keys, timeout: float = DEFAULT_TIMEOUT):
                       message=f"no shard leader for every key in {keys!r}")
 
 
+def wait_for_leader_of_key(cluster, key, timeout: float = DEFAULT_TIMEOUT):
+    """Wait until some node leads the shard that owns ``key``, and return it.
+
+    The leader read is a snapshot: :meth:`get_leader_for_key` answers ``None``
+    whenever no node's state is ``LEADER`` for that shard, which is true before the
+    first election and again while a leadership change is in flight.  A caller that
+    wants the leader itself waits for it here rather than reading a value some
+    earlier wait happened to establish - the two are not the same, and the run that
+    put this function here is the one that read ``None`` after such a wait.
+    """
+    return wait_until(lambda: cluster.get_leader_for_key(key), timeout=timeout,
+                      message=f"no shard leader for {key!r}")
+
+
 def wait_for_shard_leaders(cluster, shard_ids, timeout: float = DEFAULT_TIMEOUT):
     """Wait until every shard in ``shard_ids`` has a leader.
 

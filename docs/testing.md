@@ -263,3 +263,16 @@ python -m pytest tests --collect-only -q        # count them, and run none
 
 The node id in the fourth line is `file.py::Class::test`, and `--collect-only -q`
 is how to get one: it prints exactly that, one per test, without running any.
+
+## Reading a leader
+
+`ShardedRaftCluster.get_leader_for_key` answers with the node whose state is `LEADER`
+for the shard that owns the key, so it answers `None` whenever no node is leading: before
+the first election, and again for a moment while a leadership change is in flight
+(measured here, a ~0.2s window after the leader's server stopped, with a leader reported
+again afterwards).  A test that reads it is reading a snapshot, and a snapshot taken after
+an earlier wait is not the same thing as waiting for what it reads - the run that put this
+section here waited for the shards' leaders, then waited for the TSO, then read a leader
+and got `None`.  `tests/_wait.py` has `wait_for_keys_leader` for "every one of these keys
+has a leader" and `wait_for_leader_of_key` for the leader itself; use those rather than
+subscripting the call, which raises `TypeError` instead of saying what happened.

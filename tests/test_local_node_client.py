@@ -23,8 +23,8 @@ import time
 import pytest
 
 from _ports import free_addresses
-from _wait import (DEFAULT_TIMEOUT, wait_for_keys_leader, wait_for_tso_client,
-                   wait_until)
+from _wait import (DEFAULT_TIMEOUT, wait_for_keys_leader, wait_for_leader_of_key,
+                   wait_for_tso_client, wait_until)
 from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, NodeClient,
                             NodeClientFactory)
 from oxidedb.raft.node import MemoryRaftNode, NodeState
@@ -402,15 +402,28 @@ def _assert_two_shards(cluster, *keys):
 
     Asserted before anything else, because a routing change that put these keys
     together would otherwise turn this into a single-shard test that still passes.
+
+    The leaders are waited for rather than read once.  A leadership change makes
+    every node report no leader for a moment, and the waits already behind this
+    point do not cover it - one of them waits on another group's election.  Two keys
+    on one group is what this is looking for, and that never settles into anything
+    else.
     """
     shards = [locate(cluster._range_map, key) for key in keys]
     assert len(set(shards)) == len(shards), (
         "the keys share a shard, so nothing here crosses one")
 
-    first = cluster.get_leader_for_key(keys[0])[1]
-    for key in keys[1:]:
-        assert cluster.get_leader_for_key(key)[1] is not first, (
-            "the keys are served by one Raft group")
+    def served_by_different_groups():
+        placed = [cluster.get_leader_for_key(key) for key in keys]
+        if any(leader is None for leader in placed):
+            return None
+        first = placed[0][1]
+        if any(leader[1] is first for leader in placed[1:]):
+            return None
+        return placed
+
+    wait_until(served_by_different_groups, message=(
+        "the keys are served by one Raft group, or had no leader to compare"))
     return shards
 
 
@@ -420,9 +433,7 @@ def _client_for(factory, cluster, key):
     Through the factory, which is how a caller gets one, and for the pair the routing
     table names: a shard, and the id of the server serving it.
     """
-    leader = cluster.get_leader_for_key(key)
-    assert leader is not None, f"no shard leader for {key!r}"
-    node_id, _ = leader
+    node_id, _ = wait_for_leader_of_key(cluster, key)
 
     client = factory.get_client(locate(cluster._range_map, key), node_id)
     assert client is not None, f"no client for {key!r}"
@@ -536,7 +547,7 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
 
             # The node behind the client answers the read the same way, so what moved
             # is the node's state and not a copy the wrapper kept.
-            node = shard_cluster.get_leader_for_key(key)[1]
+            node = wait_for_leader_of_key(shard_cluster, key)[1]
             assert _read_shape(node.get(key, commit_ts)) == _read_shape(read)
     finally:
         shard_cluster.shutdown()
@@ -560,7 +571,7 @@ def test_a_prewrite_one_shard_refuses_is_refused_through_the_client_too():
         _assert_two_shards(shard_cluster, KEY_A, KEY_B)
 
         factory = LocalNodeClientFactory(shard_cluster)
-        node_b = shard_cluster.get_leader_for_key(KEY_B)[1]
+        node_b = wait_for_leader_of_key(shard_cluster, KEY_B)[1]
         client_b = LocalNodeClient(node_b)
 
         # Someone else holds the lock on KEY_B, so a prewrite for it will be refused.
