@@ -107,7 +107,7 @@ was thought about rather than missed.
 
 ## Pitfalls we have hit
 
-Five things that cost time here and are not design decisions: tools that do one thing and
+Six things that cost time here and are not design decisions: tools that do one thing and
 look like they did another, a rule that reads as stricter than the code, and a correctness
 that comes from two places happening to agree.  Each one is reproducible in a minute and
 invisible while it is happening, so they are written down here rather than left to be
@@ -154,6 +154,13 @@ rewrote the endings leaves an empty diff over a file that is not the one you sta
 and the next commit then carries whatever the experiment did to it.  Comparing bytes
 against `git show HEAD:<path>` is what says "restored", and it is the habit above applied
 to a file rather than to a claim: check the state, not the report of the state.
+
+**A file's endings are a property of that file; its neighbours are not evidence about**
+**it.**  Every text file here is CRLF in the working copy except `docs/blog/*.md`, which
+are LF because they are pasted into renderers that take them that way - so a checkout of
+one of those warns about the endings it is about to write, and "unifying" them is a
+whole-file diff over content nobody changed.  The warning is a fact about a file and not
+noise: write these back as they came, and do not take the file next to them as the rule.
 
 ## Invariants
 
