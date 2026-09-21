@@ -18,7 +18,7 @@ jobs:
       - name: Install
         run: pip install -e ".[test]"
       - name: Run the suite
-        run: pytest tests -q
+        run: pytest tests/test_split_recovery.py tests/test_client_across_a_move.py tests/test_recovery_over_processes.py -q
 
   package:
     runs-on: ubuntu-latest

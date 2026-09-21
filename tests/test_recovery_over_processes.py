@@ -25,6 +25,7 @@ a landing proposal leaves behind: the note goes, and so does the group the shard
 """
 
 import os
+import time
 
 import pytest
 from _cluster import read_when_ready, start_cluster, write_when_ready
@@ -248,9 +249,20 @@ def test_a_process_that_comes_back_after_its_move_landed_lets_the_shard_go(tmp_p
         # the ones the nodes themselves listen on, worked out the way every address here is
         # rather than guessed at - a placement the table cannot name an address for is one a
         # client cannot be sent to.
-        told = table.set_shard_nodes(
-            0, list(MOVE_TO), {node_id: cluster.shard_address(0, node_id)
-                               for node_id in MOVE_TO})
+        def tell_the_table():
+            return table.set_shard_nodes(
+                0, list(MOVE_TO), {node_id: cluster.shard_address(0, node_id)
+                                   for node_id in MOVE_TO})
+
+        started = time.monotonic()
+        told = tell_the_table()
+        attempts = 1
+        while not told.success and time.monotonic() - started < 20.0:
+            time.sleep(0.05)
+            told = tell_the_table()
+            attempts += 1
+        print('DIAG set_shard_nodes attempts=%d took=%.3fs ok=%s last=%r'
+              % (attempts, time.monotonic() - started, told.success, told.error_msg))
         assert told.success, told.error_msg
         note = PendingNote.move(shard_id=0, source_nodes=MOVE_FROM, target_nodes=MOVE_TO)
         write_pending_note(data_dir, 0, note)

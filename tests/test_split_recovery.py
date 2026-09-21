@@ -212,7 +212,13 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
         revived = _start_cluster(tmp_path, addresses, metadata)
         try:
             client = wait_for_metadata_client(metadata)
-            _wait_for_two_ranges(client)
+            try:
+                _wait_for_two_ranges(client)
+            except AssertionError:
+                print('DIAG split_error=%r pending=%s routes=%s'
+                      % (revived.split_error(), sorted(revived.pending_splits()),
+                         sorted(client.table(refresh=True).routes())))
+                raise
 
             assert again == MOVED_KEYS[1:], (
                 "the row that was already copied was copied again")

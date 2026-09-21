@@ -32,6 +32,7 @@ The table the client holds is one a publisher wrote either way.
 """
 
 import threading
+import time
 
 from _ports import free_addresses
 from _wait import wait_for_metadata_client, wait_until
@@ -296,8 +297,16 @@ def test_a_client_still_holding_the_old_table_finds_the_new_group_once_the_windo
         assert [scenario.cluster.get_shard_server(node).get_shard_node(0) for node in SERVING] \
             == [None, None, None], "the group the shard left is gone"
 
+        started = time.monotonic()
         answer = scenario.ask(lambda client: client.get(KEYS[3]))
-
+        if answer is None:
+            fresh = scenario.table_client.table(refresh=True).shard(0)
+            held = scenario.cache.table().shard(0)
+            print('DIAG answer=None after %.3fs refreshes=%d last_read_age=%.3f'
+                  % (time.monotonic() - started, scenario.cache.refreshes,
+                     time.monotonic() - scenario.cache._last_read))
+            print('DIAG held=%s/%s fresh=%s/%s'
+                  % (held.nodes, held.leader_id, fresh.nodes, fresh.leader_id))
         assert answer.success, answer.error_msg
         assert answer.value == VALUES[3]
         assert scenario.cache.refreshes == 1, "the walk ends at one read of the table"
