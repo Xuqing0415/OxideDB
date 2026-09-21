@@ -19,3 +19,7 @@ dist/
 # Virtual environments
 .venv/
 venv/
+
+# Editor and local tooling (not part of the project)
+.idea/
+.workbuddy/
