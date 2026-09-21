@@ -19,3 +19,27 @@ jobs:
         run: pip install -e ".[test]"
       - name: Run the suite
         run: pytest tests -q
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Build, and check the metadata the index will read
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - name: Install the wheel somewhere clean, and import all of it
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install dist/*.whl
+          /tmp/wheelcheck/bin/python -c "import importlib, pkgutil, oxidedb; \
+            mods = [m.name for m in pkgutil.walk_packages(oxidedb.__path__, 'oxidedb.')]; \
+            [importlib.import_module(m) for m in mods]; print(len(mods), 'submodules')"
+          /tmp/wheelcheck/bin/oxidedb --help
+          /tmp/wheelcheck/bin/oxidedb-launcher --help
