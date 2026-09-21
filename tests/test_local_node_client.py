@@ -18,16 +18,19 @@ going through a `LocalNodeClient`, so a path that only works while the caller is
 holding the node object cannot pass.
 """
 
+import time
+
 import pytest
 
 from _ports import free_addresses
-from _wait import wait_for_keys_leader, wait_for_tso_client, wait_until
+from _wait import (DEFAULT_TIMEOUT, wait_for_keys_leader, wait_for_tso_client,
+                   wait_until)
 from oxidedb.client import (LocalNodeClient, LocalNodeClientFactory, NodeClient,
                             NodeClientFactory)
 from oxidedb.raft.node import MemoryRaftNode, NodeState
 from oxidedb.raft.shard_server import ShardedRaftCluster
 from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
-                                        ScanRefused, serialize_command)
+                                        ScanRefused, is_not_leader, serialize_command)
 from oxidedb.shard.router import locate
 from oxidedb.tso.tso import TSOCluster
 
@@ -439,6 +442,34 @@ def _commit(client, key, start_ts, commit_ts):
         CommandType.COMMIT, key=key, start_ts=start_ts, commit_ts=commit_ts))
 
 
+#: How long between two asks of a shard whose leader changed under the caller.
+_BETWEEN_ASKS = 0.05
+
+
+def _through_a_client_for(client, factory, cluster, key, call, timeout=DEFAULT_TIMEOUT):
+    """Do ``call`` through a client for ``key``'s shard, following a changed leader.
+
+    A caller holds a client pinned to whoever led when it asked for one, and a group
+    elects on its own schedule: on a loaded machine the node behind a client can stop
+    leading between two calls of one test.  The answer then is ``ERR_NOT_LEADER`` - a
+    fact about the moment and not about the command - and the caller's next move is to
+    ask whoever leads now, which is what ``write_when_ready`` in ``tests/_cluster.py``
+    lets a test over the wire do.  Only that refusal is followed: a shard's own
+    refusal, a lock that is not there and a version that does not match all come back
+    untouched, and still fail the test that has a reason to.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        answer = call(client)
+        if answer.success or not is_not_leader(answer.error_code):
+            return answer
+        if time.monotonic() >= deadline:
+            return answer
+        wait_for_keys_leader(cluster, [key])
+        client = _client_for(factory, cluster, key)
+        time.sleep(_BETWEEN_ASKS)
+
+
 def test_a_cross_shard_transaction_runs_through_the_clients():
     """Two shards, one transaction, and no node object touched by the caller.
 
@@ -446,6 +477,10 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
     but of the seam: the same prewrite, commit and read, issued to a `NodeClient`
     for each shard, with the node behind each client asked afterwards to confirm it
     is the node's own state that moved.
+
+    The proposals and the reads go through `_through_a_client_for`, because a client is
+    pinned to whoever led when it was asked for and a group elects on its own schedule:
+    the one refusal that means the pin has gone stale is followed, and nothing else is.
     """
     tso_cluster, shard_cluster = _two_shard_cluster()
     try:
@@ -461,22 +496,38 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
         commit_ts = tso_client.get_timestamp()
         assert commit_ts > start_ts
 
-        assert _prewrite(client_a, KEY_A, b"value_a", start_ts, KEY_A).success
-        assert _prewrite(client_b, KEY_B, b"value_b", start_ts, KEY_B).success
+        assert _through_a_client_for(
+            client_a, factory, shard_cluster, KEY_A,
+            lambda client: _prewrite(client, KEY_A, b"value_a", start_ts,
+                                     KEY_A)).success
+        assert _through_a_client_for(
+            client_b, factory, shard_cluster, KEY_B,
+            lambda client: _prewrite(client, KEY_B, b"value_b", start_ts,
+                                     KEY_B)).success
 
-        # A prewrite is a lock, and the lock has to be readable through the same
-        # client that took it - that is what a resolver on the other side of the
-        # seam would be handed.
-        for client, key in ((client_a, KEY_A), (client_b, KEY_B)):
+        # A prewrite is a lock, and the lock has to be readable through a client -
+        # that is what a resolver on the other side of the seam would be handed.  The
+        # factory hands back the same handle while the same node still leads.
+        for key in (KEY_A, KEY_B):
+            client = _client_for(factory, shard_cluster, key)
             lock = client.get_lock(key)
             assert lock is not None and lock["start_ts"] == start_ts
 
-        assert _commit(client_a, KEY_A, start_ts, commit_ts).success
-        assert _commit(client_b, KEY_B, start_ts, commit_ts).success
+        committed = _through_a_client_for(
+            client_a, factory, shard_cluster, KEY_A,
+            lambda client: _commit(client, KEY_A, start_ts, commit_ts))
+        assert committed.success, (committed.error_code, committed.error_msg)
+        assert _through_a_client_for(
+            client_b, factory, shard_cluster, KEY_B,
+            lambda client: _commit(client, KEY_B, start_ts, commit_ts)).success
 
-        for client, key, value in ((client_a, KEY_A, b"value_a"),
-                                   (client_b, KEY_B, b"value_b")):
-            read = client.get(key, commit_ts)
+        for key, value in ((KEY_A, b"value_a"), (KEY_B, b"value_b")):
+            # Whoever leads now and not the handle the transaction started with: the
+            # reads below are about the state machine that has the committed row in it.
+            client = _client_for(factory, shard_cluster, key)
+            read = _through_a_client_for(
+                client, factory, shard_cluster, key,
+                lambda client: client.get(key, commit_ts))
             assert (read.success, read.value) == (True, value)
             assert client.get_lock(key) is None
 
