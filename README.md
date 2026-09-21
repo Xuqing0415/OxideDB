@@ -1,5 +1,10 @@
 # OxideDB
 
+[![version 0.1.0](https://img.shields.io/badge/version-0.1.0-blue)][rel]
+[![tests at v0.1.0](https://img.shields.io/badge/tests%40v0.1.0-414_passed-brightgreen)][rel]
+
+[rel]: https://github.com/Xuqing0415/OxideDB/releases/tag/v0.1.0
+
 A distributed transactional key/value store written in Python: Raft for
 replication, a Percolator-style two-phase commit for distributed transactions,
 MVCC for snapshot reads, and a range-sharded keyspace.
