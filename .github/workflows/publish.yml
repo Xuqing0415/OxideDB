@@ -1,0 +1,63 @@
+# Publishes a tagged release, with no long-lived credential: PyPI and TestPyPI
+# identify this repository through the workflow itself (trusted publishing), so
+# there is no token in a secret to leak or to rotate.
+#
+# Nothing is published until both sides are configured:
+#   * on TestPyPI and on PyPI, a pending publisher naming this repository, the
+#     workflow file `publish.yml` and the environment below (`testpypi`, `pypi`);
+#   * in this repository, the two environments of those names - and if the `pypi`
+#     environment requires reviewers, the run stops there until someone approves
+#     it, which is the second look a release should get.
+# Until then a pushed `v*` tag fails here, loudly and without publishing.
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Build the sdist and the wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    needs: testpypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
