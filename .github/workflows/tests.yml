@@ -8,7 +8,7 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,12 +17,14 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e ".[test]"
-      - name: Run the suite
+      - name: The whole suite, five times, to catch a one-in-five
         run: |
+          failed=0
           for attempt in 1 2 3 4 5; do
             echo "=== attempt $attempt ==="
-            pytest tests/test_local_node_client.py -q -rA || true
+            pytest tests -q -rA || failed=1
           done
+          exit $failed
 
   package:
     runs-on: ubuntu-latest

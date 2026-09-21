@@ -18,6 +18,8 @@ going through a `LocalNodeClient`, so a path that only works while the caller is
 holding the node object cannot pass.
 """
 
+import threading
+
 import pytest
 
 from _ports import free_addresses
@@ -473,10 +475,24 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
 
         committed = _commit(client_a, KEY_A, start_ts, commit_ts)
         if not committed.success:
-            print('DIAG commit code=%r msg=%r leader=%r tso=%r'
-                  % (committed.error_code, committed.error_msg,
-                     shard_cluster.get_leader_for_key(KEY_A), (start_ts, commit_ts)))
-        assert committed.success, committed.error_msg
+            node = client_a._node
+            print('DIAG commit code=%r msg=%r'
+                  % (committed.error_code, committed.error_msg))
+            print('DIAG that node state=%r term=%r commit_index=%r'
+                  ' last_applied=%r frozen=%r threads=%d'
+                  % (node._state, node._current_term, node._commit_index,
+                     node._last_applied, node._writes_frozen,
+                     threading.active_count()))
+            print('DIAG lock still on that machine=%r' % (client_a.get_lock(KEY_A),))
+            print('DIAG leader the table names=%r'
+                  % (shard_cluster.get_leader_for_key(KEY_A),))
+            wait_until(lambda: shard_cluster.get_leader_for_key(KEY_A) is not None)
+            retried = _commit(_client_for(factory, shard_cluster, KEY_A), KEY_A,
+                              start_ts, commit_ts)
+            print('DIAG the same commit through the leader now: success=%r code=%r'
+                  ' msg=%r'
+                  % (retried.success, retried.error_code, retried.error_msg))
+        assert committed.success, (committed.error_code, committed.error_msg)
         assert _commit(client_b, KEY_B, start_ts, commit_ts).success
 
         for client, key, value in ((client_a, KEY_A, b"value_a"),
