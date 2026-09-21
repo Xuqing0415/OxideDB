@@ -142,6 +142,14 @@ a level to switch on because it looks inexpensive.
 
 ## Quickstart
 
+From the index:
+
+```
+pip install oxidedb     # the library, the client CLI and the cluster launcher
+oxidedb --help          # get, set, delete and scan against a running cluster
+oxidedb-launcher --help # one node of a cluster: its shards, the routing table, the clock
+```
+
 Developed and tested on Python 3.14.  From a fresh clone:
 
 ```
