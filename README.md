@@ -158,9 +158,10 @@ pytest tests -q             # 414 tests, roughly two minutes
 ```
 
 `pip install -e .` on its own installs what the library needs; the `[test]` extra
-adds `pytest` and `pytest-asyncio`, and `pip install -r requirements.txt`
-installs the same set.  The tests start dozens of local gRPC servers and need a
-writable temp directory.
+adds `pytest`, and `pip install -r requirements.txt` is the same set plus
+`grpcio-tools`, which regenerates the checked-in `*_pb2.py` modules rather than
+being needed to run them.  The tests start dozens of local gRPC servers and need
+a writable temp directory.
 
 Next, the example, which runs set/get, a range scan, a transaction and a rollback
 against the embedded database:
