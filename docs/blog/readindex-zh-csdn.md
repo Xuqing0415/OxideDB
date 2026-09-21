@@ -264,3 +264,5 @@ read with the quorum gone: success=False code=301 msg='ReadIndex failed: 1 acks,
 OxideDB 是个教学向的原型，不是生产数据库。README 里有一份诚实的 Known gaps 清单：快照是整库一个 blob、没有成员变更、没有多版本 GC、分片模块是冻结的实验性代码。`docs/design.md` 记录了键空间编码、快照、Percolator 2PC 和本文的 ReadIndex 这些设计决策的来龙去脉——写那份文档的过程，正是我发现「我以为我实现了 ReadIndex，其实我只实现了它的形状」的过程。
 
 > **后记（2026-09）：** 本文写作时，「没有成员变更」是 README 的 Known gaps 之一；它现在在 Design boundaries——它需要的是 joint consensus，是 Raft 核心的变更，不是待补的工作量。
+
+同系列的另一篇：[从原型到产品](https://github.com/Xuqing0415/OxideDB/blob/main/docs/blog/prototype-to-product-zh.md)——写的是同一件事在另外两个方向上的样子。
