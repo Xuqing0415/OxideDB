@@ -52,23 +52,25 @@ entry, so replicas disagree about it by milliseconds and it is not covered by Ra
 
 ### Serializable snapshot isolation
 
-**Attained.**  A transaction reads at one timestamp - a snapshot, so it never sees half of
-another transaction - and a commit is refused when any key it read has been committed
-over since that snapshot.  That validation is what makes the committed history
-serializable: write skew is refused rather than allowed, and the refusal is ordered with
-the primary commit, so the check and the commit cannot come apart.
+**Attained.**  Serializable for transactions whose reads are point reads.  A transaction
+reads at one timestamp - a snapshot, so it never sees half of another transaction - and a
+commit is refused when any key it read has been committed over since that snapshot.  That
+validation is what makes the committed history serializable: write skew is refused rather
+than allowed, and the refusal is ordered with the primary commit, so the check and the
+commit cannot come apart.
 
 **How to use it.**  `SmartClient.run(work, attempts)`, which runs the work again after a
 refusal: a refusal is about the snapshot the work decided from, so it is the decisions
 that have to be made again, and running the commit again cannot help.
 
-**Limits.**  The read set is keys and not ranges: `scan` is not part of the transaction
-path and records nothing, so a phantom is not detected and serializability here is about
-point reads.  The check is optimistic validation rather than SSI - it refuses every
-read-write overlap, including the ones a conflict graph would allow - so it aborts more
-than a serializable algorithm has to.  And the ordering that makes the check atomic with
-the commit is one lock on one coordinator, so the guarantee is for the transactions that
-commit through one of those.
+**Limits.**  The read set is keys rather than ranges, and that is where the boundary in
+the sentence above comes from: `scan` is not part of the transaction path and records
+nothing, so a phantom is not detected - a transaction that ranges over keys it never
+point-read is outside the guarantee rather than wrong.  The check is optimistic
+validation rather than SSI: it refuses every read-write overlap, including the ones a
+conflict graph would allow, so it aborts more than a serializable algorithm has to.  And
+the ordering that makes the check atomic with the commit is one lock on one coordinator,
+so the guarantee is for the transactions that commit through one of those.
 
 ### Horizontal scaling
 
