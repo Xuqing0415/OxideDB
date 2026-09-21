@@ -481,6 +481,30 @@ def _through_a_client_for(client, factory, cluster, key, call, timeout=DEFAULT_T
         time.sleep(_BETWEEN_ASKS)
 
 
+#: What a TSO client says when the node it is pinned to has stopped leading.
+_TSO_NOT_LEADER = "TSO node is not leader"
+
+
+def _timestamp_from_whichever_leads(tso_cluster, timeout=DEFAULT_TIMEOUT):
+    """Read a timestamp from the TSO group, taking a client again if the pin is stale.
+
+    That group's client is pinned to whoever led when it was asked for, the same way a
+    shard's is, and it can be held across the waits of a test.  What it does when the
+    node it names stops leading is different: a shard answers ``ERR_NOT_LEADER`` with an
+    address, and this one raises.  So the same rule, written where the failure is: ask
+    whoever leads now, follow that one failure, and let every other one out - a group
+    that cannot allocate is a fact about the TSO and not about the moment.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return wait_for_tso_client(tso_cluster).get_timestamp()
+        except RuntimeError as refused:
+            if _TSO_NOT_LEADER not in str(refused) or time.monotonic() >= deadline:
+                raise
+            time.sleep(_BETWEEN_ASKS)
+
+
 def test_a_cross_shard_transaction_runs_through_the_clients():
     """Two shards, one transaction, and no node object touched by the caller.
 
@@ -489,22 +513,22 @@ def test_a_cross_shard_transaction_runs_through_the_clients():
     for each shard, with the node behind each client asked afterwards to confirm it
     is the node's own state that moved.
 
-    The proposals and the reads go through `_through_a_client_for`, because a client is
-    pinned to whoever led when it was asked for and a group elects on its own schedule:
-    the one refusal that means the pin has gone stale is followed, and nothing else is.
+    The proposals and the reads go through `_through_a_client_for` and the timestamps
+    through `_timestamp_from_whichever_leads`, because a client is pinned to whoever led
+    when it was asked for and a group elects on its own schedule: the one failure that
+    means the pin has gone stale is followed, and nothing else is.
     """
     tso_cluster, shard_cluster = _two_shard_cluster()
     try:
         wait_for_keys_leader(shard_cluster, [KEY_A, KEY_B])
-        tso_client = wait_for_tso_client(tso_cluster)
         _assert_two_shards(shard_cluster, KEY_A, KEY_B)
 
         factory = LocalNodeClientFactory(shard_cluster)
         client_a = _client_for(factory, shard_cluster, KEY_A)
         client_b = _client_for(factory, shard_cluster, KEY_B)
 
-        start_ts = tso_client.get_timestamp()
-        commit_ts = tso_client.get_timestamp()
+        start_ts = _timestamp_from_whichever_leads(tso_cluster)
+        commit_ts = _timestamp_from_whichever_leads(tso_cluster)
         assert commit_ts > start_ts
 
         assert _through_a_client_for(
@@ -567,7 +591,6 @@ def test_a_prewrite_one_shard_refuses_is_refused_through_the_client_too():
     tso_cluster, shard_cluster = _two_shard_cluster()
     try:
         wait_for_keys_leader(shard_cluster, [KEY_A, KEY_B])
-        tso_client = wait_for_tso_client(tso_cluster)
         _assert_two_shards(shard_cluster, KEY_A, KEY_B)
 
         factory = LocalNodeClientFactory(shard_cluster)
@@ -576,12 +599,12 @@ def test_a_prewrite_one_shard_refuses_is_refused_through_the_client_too():
 
         # Someone else holds the lock on KEY_B, so a prewrite for it will be refused.
         # Its timestamp comes from the TSO too, so it cannot collide with ours.
-        other_ts = tso_client.get_timestamp()
+        other_ts = _timestamp_from_whichever_leads(tso_cluster)
         assert node_b.propose(serialize_command(
             CommandType.PREWRITE, key=KEY_B, value=b"someone else",
             start_ts=other_ts, primary_key=KEY_B)).success
 
-        start_ts = tso_client.get_timestamp()
+        start_ts = _timestamp_from_whichever_leads(tso_cluster)
         blocked = serialize_command(CommandType.PREWRITE, key=KEY_B, value=b"ours",
                                     start_ts=start_ts, primary_key=KEY_A)
 

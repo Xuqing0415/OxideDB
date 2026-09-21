@@ -276,3 +276,14 @@ section here waited for the shards' leaders, then waited for the TSO, then read 
 and got `None`.  `tests/_wait.py` has `wait_for_keys_leader` for "every one of these keys
 has a leader" and `wait_for_leader_of_key` for the leader itself; use those rather than
 subscripting the call, which raises `TypeError` instead of saying what happened.
+
+## A client pinned to a leader
+
+The TSO group is the same shape with a different refusal.  A `TSOClient` is pinned to
+the node that led when it was asked for, and once that node stops leading the client
+*raises* - `RuntimeError: TSO node is not leader` - rather than answering with an
+address the way a shard's client does.  Measured by taking a client and stopping the
+node it names: the group had a new leader 0.20s later and the held client still raised.
+`_timestamp_from_whichever_leads` in `tests/test_local_node_client.py` is that group's
+version of the same move - take a client again, follow that one failure, and let every
+other one out - and it is what the timestamps in that file are read through.
