@@ -212,6 +212,11 @@ def test_a_split_that_died_mid_copy_copies_only_what_is_missing(tmp_path, monkey
         revived = _start_cluster(tmp_path, addresses, metadata)
         try:
             client = wait_for_metadata_client(metadata)
+            # The split is proposed against the table, and a group that has not been told
+            # the shard exists yet refuses it: that is the publisher's first pass not having
+            # happened, which is not what this test is about - see the same wait in the test
+            # above, where the assertion after it needs the table to be behind.
+            _wait_for_the_table_to_know_the_shard(client)
             _wait_for_two_ranges(client)
 
             assert again == MOVED_KEYS[1:], (

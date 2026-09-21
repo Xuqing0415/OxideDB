@@ -27,7 +27,8 @@ a landing proposal leaves behind: the note goes, and so does the group the shard
 import os
 
 import pytest
-from _cluster import read_when_ready, start_cluster, write_when_ready
+from _cluster import (read_when_ready, start_cluster, tell_the_table_when_ready,
+                     write_when_ready)
 from _notes import MOVE, SPLIT, PendingNote, pending_note, write_pending_note
 from _wait import wait_until
 from oxidedb.client import NodeUnreachable, RemoteMetadataClient, RemoteNodeClient
@@ -248,9 +249,9 @@ def test_a_process_that_comes_back_after_its_move_landed_lets_the_shard_go(tmp_p
         # the ones the nodes themselves listen on, worked out the way every address here is
         # rather than guessed at - a placement the table cannot name an address for is one a
         # client cannot be sent to.
-        told = table.set_shard_nodes(
-            0, list(MOVE_TO), {node_id: cluster.shard_address(0, node_id)
-                               for node_id in MOVE_TO})
+        told = tell_the_table_when_ready(
+            table, 0, MOVE_TO,
+            {node_id: cluster.shard_address(0, node_id) for node_id in MOVE_TO})
         assert told.success, told.error_msg
         note = PendingNote.move(shard_id=0, source_nodes=MOVE_FROM, target_nodes=MOVE_TO)
         write_pending_note(data_dir, 0, note)

@@ -519,6 +519,27 @@ def write_when_ready(client, command: bytes, timeout: float = CLIENT_TIMEOUT) ->
         time.sleep(CLIENT_INTERVAL)
 
 
+def tell_the_table_when_ready(client, shard_id: int, nodes, addresses,
+                              timeout: float = CLIENT_TIMEOUT) -> ApplyResult:
+    """Record a placement, retrying the one refusal a retry can fix.
+
+    ``RemoteMetadataClient`` follows the leader a refusal names, and a member that has
+    just lost its leader names nobody - the group is electing, and that is a fact about
+    the moment rather than about the command.  So the refusal is retried, for the reason
+    ``write_when_ready`` above exists: a test that writes the table over a socket is not
+    a test about how fast one machine elects.  A group with a leader refuses a placement
+    for its own reasons, and those come straight back.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        result = client.set_shard_nodes(shard_id, list(nodes), dict(addresses))
+        if result.success or result.error_code != ErrorCode.ERR_NOT_LEADER:
+            return result
+        if time.monotonic() >= deadline:
+            return result
+        time.sleep(CLIENT_INTERVAL)
+
+
 def read_when_ready(client, key: bytes, timeout: float = CLIENT_TIMEOUT) -> ReadResult:
     """Read ``key``, retrying the same NOT_LEADER a write would, and return the answer.
 

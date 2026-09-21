@@ -218,6 +218,27 @@ def _the_window_is_open(cluster, timeout: float = 30.0):
                 "and the group it left is still serving")
 
 
+def _the_new_group_has_a_leader(table_client, timeout: float = 30.0):
+    """Wait until the table names a leader for shard 0 again.
+
+    A commit clears the column: a replica set that does not hold the node that last
+    reported itself leader is one the table will not point clients at, so the leader goes
+    and the publisher fills it in again on a later pass - up to its poll interval, which is
+    half a second.  A walk that reads the table inside that window finds a placement and
+    nobody leading it, and the cache will not read the table again for
+    ``MISSING_LEADER_REFRESH_INTERVAL``, which is that same half second: the walk is over
+    rather than repeated.  So the moment a test starts from is one where the table is whole,
+    and what a test is about is the walk rather than the publisher's polling.
+    """
+    def named():
+        placement = table_client.table(refresh=True).shard(0)
+        return None if placement is None or placement.leader_id is None else placement
+
+    return wait_until(
+        named, timeout=timeout,
+        message="the table never named a leader for the group the move landed on")
+
+
 def test_a_read_the_client_arrived_with_is_answered_by_the_group_the_shard_left(tmp_path):
     """The window, used by the client it exists for.
 
@@ -284,14 +305,17 @@ def test_a_client_still_holding_the_old_table_finds_the_new_group_once_the_windo
     is the table read again and the group the shard moved to named.  Nothing else tells the
     client anything, and that is the recovery the window is sized against.
 
-    The price is the timeout on the factory, spent once per address of the set that left:
-    three of them here, which is why the constant is small.  It is not a retry budget and it
-    does not grow with how long the shard is gone - the set is finite and the table is read
-    once - so a caller that wants it cheaper wants the set smaller, not the client cleverer.
+    The price is at most the timeout on the factory, once per address of the set that left:
+    three of them here, which is why the constant is small.  A closed port refuses a
+    connection at once, so only an address that swallows the connection costs the whole
+    timeout.  It is not a retry budget and it does not grow with how long the shard is gone
+    - the set is finite and the table is read once - so a caller that wants it cheaper
+    wants the set smaller, not the client cleverer.
     """
     with _AMoveAndTheClientThatMissedIt(tmp_path) as scenario:
         scenario.start_the_move()
         scenario.wait_for_the_move()
+        _the_new_group_has_a_leader(scenario.table_client)
 
         assert [scenario.cluster.get_shard_server(node).get_shard_node(0) for node in SERVING] \
             == [None, None, None], "the group the shard left is gone"
