@@ -1,6 +1,6 @@
 # Design notes
 
-The README describes *what* is implemented.  This file records *why* it is shaped
+The README and the notes beside it describe *what* is implemented.  This file records *why* it is shaped
 the way it is: the decisions behind the keyspace encoding, the snapshot, the
 two-phase commit protocol and the read path, and what each one buys.  File
 references point at the code that implements the decision.
@@ -314,7 +314,7 @@ the snapshot *before* compacting the log.  A crash in between leaves entries tha
 the next replay skips because `_last_applied` already covers them; the other
 order would throw away the only copy of that state.
 
-Two costs are accepted deliberately (see Known gaps in the README): the blob is
+Two costs are accepted deliberately (see `docs/known-gaps.md`): the blob is
 built and restored while holding the node lock, so the node serves no RPCs for
 the duration, and over gRPC it must fit in one message.
 
@@ -598,8 +598,8 @@ directions and refuses only transactions that close a cycle.  That is less pessi
 than what is here - this refuses any transaction whose snapshot was superseded, even when
 no cycle exists - but it needs a registry of live transactions, edges between them, and a
 rule for which one to sacrifice.  The simpler rule is sound, needs no shared state beyond
-the keyspace, and costs one lookup per read key.  What it is not is SSI, and the README
-says so.
+the keyspace, and costs one lookup per read key.  What it is not is SSI, and the notes
+say so.
 
 **Why not read locks.**  The other way to catch it is to mark keys as read while a
 transaction is open and have a writer refuse to prewrite a key with a live reader.  That
@@ -847,7 +847,7 @@ about it is no longer in question: only the carrier is.  That is due with the ne
 widening of `ClientService`, and before follower reads: follower reads put a second
 decision about placement in the client, and a caller that has to read prose to act on a
 refusal is a caller that cannot be anything but this repository's own code.  Until then
-it is written down in the README as well as here.
+it is written down in `docs/known-gaps.md` as well as here.
 
 That widening is no longer only about this refusal.  Recovery needs a read that says
 which version a row is at, and no combination of the six calls the client service had

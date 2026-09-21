@@ -652,7 +652,7 @@ already settled and does not change with the caller:
 * a lock in the range - frozen and remembered too, because a copy taken over one would be
   of a row a transaction is in the middle of changing.  This is the one outcome whose exit
   is not built: the lock goes by itself, but the note is only read again by the next start
-  or the next call, and nothing calls on its own (README, "Known gaps");
+  or the next call, and nothing calls on its own (`docs/known-gaps.md`);
 * done - the note goes, the source of a split is thawed, and the group a move left is
   closed and set aside.
 
