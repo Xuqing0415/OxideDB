@@ -243,8 +243,9 @@ is the client side of it and `MetadataServicer` in `metadata/service.py` and `TS
 `tso/tso.py` serve it, so a program outside the cluster can use the six shard primitives,
 read the table and take a timestamp, and route by the table it read: a client holding one
 needs no cluster object at all, which is what `oxidedb/cli.py --server` is - that same
-client with a shell in front of it.  What no client can do yet is read from a follower;
-see Known gaps.
+client with a shell in front of it.  A read need not go to the leader either:
+`--consistency` on `get` and `scan` names one of three levels, and Consistency levels
+says which copy of a shard may answer each one and what it costs.
 
 ## Architecture
 
@@ -327,7 +328,8 @@ Engine                durable ordered key/value store  oxidedb/storage/engine.py
   out of the note the source shard left and the answer the routing table gives - by
   `ShardedRaftCluster` and by a node started through `launcher.py`, which drives the same
   recovery in the same order.  See Known gaps for what is still missing around all of
-  this: something that decides to move a shard in the first place, and follower reads.
+  this: something that decides to move a shard in the first place, and something that
+  chooses where a shard should live.
 
 ## Storage engines (plan E)
 
@@ -702,9 +704,10 @@ Honest list of what is *not* done, roughly in priority order.
   machine deterministic.
 * **Snapshot reads are reachable from the state machine, the node and a client, but no
   user-facing entry point passes a timestamp.**  `node.get(key, ts)`,
-  `node.scan(start, end, ts)`, `coordinator.read(txn_id, key)` and the six primitives over
-  a wire all take one, but nothing outside the tests passes one - the CLI and the examples
-  drive a local `Database` - so a user still gets the newest version.  A read whose
+  `node.scan(start, end, ts)`, `coordinator.read(txn_id, key)` and the wire's two reads,
+  `Get` and `Scan` - the only calls that carry one - all accept it, but nothing outside
+  the tests passes one: the CLI and the examples drive a local `Database`, so a user still
+  gets the newest version.  A read whose
   snapshot is hidden by a lock is resolved by asking
   the primary key's write record and then rolled forward or cleared, and a lock whose
   transaction is still live is waited out up to the lock's remaining TTL - a reader is
@@ -823,8 +826,8 @@ Honest list of what is *not* done, roughly in priority order.
   replica set at an address something answers at, a one-node cluster names itself for every
   shard, and a client outside the cluster can write the table through a member that does not
   lead it.
-* **Sharding is experimental, and nothing moves a shard by itself: no rebalancing, no
-  follower read.**  Every component routes
+* **Sharding is experimental, and nothing moves a shard by itself: no rebalancing, and
+  nothing that chooses a split point.**  Every component routes
   through one range lookup (`shard/router.py`), and the table that lookup needs has an
   owner: `metadata/service.py` is a Raft group holding each shard's range, its replica
   set and the leaders that reported themselves, and `MetadataClient` reads it with the
@@ -861,9 +864,10 @@ Honest list of what is *not* done, roughly in priority order.
   shard again, copies only what the new shard is missing, and proposes the split.
   What is still missing around it: it does not coordinate with a write that resolved to the
   old shard just before the range moved, so the copy can end up behind such a write; the
-  copies left in the old shard are never reclaimed; nothing chooses split points, and nothing
-  chooses where a shard should live; and there are no follower reads - every read goes to the
-  leader.
+  copies left in the old shard are never reclaimed; and nothing chooses split points or
+  where a shard should live, which is a decision the caller makes.  A read that need not
+  lead is a level a client asks for rather than something the cluster decides: the flag
+  that names it is in Consistency levels.
   A move is wired end to end.  `move_shard(shard_id, target_nodes)` freezes the source -
   refusing its writes with `ERR_MIGRATING`, which is deliberately not the split's answer,
   because a caller told a shard is moving has to look the range up again - reads its rows at
@@ -930,9 +934,10 @@ Honest list of what is *not* done, roughly in priority order.
   to, the same lookup that finds that shard's leader, so nothing above the client needs a
   cluster object at all - but a client *without* one still routes by the cluster's own
   nodes, and the cross-shard transaction test is still driven in the cluster's own process.
-  What the CLI cannot do is read from a follower; every read goes to a leader.  What it does
-  that no other client here does is wait for a cluster that has only just started: a
-  `--server` command asks first - for a timestamp, and for a table naming every shard it was
+  A read from the CLI need not go to a leader: `get` and `scan` take a `--consistency`
+  (Consistency levels).  What it does that no other client here does is wait for a cluster
+  that has only just started: a `--server` command asks first - for a timestamp, and for a
+  table naming every shard it was
   started with and a leader for each - and sends the command only once both answer, so a run
   in the first moments of a cluster's life is slow rather than failed (`READY` is a promise
   about ports, not about elections or the publisher's first pass).  `--wait SECONDS` is the
