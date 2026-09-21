@@ -19,3 +19,17 @@ jobs:
         run: pip install -e ".[test]"
       - name: Run the suite
         run: pytest tests -q
+
+  isolated:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[test]"
+      - name: The two files on their own
+        run: pytest tests/test_split_recovery.py tests/test_client_across_a_move.py -q --durations=8
