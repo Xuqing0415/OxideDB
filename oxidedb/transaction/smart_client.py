@@ -27,20 +27,24 @@ class Consistency:
     answer is promised at come from, and therefore how many nodes a read costs beyond the
     one that answers it.
 
-    ``STRONG`` is a quorum.  The leader confirms an index and answers at it, which is the
-    only one of the three that cannot answer out of data that was already stale when the
-    read began.  It is the default, and it is what every caller had before there was a
-    choice.
+    ``STRONG`` is a quorum.  The leader confirms an index with one and answers at that
+    index, so the basis is established after the read began and no answer older than it can
+    be given.  It is the default, and it is what every caller had before there was a choice.
 
-    ``FOLLOWER`` is the leader's index, fetched over the wire.  A replica answers, and the
-    index it answers at is one the leader confirmed for it, so the hop happens on the node
-    the caller chose rather than on the caller.
+    ``FOLLOWER`` is that same basis, fetched by the node instead of by the caller.  Any
+    member of the set answers, and the index it answers at is one the leader confirmed for
+    it over the wire, so the guarantee is ``STRONG``'s and what moves is where the hop that
+    establishes it happens: on the node the caller chose rather than on the caller.
 
-    ``CACHED`` is the client's own memory.  A replica answers at an index this client was
-    given earlier, and what the caller pays for skipping the confirmation is the age of that
-    index (see :data:`READ_INDEX_TTL`) and, when the member it reaches is behind that index,
-    the wait for it to catch up: a read is answered at an index rather than at a moment, so a
-    member that has not applied it yet is one to wait for, not one to refuse.
+    ``CACHED`` is the client's own memory, and the one source that can be older than the
+    read.  Any member answers at an index this client was given earlier, which is what
+    skipping the confirmation costs: the answer is as of somewhere between now and
+    :data:`READ_INDEX_TTL` ago.  A member that has not applied that index yet is waited for
+    rather than refused, since a read is answered at an index and not at a moment.
+
+    Each of the three is written as where its basis comes from, because that is the thing a
+    reader can check.  A level defined as what the other two cannot do goes wrong the moment
+    one of them can, with nothing about the level itself having changed.
     """
 
     STRONG = "strong"
