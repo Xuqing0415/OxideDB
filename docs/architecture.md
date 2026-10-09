@@ -111,7 +111,8 @@ docs/            the notes the README points at, and the posts
   architecture.md the five-layer write path, and this layout
   storage.md     the engine interface, the keyspace layout, durable mode
   testing.md     what the test suite covers, file by file
-  known-gaps.md  what is not done, and what is out of scope by design
+  known-gaps.md  what is not done, and what would finish it
+  design-boundaries.md what is out of scope by design, and what would move it
   design.md      why the keyspace, snapshot, 2PC and read path are shaped this way
   recovery.md    how a split or a move that died is finished after a restart
   blog/          the ReadIndex story: a read path that passed every test while wrong

@@ -267,4 +267,6 @@ OxideDB 是个教学向的原型，不是生产数据库。README 里有一份�
 
 > **后记（2026-09-21）：** 本文写作时，那份清单在 README。README 已重构，它现在单独成篇：`docs/known-gaps.md`。
 
+> **后记（2026-10）：** Design boundaries 也单独成篇了：`docs/design-boundaries.md`。
+
 同系列的另一篇：[从原型到产品](https://github.com/Xuqing0415/OxideDB/blob/main/docs/blog/prototype-to-product-zh.md)——写的是同一件事在另外两个方向上的样子。

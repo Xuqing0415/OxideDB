@@ -10,8 +10,8 @@ Percolator-style two-phase commit for transactions that span shards, MVCC for sn
 reads, and a range-sharded keyspace.
 
 It is a working prototype rather than a production database.  What is implemented is tested;
-what is not is written down with its reason in [the known gaps][gaps] - including which of
-them are waiting for work and which would take a different design.
+what is not is written down with its reason: the [known gaps][gaps] for what is waiting for
+work, and the [design boundaries][boundaries] for what would take a different design.
 
 ## What it does
 
@@ -72,7 +72,8 @@ python examples/basic_usage.py     # set/get, a scan, a transaction and a rollba
 | [Architecture][architecture] | the five-layer write path, and what is in each directory |
 | [Storage engines][storage] | the engine interface, the keyspace layout, durable mode |
 | [Tests][tests] | what the suite covers, file by file |
-| [Known gaps and boundaries][gaps] | what is not done, and what is out of scope by design |
+| [Known gaps][gaps] | what is not done, and the shape that would finish it |
+| [Design boundaries][boundaries] | what is out of scope by design, and why |
 | [Design notes][design] | why the keyspace, snapshot, 2PC and read path are shaped this way |
 | [Recovery][recovery] | a split or a move that died part way through, and how it is finished |
 
@@ -90,5 +91,6 @@ MIT.  See [LICENSE][license].
 [storage]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/storage.md
 [tests]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/testing.md
 [gaps]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/known-gaps.md
+[boundaries]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/design-boundaries.md
 [design]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/design.md
 [recovery]: https://github.com/Xuqing0415/OxideDB/blob/main/docs/recovery.md
