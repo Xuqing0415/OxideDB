@@ -14,13 +14,13 @@ serve each shard.  What they share is the four commands, and this file is where 
 are said once rather than once per backend.
 
 ``--server`` wants the address a node's shard 0 listens at, because a node's other
-ports are derived from that one - by ``ports_for`` in ``oxidedb/launcher.py``, which is
-imported here rather than worked out a second time.  Nothing has to be said about the
-cluster for that: a node's ports are three fixed segments above its base port, so the
-two group ports follow from the address alone.  Several nodes may be named,
-comma-separated or repeated, and all of them are used as seeds: no client knows which
-member of either group leads, so one address it cannot use would otherwise be the end
-of the walk.
+ports are derived from that one - by ``ports_for`` in ``oxidedb/launcher.py``, which
+``SmartClient.connect`` imports rather than working the arithmetic out again.  Nothing
+has to be said about the cluster for that: a node's ports are three fixed segments above
+its base port, so the two group ports follow from the address alone.  Several nodes may
+be named, comma-separated or repeated, and all of them are used as seeds: no client
+knows which member of either group leads, so one address it cannot use would otherwise
+be the end of the walk.
 
 A node is READY before it can be written to, so a ``--server`` command asks before it
 sends: a timestamp from the clock's group, and a table naming every shard and its
@@ -40,10 +40,7 @@ import argparse
 import sys
 import time
 
-from oxidedb.client import RemoteNodeClientFactory
 from oxidedb.database import Database
-from oxidedb.launcher import ports_for
-from oxidedb.metadata.cache import RoutingCache
 from oxidedb.transaction.smart_client import READ_INDEX_TTL, Consistency, SmartClient
 
 
@@ -100,20 +97,15 @@ class ClusterStore:
     """
 
     def __init__(self, servers, consistency=Consistency.STRONG):
-        metadata_seeds, tso_seeds = _group_seeds(servers)
-        self._factory = RemoteNodeClientFactory(metadata_seeds=metadata_seeds,
-                                                tso_seeds=tso_seeds)
-        #: The group's client, held here rather than only inside the cache: the wait
-        #: asks the same one, and asking the factory twice would be asking for the same
-        #: object anyway - so this is where it is kept rather than a second channel.
+        #: The client, built by name: the seeds, the factory, the table's client and the
+        #: placement it routes by are ``SmartClient.connect``'s now, which is what the
+        #: lines that used to be here were assembling by hand.
+        self._client = SmartClient.connect(servers)
+        #: The two handles this store needs beyond the client's own calls, taken from what
+        #: ``connect`` built rather than made a second time: the wait below asks the clock
+        #: and the table, and both of those are this factory's clients.
+        self._factory = self._client.factory
         self._metadata = self._factory.metadata_client()
-        #: The placement, read from the group the first time it is needed and kept
-        #: for the life of the command.  ``None`` where a cluster would go because
-        #: there is no cluster object here to ask: what this client knows about
-        #: placement is the table, which is the point of the table.
-        self._table = RoutingCache(None, self._metadata, factory=self._factory)
-        self._client = SmartClient(self._factory.tso_client(), None,
-                                   router=self._table, factory=self._factory)
         #: The level this store's reads are answered at.  Kept with the client rather
         #: than passed to the two calls that have one, because a command makes one
         #: read: see this class's docstring for why the level arrives here at all.
@@ -218,25 +210,8 @@ class ClusterStore:
         return self._client.scan(start, end, consistency=self._consistency)
 
     def close(self):
-        self._factory.close()
-
-
-def _group_seeds(servers):
-    """The table's addresses and the clock's, derived from the nodes' own blocks.
-
-    A node takes its shards from its base port upwards, the routing table's group above
-    the shard segment, and the timestamp group above that.  That is the arithmetic of
-    ``oxidedb/launcher.py``, imported rather than repeated, so an address worked out
-    here is the address those nodes bound - which is the whole reason it lives in one
-    function there, and the reason this needs nothing but the addresses.
-    """
-    metadata, tso = [], []
-    for server in servers:
-        host, port = server.rsplit(":", 1)
-        ports = ports_for(int(port))
-        metadata.append(f"{host}:{ports.metadata}")
-        tso.append(f"{host}:{ports.tso}")
-    return metadata, tso
+        """Close the channels the client routes through - the ones ``connect`` opened."""
+        self._client.close()
 
 
 def _servers(text):

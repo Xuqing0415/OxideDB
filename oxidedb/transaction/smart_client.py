@@ -1,10 +1,13 @@
 import threading
 import time
 import random
-from typing import Callable, List, Optional, Tuple, Dict, Any
+from typing import Callable, List, Optional, Sequence, Tuple, Dict, Any
 
+from ..channels import DEFAULT_TIMEOUT
 from ..client.node_client import NodeClient, NodeClientFactory
+from ..client.remote_node_client import RemoteNodeClientFactory
 from ..client.routing import ShardLeaders, ask_shard
+from ..metadata.cache import RoutingCache
 from ..raft.state_machine import (CommandType, ErrorCode, ReadResult,
                                   serialize_command)
 from ..tso.tso import TSOClient
@@ -127,6 +130,9 @@ class SmartClient:
     def __init__(self, tso_client: TSOClient, shard_cluster, router=None,
                  factory: Optional[NodeClientFactory] = None):
         self._tso_client = tso_client
+        #: Kept rather than only passed on, because a client built by
+        #: :meth:`connect` is what has to close these.  See :attr:`factory`.
+        self._factory = factory
         #: Where this client thinks the shards are, and how it reaches them.  Handed
         #: a table it routes by that - the placement the cluster published, which is
         #: the only one a client outside the cluster could have; without one the
@@ -144,6 +150,66 @@ class SmartClient:
         #: one of their own (``Consistency.CACHED``).
         self._read_index_cache = ReadIndexCache()
     
+    @classmethod
+    def connect(cls, servers: Sequence[str],
+                timeout: float = DEFAULT_TIMEOUT) -> "SmartClient":
+        """A client of a cluster that is already running, from the addresses of its nodes.
+
+        ``servers`` is what a caller outside the cluster knows: the addresses the nodes'
+        shard 0 listens on, one per node.  They are seeds and not replicas - no client
+        knows which member of a group leads, so an address it cannot use would otherwise
+        be the end of its walk.  Everything else follows from those addresses: a node's
+        two group ports from its base port (``ports_for``, the one place that arithmetic
+        is written), and the placement from the table's group, read through whichever of
+        the seeds answers.
+
+        What this builds it also keeps, because the two things a caller outside the
+        cluster has to do are the ones this routing goes through anyway: wait out a
+        cluster that is still coming up by asking the clock and the table, and close the
+        channels when done.  :attr:`factory` is where those two clients are, and
+        :meth:`close` is the second half.
+
+        ``timeout`` is what one call waits for an answer - the wire's default, on this
+        signature because a caller on a slower link is the one who knows better.
+        """
+        # The port arithmetic is the launcher's, and that is a server-side module: asked
+        # for here rather than at the top, so that routing a client depends on nothing
+        # about running a cluster.
+        from ..launcher import ports_for
+
+        metadata_seeds, tso_seeds = [], []
+        for server in servers:
+            host, port = server.rsplit(":", 1)
+            ports = ports_for(int(port))
+            metadata_seeds.append(f"{host}:{ports.metadata}")
+            tso_seeds.append(f"{host}:{ports.tso}")
+
+        factory = RemoteNodeClientFactory(timeout=timeout, metadata_seeds=metadata_seeds,
+                                          tso_seeds=tso_seeds)
+        table = RoutingCache(None, factory.metadata_client(), factory=factory)
+        return cls(factory.tso_client(), None, router=table, factory=factory)
+
+    @property
+    def factory(self) -> Optional[NodeClientFactory]:
+        """The channels this client routes through, where it was handed a factory.
+
+        Not a question this client asks itself - it routes through whatever it was given
+        - but the two things a caller outside the cluster has to do belong to that
+        factory: asking the clock and the table whether the cluster is up yet, and
+        closing the channels at the end.
+        """
+        return self._factory
+
+    def close(self) -> None:
+        """Close the channels this client routes through, if it was handed a factory.
+
+        A client built by :meth:`connect` is the only holder of what that call opened, so
+        closing them is its to do and this is how.  A client a test composed from parts
+        was handed a factory by the test, and that factory is the test's to close.
+        """
+        if self._factory is not None:
+            self._factory.close()
+
     def _retry_with_backoff(self, func, *args, **kwargs):
         last_error = None
         for attempt in range(self._retry_max_attempts):

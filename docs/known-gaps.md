@@ -325,7 +325,8 @@ What could not be written that way, because only a different design reaches it, 
   caller gets to ask for a new one between two transactions.  Nothing shipped reaches this:
   `oxidedb/cli.py` hands `SmartClient` the remote client, which is the one that follows.
   What is exposed is a library caller composing a `SmartClient` over an in-process cluster,
-  which is the shape every test here builds.  Measured on a three-node TSO group: a client
+  which is the shape every test here builds, or - by name, `SmartClient.connect` - over a
+  running one.  Measured on a three-node TSO group: a client
   built and not yet read from, with the node it names stopped, raises; the group has a new
   leader 0.201s later, and a client built after that reads.  Tests are protected only where
   they were made so - `_timestamp_from_whichever_leads` in
@@ -414,3 +415,21 @@ What could not be written that way, because only a different design reaches it, 
   onto the factory and the class deleted, which is cleanup waiting to happen rather than a
   design this project chose: `raft/shard_server.py` already imports it without using it, so
   the callers are fewer than the imports suggest.
+* **A test that a shard is unreachable can be answered instead, and the window it rests on
+  is not measured.**  The last test in `tests/test_recovery_over_processes.py` lets a move
+  land, restarts the node that was serving the shard, and asserts that the next `get` to
+  that node raises `NodeUnreachable` - asserted the moment `start_node` returns, with
+  nothing waited for.  What it rests on was measured and holds: the launcher finishes the
+  recovery before it prints `READY` (`launcher.py`), `start_node` waits for READY
+  (`tests/_cluster.py`), and the path that comes back to a landed move passes `drain=0`
+  (`raft/recovery_runner.py`), so by the time the test may route, the note is gone and the
+  group's port is closed.  The failure seen earlier - three red of four single-file runs,
+  `DID NOT RAISE NodeUnreachable` - has one candidate left: a `shutdown_shard` that has
+  returned while the port still answers for a moment.  The other candidate, a recovery
+  that never ran, is out because the assertion above that one would fail first.  Twenty
+  runs on 2026-10-09 did not reproduce it: twenty green, the window from `start_node` to
+  the asserted call 0.34s to 0.99s, and the two shapes of run that turned up (a 3.7s call
+  and a 5.6s one, the difference before the window) both green.  The completion state is
+  that window measured - from `shutdown_shard` returning to the port refusing a connection
+  - which wants a probe inside the node's own process; not done, because what it buys is
+  the conditions under which an already-unreproducible failure comes back.
