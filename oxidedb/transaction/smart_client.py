@@ -156,12 +156,12 @@ class SmartClient:
         """A client of a cluster that is already running, from the addresses of its nodes.
 
         ``servers`` is what a caller outside the cluster knows: the addresses the nodes'
-        shard 0 listens on, one per node.  They are seeds and not replicas - no client
-        knows which member of a group leads, so an address it cannot use would otherwise
-        be the end of its walk.  Everything else follows from those addresses: a node's
-        two group ports from its base port (``ports_for``, the one place that arithmetic
-        is written), and the placement from the table's group, read through whichever of
-        the seeds answers.
+        shard 0 listens on, one per node - one address written on its own, or several in
+        a sequence.  They are seeds and not replicas - no client knows which member of a
+        group leads, so an address it cannot use would otherwise be the end of its walk.
+        Everything else follows from those addresses: a node's two group ports from its
+        base port (``ports_for``, the one place that arithmetic is written), and the
+        placement from the table's group, read through whichever of the seeds answers.
 
         What this builds it also keeps, because the two things a caller outside the
         cluster has to do are the ones this routing goes through anyway: wait out a
@@ -176,6 +176,12 @@ class SmartClient:
         # for here rather than at the top, so that routing a client depends on nothing
         # about running a cluster.
         from ..launcher import ports_for
+
+        # One address written on its own is what a caller reaches for first, and a
+        # ``str`` is a ``Sequence[str]``, so without this the loop below walks it a
+        # character at a time.
+        if isinstance(servers, str):
+            servers = [servers]
 
         metadata_seeds, tso_seeds = [], []
         for server in servers:
