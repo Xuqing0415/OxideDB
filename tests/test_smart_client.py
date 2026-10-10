@@ -7,6 +7,7 @@ import pytest
 from _ports import free_addresses
 from _wait import wait_for_keys_leader, wait_for_leader, wait_for_tso_client
 from oxidedb.client import LocalNodeClientFactory
+from oxidedb.launcher import ports_for
 from oxidedb.metadata.cache import RoutingCache
 from oxidedb.metadata.service import RoutingTable
 from oxidedb.raft.node import RaftCluster
@@ -210,6 +211,68 @@ def test_read_index_consistency():
     
     cluster.shutdown()
     print("ReadIndex consistency test passed!")
+
+
+
+def test_one_address_written_on_its_own_is_one_address():
+    """A caller with one address writes one address, not a list of its characters.
+
+    ``servers`` is annotated ``Sequence[str]``, and a ``str`` is one - so the shortest
+    form of this call was accepted by the signature and then walked one character at a
+    time, dying inside ``connect`` on the first of them.  A consumer outside the suite
+    (a small HTTP front end) reached for this form before any other.
+    """
+    client = SmartClient.connect("127.0.0.1:8001")
+    try:
+        ports = ports_for(8001)
+        assert client.factory._metadata_seeds == [f"127.0.0.1:{ports.metadata}"]
+        assert client.factory._tso_seeds == [f"127.0.0.1:{ports.tso}"]
+    finally:
+        client.close()
+
+
+def test_an_address_in_a_list_is_read_the_same_way():
+    """The CLI's shape: the same address, wrapped, names the same two groups.
+
+    ``ClusterStore`` hands ``--server``'s addresses in as a list, which is the path
+    that worked while the one above did not.  Both have to keep working, and they have
+    to agree about what one address means.
+    """
+    one = SmartClient.connect("127.0.0.1:8001")
+    many = SmartClient.connect(["127.0.0.1:8001"])
+    try:
+        assert many.factory._metadata_seeds == one.factory._metadata_seeds
+        assert many.factory._tso_seeds == one.factory._tso_seeds
+    finally:
+        one.close()
+        many.close()
+
+
+def test_every_address_named_is_kept_as_a_seed():
+    """Several nodes are several seeds, and each node's two group ports are its own.
+
+    Nothing here picks a leader - no client knows which member of a group leads - so a
+    dropped address ends a walk rather than making a smaller request.
+    """
+    client = SmartClient.connect(["a:1", "b:2"])
+    try:
+        assert client.factory._metadata_seeds == [
+            f"a:{ports_for(1).metadata}", f"b:{ports_for(2).metadata}"]
+        assert client.factory._tso_seeds == [
+            f"a:{ports_for(1).tso}", f"b:{ports_for(2).tso}"]
+    finally:
+        client.close()
+
+
+def test_a_client_with_no_address_at_all_is_refused():
+    """Nothing to ask is refused where it is found, not left to the first call.
+
+    An empty list names no seed and a client built from one could reach nothing, so the
+    group client refuses the empty address list rather than handing back a client that
+    fails later with the reason three frames down.
+    """
+    with pytest.raises(ValueError, match="at least one address"):
+        SmartClient.connect([])
 
 
 if __name__ == "__main__":
