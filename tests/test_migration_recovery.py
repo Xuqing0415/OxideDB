@@ -32,7 +32,9 @@ waited for rather than taken as final, which is the window a restart reads its n
 and a lock in the range a move would copy stops it in the same way, because that read is the
 read the call that began the move made;
 and that a shard being moved answers for itself while it is in flight, out of the recovery's
-one record of it rather than out of a copy this cluster keeps.
+one record of it rather than out of a copy this cluster keeps; and that a range read the
+source refuses is written down and left for the next call, rather than let out of the
+recovery to stop the node that would have come back to finish it.
 """
 
 import os
@@ -48,7 +50,8 @@ from oxidedb.raft import recovery_runner
 from oxidedb.raft.recovery_notes import PendingNote, write_note
 from oxidedb.raft.recovery_runner import RecoveryRunner
 from oxidedb.raft.shard_server import ShardedRaftCluster
-from oxidedb.raft.state_machine import CommandType, ErrorCode, MVCCStateMachine
+from oxidedb.raft.state_machine import (CommandType, ErrorCode, MVCCStateMachine,
+                                        ScanRefused)
 from oxidedb.raft.storage import EngineRaftStorage
 
 COUNT = 20
@@ -590,3 +593,92 @@ def test_a_shard_that_is_moving_is_answered_for_out_of_the_one_record_of_the_mov
     finally:
         metadata.shutdown()
 
+
+class _ASourceThatRefusesARead:
+    """A source group that answers a range read with a refusal instead of its rows.
+
+    A group that stopped leading between the freeze and the read says so rather than
+    answering, and the read that lands after the loss is the one refused.  Which read that
+    is is the count's: a recovery out of a note reads the source's whole range once for the
+    rows and once more for the versions they are at, and either of those is a read a group
+    that is no longer the leader refuses.
+    """
+
+    def __init__(self, inner, refusal_at):
+        self._inner = inner
+        self._refusal_at = refusal_at
+        self.reads = 0
+
+    def scan_versions(self, start, end):
+        self.reads += 1
+        if self.reads == self._refusal_at:
+            raise ScanRefused(ErrorCode.ERR_NOT_LEADER, "Lost leadership during read")
+        return self._inner.scan_versions(start, end)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+@pytest.mark.parametrize("refusal_at", [1, 2])
+def test_a_range_read_the_source_refuses_stops_the_move_and_not_the_node(
+        tmp_path, monkeypatch, refusal_at):
+    """The refusal a read gets is written down and left for the next call, not raised.
+
+    The rows of a move come out of the source group as one range read at the freeze, and
+    the versions they are at as a second one over the same range, and a group that lost an
+    election in between answers either of them with a refusal.  A node that came back to
+    finish the move is the node making that read, so a refusal let out of here is a process
+    that never starts: the note on disk, the rows in a group the table does not name yet,
+    and nothing left to come back.  It is the answer a lock gets instead - the reason
+    written down, the note kept, the shard frozen - and the call after this one finishes
+    the move.
+    """
+    addresses = free_addresses(num_nodes=5)
+    metadata = _start_metadata()
+    opened = []
+    try:
+        cluster, client = _a_move_that_died_before_the_proposal(
+            tmp_path, monkeypatch, addresses, metadata, opened)
+        try:
+            assert cluster._recovery_runner._load_migration_record(0) is not None, (
+                "the state the restart picks up from: the note on disk, nowhere told")
+        finally:
+            cluster.shutdown()
+            _close(opened)
+
+        wait_for_group = RecoveryRunner._wait_for_group
+
+        def the_source_refuses(self, shard_id, nodes, *args, **kwargs):
+            group = wait_for_group(self, shard_id, nodes, *args, **kwargs)
+            if group is None or sorted(nodes) != sorted(SERVING):
+                return group
+            return _ASourceThatRefusesARead(group, refusal_at)
+
+        # Patched over the start itself: that is where the node reads the note back and
+        # picks the move up again, and that is the call the refusal has to survive.
+        monkeypatch.setattr(RecoveryRunner, "_wait_for_group", the_source_refuses)
+        revived = _start_cluster(tmp_path, addresses, metadata, shard_nodes={0: SERVING})
+        try:
+            assert "Lost leadership during read" in revived.migration_error(), (
+                "the read the source refused is the reason written down")
+            assert revived.migrations()[0].target_nodes == MOVE_TO, "the move stands"
+            assert revived._recovery_runner._load_migration_record(0) is not None, (
+                "the note is still on disk")
+            wait_until(lambda: revived.get_leader_for_key(KEYS[0]),
+                       message="the shard the move left behind named no leader")
+            leader = revived.get_leader_for_key(KEYS[0])[1]
+            assert leader.writes_frozen and leader.freeze_reason == "migration", (
+                "and the shard stays frozen while the move is unfinished")
+
+            # The answer this time is the group the move is leaving, which is the retry a
+            # caller would have made: copy what is missing, propose, let the old group go.
+            monkeypatch.setattr(RecoveryRunner, "_wait_for_group", wait_for_group)
+            assert revived.recover_migrations() == [0], revived.migration_error()
+            assert client.table(refresh=True).shard(0).nodes == MOVE_TO
+            assert revived._recovery_runner._load_migration_record(0) is None
+            assert revived.migrations() == {}
+            _the_rows_are_where_the_table_says(revived, client)
+        finally:
+            revived.shutdown()
+    finally:
+        metadata.shutdown()

@@ -482,8 +482,21 @@ class RecoveryRunner:
             # out of the shard's own state: one range read over the group's leader, at the
             # newest committed version, which is the read the copy below is about to make
             # again for the versions it needs.
-            state.rows = [(key, value)
-                          for key, value, _ in source.scan_versions(start, end)]
+            # A group that stopped leading answers this read with a refusal rather
+            # than with rows, and a recovery that let the refusal out of here would
+            # be a node that never starts: the note is on disk, the rows are in a
+            # group the table does not name yet, and the process that would finish
+            # the move is gone.  It is the read the table above is read through, one
+            # step further along, and it stops the move the same way that one is
+            # stopped - the reason written down, the note kept, the shard frozen.
+            try:
+                state.rows = [(key, value)
+                              for key, value, _ in source.scan_versions(start, end)]
+            except ScanRefused as refusal:
+                self.record_migration_error(
+                    f"the rows of shard {shard_id} could not be read to copy: "
+                    f"{refusal.error_msg}")
+                return False
 
         # The target's own members and nothing closed, which is not the placement: the
         # source is still the group the table names, so this is a group built beside it
@@ -834,8 +847,18 @@ class RecoveryRunner:
         now two.
         """
         start, end = self._view.range_map()[state.shard_id]
-        versions = {key: version
-                    for key, _, version in source.scan_versions(start, end)}
+        # The same read over the same range and the same group, made once more for
+        # the versions: a group that has stopped leading refuses this one the same
+        # way, and the copy stops here rather than the node.  The rows are already
+        # read, so the note and the freeze are what the next call starts from.
+        try:
+            versions = {key: version
+                        for key, _, version in source.scan_versions(start, end)}
+        except ScanRefused as refusal:
+            self.record_migration_error(
+                f"the versions of shard {state.shard_id}'s rows could not be read: "
+                f"{refusal.error_msg}")
+            return False
         for key, value in state.rows:
             expected = versions.get(key)
             if expected is None:
