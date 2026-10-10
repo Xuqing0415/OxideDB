@@ -436,13 +436,33 @@ What could not be written that way, because only a different design reaches it, 
   Measured again on 2026-10-10, the green was the outlier: the same test failed
   in five of nine runs of that file, every one of them the `DID NOT RAISE` above,
   and passed six of six with that one test run alone - so it is the file's company
-  the failure needs, not the test.  A second mode turned up once that day, in a
-  whole-suite run: the node never said `READY` because it died in `finish_move`
-  (`raft/recovery_runner.py:486`) on `ScanRefused: Lost leadership during read`.
+  the failure needs, not the test.  A second failure turned up once that day, in a
+  whole-suite run, and it was the product's rather than this test's: the node never
+  said `READY` because `ScanRefused: Lost leadership during read` came out of
+  `finish_move` (`raft/recovery_runner.py:486`) and took the start-up with it.
   Reaching `finish_move` at all means the restarted node read a table naming the
   source and took the copy half - the half this test exists to rule out - and that
-  half's refusal leaves `node.start()` as an exception, where every other refusal
-  in the method is recorded and returned to the caller.
+  half's refusal left `node.start()` as an exception, where every other refusal in
+  the method is recorded and returned to the caller.
+  Fixed on 2026-10-10: both range reads of the move path - the rows in `finish_move`
+  and the versions in `_copy_rows` - record the refusal through
+  `record_migration_error` and answer `False`, which is what every other refusal in
+  the method does, so a node that comes back keeps its note, keeps the shard frozen,
+  and starts.  Measured by putting the guards back the way they were: the new test's
+  two cases fail with the refusal leaving `start_network` at `:486`, the read the
+  failure named, and at `:838`, the versions read, and pass with the guards in.
+  What is not fixed here is the entry above - nothing asks a refused recovery again -
+  so the crash that was is now a wait, and the split side's own recovery has the same
+  two reads unguarded, which is the entry below.
+* **A refused range read in a split's recovery stops the node the way a move's did.**  A
+  process coming back to a split reads the source's range twice, exactly as a move does -
+  `_rows_above` out of `_resume_split`, and the versions in `_copy_what_is_missing` - and
+  neither read records a `ScanRefused`.  `finish_move` was the same and was fixed on
+  2026-10-10, in the entry above, because that is where the refusal was seen; nothing has
+  been seen here, so this is written down rather than changed with it, and the two are one
+  class of read rather than two bugs.  The completion state is the same two guards, and a
+  test shaped like the move's: a source that refuses a read, a note that survives it, a
+  shard still frozen, and a start that comes up.
 * **`connect` parses an address its own way, and the CLI parses it differently.**
   `SmartClient.connect` splits a seed with `host, port = server.rsplit(":", 1)` and
   hands the port to `int()`, so a bare `connect("localhost")` - an address with no
