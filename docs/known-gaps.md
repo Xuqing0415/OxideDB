@@ -433,6 +433,16 @@ What could not be written that way, because only a different design reaches it, 
   that window measured - from `shutdown_shard` returning to the port refusing a connection
   - which wants a probe inside the node's own process; not done, because what it buys is
   the conditions under which an already-unreproducible failure comes back.
+  Measured again on 2026-10-10, the green was the outlier: the same test failed
+  in five of nine runs of that file, every one of them the `DID NOT RAISE` above,
+  and passed six of six with that one test run alone - so it is the file's company
+  the failure needs, not the test.  A second mode turned up once that day, in a
+  whole-suite run: the node never said `READY` because it died in `finish_move`
+  (`raft/recovery_runner.py:486`) on `ScanRefused: Lost leadership during read`.
+  Reaching `finish_move` at all means the restarted node read a table naming the
+  source and took the copy half - the half this test exists to rule out - and that
+  half's refusal leaves `node.start()` as an exception, where every other refusal
+  in the method is recorded and returned to the caller.
 * **`connect` parses an address its own way, and the CLI parses it differently.**
   `SmartClient.connect` splits a seed with `host, port = server.rsplit(":", 1)` and
   hands the port to `int()`, so a bare `connect("localhost")` - an address with no
