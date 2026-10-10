@@ -171,6 +171,12 @@ class SmartClient:
 
         ``timeout`` is what one call waits for an answer - the wire's default, on this
         signature because a caller on a slower link is the one who knows better.
+
+        Nothing here starts a cluster - this connects to one that is already up, and a
+        node is a process of its own.  One node is a cluster of one:
+        ``python -m oxidedb.launcher --node-id 1 --port 8001``.  It prints ``READY``
+        once every port is bound, which is before the groups have elected, so a call
+        sent in the first moment may be refused rather than answered.
         """
         # The port arithmetic is the launcher's, and that is a server-side module: asked
         # for here rather than at the top, so that routing a client depends on nothing
