@@ -433,3 +433,14 @@ What could not be written that way, because only a different design reaches it, 
   that window measured - from `shutdown_shard` returning to the port refusing a connection
   - which wants a probe inside the node's own process; not done, because what it buys is
   the conditions under which an already-unreproducible failure comes back.
+* **`connect` parses an address its own way, and the CLI parses it differently.**
+  `SmartClient.connect` splits a seed with `host, port = server.rsplit(":", 1)` and
+  hands the port to `int()`, so a bare `connect("localhost")` - an address with no
+  port - dies with `ValueError: not enough values to unpack (expected 2, got 1)` from
+  inside the loop: a message about unpacking, not about the address.  `oxidedb/cli.py`
+  checks the same input at its own boundary and says `--server wants host:port, and
+  'localhost' is not that`.  One concept, two implementations, two answers - the shape
+  the TSO entry above has.  The completion state is one parser: `connect` calling the
+  CLI's check, or both calling a shared one.  The shapes that must work are what
+  `tests/test_smart_client.py` covers; this is the shape that must not, recorded
+  rather than tested, because a test here would pin the current words in place.
